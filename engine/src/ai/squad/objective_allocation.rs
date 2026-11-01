@@ -527,7 +527,8 @@ pub(super) fn capture_target_allowed(
     target: GridPosition,
     orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
 ) -> bool {
-    !beyond_defended_route(map, target, orders) && capture_is_holdable(world, map, player, target)
+    !beyond_defended_route(world, map, target, orders)
+        && capture_is_holdable(world, map, player, target)
 }
 
 /// 進軍路作戦へ回す占領役（released）のうち、まだ誰も占領に向かっていない攻勢進軍路上の
@@ -627,11 +628,55 @@ const CAPTURE_OWN_RADIUS: u32 = 6;
 /// （[`KEY_POINT_CAPTURE_RADIUS`]）の外にある。守りの進軍路には前へ出るゴーサインを出していない
 /// ので、そこへ占領役を送らない（工場付近で守る）。
 pub(super) fn beyond_defended_route(
+    world: &World,
     map: &Map,
     target: GridPosition,
     orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
 ) -> bool {
-    let distance = |point: GridPosition| map.distance(point.x, point.y, target.x, target.y);
+    let Some(data) = world.get_resource::<MasterDataRegistry>() else {
+        return false;
+    };
+    // 目標から逆向きに地形コストを積み、入り江や迂回路を含む到達距離で比較する。
+    let mut costs = HashMap::default();
+    let mut queue = std::collections::BinaryHeap::new();
+    costs.insert((target.x, target.y), 0_u32);
+    queue.push(Reverse((0_u32, target.y, target.x)));
+    while let Some(Reverse((cost, y, x))) = queue.pop() {
+        if costs.get(&(x, y)).is_some_and(|best| cost > *best) {
+            continue;
+        }
+        let Some(terrain) = map.get_terrain(x, y) else {
+            continue;
+        };
+        let Some(step) = crate::systems::movement::get_valid_movement_cost(
+            data,
+            crate::resources::MovementType::Infantry,
+            terrain,
+        ) else {
+            continue;
+        };
+        for (nx, ny) in map.get_adjacent(x, y) {
+            if map
+                .get_terrain(nx, ny)
+                .and_then(|t| {
+                    crate::systems::movement::get_valid_movement_cost(
+                        data,
+                        crate::resources::MovementType::Infantry,
+                        t,
+                    )
+                })
+                .is_none()
+            {
+                continue;
+            }
+            let next = cost.saturating_add(step);
+            if costs.get(&(nx, ny)).is_none_or(|old| next < *old) {
+                costs.insert((nx, ny), next);
+                queue.push(Reverse((next, ny, nx)));
+            }
+        }
+    }
+    let distance = |point: GridPosition| costs.get(&(point.x, point.y)).copied();
     let nearest = orders
         .iter()
         .flat_map(|order| {
@@ -640,10 +685,14 @@ pub(super) fn beyond_defended_route(
             } else {
                 vec![order.key_point, order.staging]
             };
-            points.into_iter().map(move |point| (point, order.defend))
+            points
+                .into_iter()
+                .filter_map(|point| distance(point).map(|cost| (point, order.defend, cost)))
         })
-        .min_by_key(|(point, defend)| (distance(*point), !*defend, point.y, point.x));
-    nearest.is_some_and(|(point, defend)| defend && distance(point) > KEY_POINT_CAPTURE_RADIUS)
+        .min_by_key(|(point, defend, cost)| (*cost, !*defend, point.y, point.x));
+    nearest.is_some_and(|(point, defend, _)| {
+        defend && map.distance(point.x, point.y, target.x, target.y) > KEY_POINT_CAPTURE_RADIUS
+    })
 }
 
 /// 配分案を遂行中に占領へ向かってよい施設か。中立の施設か、要衝の周りの施設。

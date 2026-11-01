@@ -110,23 +110,38 @@ pub(super) fn combat_assignments(
         if assignments.contains_key(&entity) {
             continue;
         }
-        let (Some(faction), Some(transporting), Some(stats)) = (
+        let (Some(faction), Some(stats)) = (
             entity_ref.get::<Faction>(),
-            entity_ref.get::<crate::components::Transporting>(),
             entity_ref.get::<crate::components::UnitStats>(),
         ) else {
             continue;
         };
-        if faction.0 != player || !super::artillery_ferry::is_ferried_gun(stats) {
+        if faction.0 != player
+            || (!super::artillery_ferry::is_ferried_gun(stats)
+                && !manager.route_operation_members.contains_key(&entity))
+        {
             continue;
         }
+        // 輸送中は車両の位置、降車直後やReserveでは部隊自身の位置を使う。
+        let position = entity_ref
+            .get::<crate::components::Transporting>()
+            .and_then(|transport| world.get::<crate::components::GridPosition>(transport.0))
+            .or_else(|| entity_ref.get::<crate::components::GridPosition>());
         let objective = manager
             .route_operation_members
             .get(&entity)
             .copied()
             .or_else(|| super::artillery_ferry::assigned_attack_route(world, player, entity))
+            // 降車済み砲台は推測した防衛拠点より現在地を使い、最寄りの作戦へ結ぶ。
             .or_else(|| {
-                let carrier_pos = world.get::<crate::components::GridPosition>(transporting.0)?;
+                entity_ref
+                    .get::<crate::components::Transporting>()
+                    .is_none()
+                    .then(|| position.copied())
+                    .flatten()
+            })
+            .or_else(|| {
+                let carrier_pos = position?;
                 let map = map?;
                 defend_points
                     .iter()
@@ -138,7 +153,8 @@ pub(super) fn combat_assignments(
                         )
                     })
                     .copied()
-            });
+            })
+            .or_else(|| position.copied());
         if let Some(target) = objective {
             assignments.insert(
                 entity,

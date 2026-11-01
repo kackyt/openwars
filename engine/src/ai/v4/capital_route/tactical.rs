@@ -5,7 +5,6 @@ use crate::ai::v4::capital_route::model::{
     CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteNodeObjective,
     CapitalRouteNodeOperationRegistry, CapitalRouteNodeScope,
 };
-use crate::ai::v4::capital_route::node_operation::capital_route_node_exit_satisfied;
 use crate::ai::v4::capital_route::topology::capital_route_topology_for;
 use crate::ai::v4::{
     BTreeSet, Entity, Faction, GridPosition, HashMap, Health, Map, MasterDataRegistry, PlayerId,
@@ -25,7 +24,7 @@ pub(in crate::ai::v4) fn capital_route_capture_target_is_reserved(
     operations.operations.values().any(|operation| {
         operation.id.topology.player_id == player_id
             && operation.objective == CapitalRouteNodeObjective::Capture
-            && !capital_route_node_exit_satisfied(operation)
+            && operation.state != crate::ai::v4::victory_roadmap::RoadmapNodeState::Secured
             && operation.capture_targets.contains(&position)
     })
 }

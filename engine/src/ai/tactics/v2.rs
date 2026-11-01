@@ -182,14 +182,65 @@ impl UnitTactics {
     }
 
     /// 移動先候補。護衛・集結待ちのSquadは、現在位置での攻撃・占領・待機だけを残す。
-    fn candidate_tiles(&self, board: &TacticalBoard) -> std::collections::BTreeSet<(usize, usize)> {
+    fn candidate_tiles(
+        &self,
+        world: &World,
+        board: &TacticalBoard,
+        blockade: Option<&EnemyProductionBlockade>,
+    ) -> std::collections::BTreeSet<(usize, usize)> {
         let unit = &self.state;
         if self
             .campaign
             .as_ref()
             .is_some_and(|context| context.holds_position())
         {
-            return std::iter::once((unit.position.x, unit.position.y)).collect();
+            let mut tiles = std::collections::BTreeSet::from([(unit.position.x, unit.position.y)]);
+            // 占領役や防衛役の配置は維持し、攻撃役だけが安全に届く生産口を塞ぐ。
+            // 首都そのものは占領役のために空けておく。
+            if !unit.stats.can_capture
+                && unit.stats.max_range > 0
+                && self
+                    .campaign
+                    .as_ref()
+                    .is_some_and(|context| context.mission_type == MissionType::Attack)
+                && let Some(blockade) = blockade
+            {
+                let reachable = calculate_reachable_tiles(
+                    &board.map,
+                    &board.occupancy,
+                    (unit.position.x, unit.position.y),
+                    unit.stats.movement_type,
+                    unit.stats.max_movement,
+                    unit.fuel,
+                    board.player_id,
+                    unit.stats.unit_type,
+                    &board.registry,
+                );
+                for (x, y) in reachable {
+                    let position = GridPosition { x, y };
+                    let is_capital = board.properties.iter().any(|(site, terrain, _)| {
+                        *site == position && *terrain == crate::resources::Terrain::Capital
+                    });
+                    if !is_capital
+                        && !crate::ai::v4::capital_route::tactical::is_capture_target_reserved(
+                            world,
+                            board.player_id,
+                            position,
+                        )
+                        && blockade
+                            .assess(
+                                board,
+                                unit,
+                                position,
+                                terrain_defense_bonus(board, position),
+                            )
+                            .holds_site
+                    {
+                        tiles.insert((x, y));
+                    }
+                }
+            }
+            return tiles;
         }
         calculate_reachable_tiles(
             &board.map,
@@ -231,7 +282,7 @@ fn best_action_for_unit(
 ) -> BestAction {
     let state = &unit.state;
     let mut best = BestAction::default();
-    let mut tiles = unit.candidate_tiles(board);
+    let mut tiles = unit.candidate_tiles(world, board, blockade);
     if unit.treats_target_as_reference() {
         // 敵の生産口は、占領役の予約より占位（補充の遮断）を優先して候補に残す。
         // 予約で外すと、占領役が着くまで敵が空いた生産口で補充を続ける。
@@ -256,7 +307,7 @@ fn best_action_for_unit(
                 state.position,
                 || {
                     json!({
-                "departure_authorized":false,"generated_current_tile_only":true,
+                "departure_authorized":false,"generated_current_tile_only":tiles.len() == 1,
                 "underlying_departure_reason":"not_persisted"})
                 },
             );

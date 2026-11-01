@@ -412,3 +412,39 @@ fn capital_assault_attacks_with_effective_units_and_stages_the_rest() {
     assert_eq!(for_missiles.mission_type, MissionType::Defense);
     assert_eq!(for_missiles.target, geometry.staging);
 }
+
+#[test]
+fn defended_route_uses_land_path_around_an_inlet() {
+    use crate::ai::v4::capital_route::force_demand::RouteOrder;
+    let mut world = World::new();
+    world.insert_resource(MasterDataRegistry::load().unwrap());
+    let mut map = Map::new(10, 8, Terrain::Plains, GridTopology::Square);
+    let target = pos(6, 1);
+    let defend = pos(2, 1);
+    let attack = pos(9, 3);
+    let orders = [
+        RouteOrder {
+            key_point: defend,
+            staging: defend,
+            defend: true,
+            force: 0,
+        },
+        RouteOrder {
+            key_point: attack,
+            staging: attack,
+            defend: false,
+            force: 0,
+        },
+    ];
+    assert!(
+        beyond_defended_route(&world, &map, target, &orders),
+        "平地では近い防衛路を優先する"
+    );
+    for y in 0..7 {
+        map.set_terrain(4, y, Terrain::Sea).unwrap();
+    }
+    assert!(
+        !beyond_defended_route(&world, &map, target, &orders),
+        "入り江を迂回する防衛路より陸路が短い攻撃路を優先する"
+    );
+}

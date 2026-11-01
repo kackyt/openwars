@@ -45,10 +45,6 @@ pub(in crate::ai::v4) fn plan_production_with_registry(
     assign_committed_combat(input, &mut state);
     let ferries_artillery = input.policy == ProductionPolicy::Standard
         && crate::ai::v4::artillery_ferry::artillery_ferry_enabled();
-    if ferries_artillery {
-        // 運ぶ手段の無い既存の砲台へ、作戦枠より先に補給輸送車を付ける。
-        allocate_artillery_carriers(input, &mut state);
-    }
     allocate_operation_slots(input, &mut state, plan_registry, contract_registry);
     if ferries_artillery {
         // この手番に計画が買った砲台へ、残額で補給輸送車を付ける。
@@ -172,6 +168,7 @@ fn assign_committed_combat(input: &ProductionInputs<'_>, state: &mut ProductionS
         committed_by_operation,
         ..
     } = state;
+    let islands = crate::ai::islands::IslandMap::analyze(&scan.map);
     for (&entity, assignment) in committed_combat_assignments {
         let Some(unit) = scan
             .my_units
@@ -206,7 +203,25 @@ fn assign_committed_combat(input: &ProductionInputs<'_>, state: &mut ProductionS
                     operation.anchor.y,
                 )
             })
-            .map(|(index, _)| index);
+            .map(|(index, _)| index)
+            .or_else(|| {
+                // 射撃位置や確保済み要衝も、同じ陸塊の最も近い作戦へ数える。
+                let target = assignment.objective.unwrap_or(unit.pos);
+                let island = islands.get_island_at(&target)?.id;
+                operations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, operation)| operation.island_id == Some(island))
+                    .min_by_key(|(_, operation)| {
+                        scan.map.distance(
+                            target.x,
+                            target.y,
+                            operation.anchor.x,
+                            operation.anchor.y,
+                        )
+                    })
+                    .map(|(index, _)| index)
+            });
         if let Some(index) = assigned_operation {
             committed_by_operation
                 .entry(index)
@@ -428,4 +443,98 @@ fn record_surplus_purchase(
         deployment,
         capture_intent: None,
     });
+}
+
+#[cfg(test)]
+mod assignment_regression_tests {
+    use super::*;
+    use crate::ai::v4::test_support::{multi_factory_scan, pos, stats};
+
+    #[test]
+    fn deployed_gun_at_non_objective_tile_is_committed_to_one_local_operation() {
+        let mut scan = multi_factory_scan();
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Artillery, UnitType::Infantry, 70);
+        scan.damage_chart = chart.into();
+        scan.enemy_units.push(UnitSnapshot {
+            entity: Some(Entity::from_raw(901)),
+            pos: pos(6, 2),
+            stats: stats(UnitType::Infantry, 1000),
+            hp: 100,
+            free_cargo: 0,
+        });
+        let gun = Entity::from_raw(900);
+        let firing_tile = pos(3, 2);
+        scan.my_units.push(UnitSnapshot {
+            entity: Some(gun),
+            pos: firing_tile,
+            stats: UnitStats {
+                min_range: 3,
+                max_range: 6,
+                max_movement: 1,
+                ..stats(UnitType::Artillery, 20_000)
+            },
+            hp: 100,
+            free_cargo: 0,
+        });
+        let assignments = HashMap::from_iter([(
+            gun,
+            deployment::ActiveTargetAssignment {
+                plan_id: None,
+                slot_kind: SlotKind::Combat,
+                objective: Some(firing_tile),
+                targets: HashSet::default(),
+            },
+        )]);
+        let routes = AdvancingCapitalRouteEntities::default();
+        let input = ProductionInputs {
+            policy: ProductionPolicy::Standard,
+            scan: &scan,
+            player_id: PlayerId(1),
+            allow_structural_slots: true,
+            committed_combat_assignments: &assignments,
+            advancing_route_entities: &routes,
+            turn: 1,
+        };
+        let registry = V4RollingPlanRegistry::default();
+        let mut contracts = plan_contract::PlanContractRegistry::default();
+        let mut state = prepare_operations(&input, &registry, &mut contracts);
+        assert!(!state.operations.is_empty());
+        assert!(state.operations.iter().all(|op| op.anchor != firing_tile));
+        assign_committed_combat(&input, &mut state);
+        assert_eq!(
+            state
+                .committed_by_operation
+                .values()
+                .filter(|units| units.contains_key(&gun))
+                .count(),
+            1
+        );
+        let operation_index = *state
+            .committed_by_operation
+            .iter()
+            .find(|(_, units)| units.contains_key(&gun))
+            .unwrap()
+            .0;
+        let combat = combat_input::combat_plan_input(
+            &scan,
+            &mut state.ctx,
+            &state.operations[operation_index],
+            &HashSet::default(),
+            &HashSet::from_iter([gun]),
+            &HashSet::default(),
+            scan.funds,
+            false,
+            PlayerId(1),
+            ProductionPolicy::Standard,
+        )
+        .expect("対象作戦の戦闘計画入力");
+        assert!(
+            combat
+                .existing_units
+                .iter()
+                .any(|unit| unit.stats.unit_type == UnitType::Artillery),
+            "割り当てた砲台は実際の戦闘計画入力にも残る"
+        );
+    }
 }

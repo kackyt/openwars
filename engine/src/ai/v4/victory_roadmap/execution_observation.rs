@@ -27,6 +27,7 @@ struct ExecutionFacts {
     property_snapshots: Vec<(GridPosition, Property)>,
     enemy_capital: Option<GridPosition>,
     enemy_capital_island: Option<IslandId>,
+    friendly_in_capital_production_range: bool,
     enemy_unit_count: usize,
     enemy_positions: Vec<GridPosition>,
     combat_plan_summaries: Vec<ActiveCombatPlanSummary>,
@@ -54,6 +55,38 @@ impl ExecutionFacts {
         let enemy_capital_island = enemy_capital
             .and_then(|position| island_map.get_island_at(&position))
             .map(|island| island.id);
+        // 首都圏に実際の地上戦力が到達したら、周辺物件の占領完了を首都作戦の必須条件にしない。
+        // 輸送中・航空・海上のユニットだけでは、地上の侵入路が開いたとは判断しない。
+        let friendly_in_capital_production_range = enemy_capital.is_some_and(|capital| {
+            let topology = world.resource::<crate::resources::Map>().topology;
+            let mut units = world.query::<(
+                &Faction,
+                &GridPosition,
+                &crate::components::UnitStats,
+                Option<&Transporting>,
+            )>();
+            units
+                .iter(world)
+                .any(|(faction, position, stats, transporting)| {
+                    faction.0 == player_id
+                        && transporting.is_none()
+                        && island_map.get_island_at(position).map(|island| island.id)
+                            == enemy_capital_island
+                        && enemy_capital_island.is_some()
+                        && !matches!(
+                            stats.movement_type,
+                            crate::resources::MovementType::Air
+                                | crate::resources::MovementType::Ship
+                        )
+                        && (stats.can_capture || stats.max_range > 0)
+                        && crate::systems::production::is_within_production_range(
+                            &[capital],
+                            position.x,
+                            position.y,
+                            topology,
+                        )
+                })
+        });
         let enemy_unit_count = {
             let mut units = world.query::<&Faction>();
             units
@@ -94,6 +127,7 @@ impl ExecutionFacts {
             property_snapshots,
             enemy_capital,
             enemy_capital_island,
+            friendly_in_capital_production_range,
             enemy_unit_count,
             enemy_positions,
             combat_plan_summaries,
@@ -717,7 +751,12 @@ impl ExecutionContext<'_> {
         let logistics_plan = &self.facts.logistics_plan;
         let owned_properties = &self.facts.owned_properties;
         registry.refresh_objective_ownership(player_id, owned_properties);
-        registry.rebuild_dependencies(player_id, enemy_capital_island, logistics_plan.as_ref());
+        registry.rebuild_dependencies(
+            player_id,
+            enemy_capital_island,
+            logistics_plan.as_ref(),
+            self.facts.friendly_in_capital_production_range,
+        );
         registry.refresh_node_states(player_id);
 
         // 完了・撤回済み作戦は履歴として残すが、Entity集合を第二の割当正本にしない。

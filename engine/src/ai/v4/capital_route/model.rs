@@ -143,6 +143,9 @@ pub(in crate::ai::v4) struct CapitalRouteNodeOperation {
     /// 前進しても、橋Nodeを未達へ戻さない。
     pub(in crate::ai::v4) crossed: bool,
     pub(in crate::ai::v4) state: victory_roadmap::RoadmapNodeState,
+    /// 過半数確保と局地優勢が継続した最初の手番。
+    pub(in crate::ai::v4) dominant_since: Option<u32>,
+    pub(in crate::ai::v4) capture_release: bool,
     pub(in crate::ai::v4) assigned_squads: HashSet<SquadId>,
 }
 

@@ -32,7 +32,7 @@
 //! 射程の長い砲台が盾の後ろから回廊の敵を一方的に撃てるので、攻めの進軍路の戦力の中心に置く。
 //! 既に居る砲台（守りの進軍路の砲台など）は割り当てを変えない。何基作るかは生産計画が決める。
 //! 割り当てた砲台は、その進軍路の要衝の周り
-//! （射程＋[`ROUTE_ZONE_MARGIN`]マス）を受け持ち、外に居れば撃てる敵が居ても積んで運ぶ。
+//! （射程＋[`ROUTE_ZONE_MARGIN`]マス）を受け持ち、外に居ても射程内の敵を優先して撃つ。
 //! 攻めの要衝は占領が進むと先へ移るので、受け持ちの範囲も前へ動き、砲台は前線について前進する。
 //!
 //! 撃つ敵が居なくなった（その戦線の敵を掃討し終えた）砲台は、輸送車で前へ運ぶ。行き先は
@@ -112,24 +112,29 @@ pub(crate) fn own_ferry_units(world: &mut World, player_id: PlayerId) -> HashSet
 }
 
 /// 自軍の砲台・補給輸送車の、運搬としての次の1手。担当外ならNone。
-pub(crate) fn decide_artillery_ferry(
+#[cfg(test)]
+fn decide_artillery_ferry(
     world: &mut World,
     player_id: PlayerId,
     skip: &HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
+    decide_artillery_ferry_phase(world, player_id, skip, false)
+        .or_else(|| decide_artillery_ferry_phase(world, player_id, skip, true))
+}
+
+pub(crate) fn decide_artillery_ferry_phase(
+    world: &mut World,
+    player_id: PlayerId,
+    skip: &HashSet<Entity>,
+    post: bool,
+) -> Option<(Entity, AiCommand)> {
     let turn = world
         .get_resource::<crate::resources::MatchState>()
         .map_or(0, |state| state.current_turn_number.0);
-    let cached_idle = world
-        .get_resource::<ArtilleryFerryIdle>()
-        .is_some_and(|idle| idle.player_id == player_id && idle.turn == turn);
-    // 砲台が1基も無い手番から記録し、後で作った砲台を新しい砲台として見分ける。
+    // 通常部隊の行動で盤面が変わるため、フェーズ間の不成立をキャッシュしない。
     let routes = update_gun_routes(world, player_id, turn);
     let guards = guard_posts(world, player_id, &routes);
-    if cached_idle || !has_idle_gun_or_carrier(world, player_id, skip) {
-        if std::env::var("OPENWARS_ARTILLERY_FERRY_DEBUG").is_ok() {
-            eprintln!("FERRY-SKIP T{turn} P{player_id:?} cached={cached_idle}");
-        }
+    if !has_idle_gun_or_carrier(world, player_id, skip) {
         return None;
     }
     let board = PlayerBoard::observe(world, player_id);
@@ -169,15 +174,19 @@ pub(crate) fn decide_artillery_ferry(
         routes: &routes,
         guards: &guards,
     };
-    let decision = ferry
-        .supply()
-        .or_else(|| ferry.fire())
-        .or_else(|| ferry.deliver())
-        .or_else(|| ferry.board())
-        .or_else(|| ferry.meet())
-        .or_else(|| ferry.tend())
-        .or_else(|| ferry.vacate_facility())
-        .or_else(|| ferry.hold());
+    let decision = if post {
+        ferry
+            .deliver()
+            .or_else(|| ferry.board())
+            .or_else(|| ferry.meet())
+            .or_else(|| ferry.tend())
+            .or_else(|| ferry.hold())
+    } else {
+        ferry
+            .supply()
+            .or_else(|| ferry.fire())
+            .or_else(|| ferry.vacate_facility())
+    };
     if std::env::var("OPENWARS_ARTILLERY_FERRY_DEBUG").is_ok() {
         let guns = board
             .units
@@ -192,9 +201,6 @@ pub(crate) fn decide_artillery_ferry(
             .map(|unit| (unit.position, unit.action_completed, unit.cargo))
             .collect::<Vec<_>>();
         eprintln!("FERRY T{turn} guns={guns:?} carriers={carriers:?} -> {decision:?}");
-    }
-    if decision.is_none() {
-        world.insert_resource(ArtilleryFerryIdle { player_id, turn });
     }
     decision
 }
@@ -427,15 +433,7 @@ fn guard_posts(
         .collect()
 }
 
-/// その手番に運搬の判断が尽きたことの記録。
-#[derive(Resource, Debug, Clone, Copy)]
-struct ArtilleryFerryIdle {
-    player_id: PlayerId,
-    turn: u32,
-}
-
-/// 判断の対象が居るか。盤面の観測は重いので先に調べる。自軍の砲台が居て、砲台か
-/// 補給輸送車のどちらかがまだ行動できる場合に限る。
+/// 盤面の観測前に、行動可能な砲台または輸送車がいるか調べる。
 fn has_idle_gun_or_carrier(world: &mut World, player_id: PlayerId, skip: &HashSet<Entity>) -> bool {
     let mut query = world.query::<(
         Entity,
@@ -443,17 +441,15 @@ fn has_idle_gun_or_carrier(world: &mut World, player_id: PlayerId, skip: &HashSe
         &UnitStats,
         &crate::components::ActionCompleted,
     )>();
-    let mut has_gun = false;
     let mut has_idle = false;
     for (entity, faction, stats, done) in query.iter(world) {
         if faction.0 != player_id {
             continue;
         }
         let gun = is_ferried_gun(stats);
-        has_gun |= gun;
         has_idle |= !done.0 && !skip.contains(&entity) && (gun || is_artillery_carrier(stats));
     }
-    has_gun && has_idle
+    has_idle
 }
 
 /// 運搬の判断で共有する盤面。
@@ -582,6 +578,54 @@ impl ArtilleryFerry<'_> {
     /// 敵の脅威圏内（threat > 0）にあるマスでは、前方に味方直接部隊の盾（screened）が
     /// 存在することを完全必須化し、無防備な最前線への据え付けを禁止する。
     fn can_safely_emplace(&self, gun: &BoardUnit, cell: Cell) -> bool {
+        // 占領役と未確保拠点を結ぶ一本道に据えると、後続の占領を塞ぐ。
+        let exits = self
+            .board
+            .map
+            .get_adjacent(cell.0, cell.1)
+            .into_iter()
+            .filter(|&(x, y)| {
+                self.board
+                    .map
+                    .get_terrain(x, y)
+                    .and_then(|terrain| {
+                        get_valid_movement_cost(
+                            &self.board.registry,
+                            MovementType::Infantry,
+                            terrain,
+                        )
+                    })
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        if exits.len() == 2
+            && self
+                .own()
+                .filter(|unit| unit.stats.can_capture)
+                .any(|capturer| {
+                    let from = Self::cell(capturer.position);
+                    let to_cell = self.distance(
+                        from,
+                        GridPosition {
+                            x: cell.0,
+                            y: cell.1,
+                        },
+                    );
+                    self.board
+                        .properties
+                        .iter()
+                        .filter(|property| property.owner != Some(self.board.player))
+                        .any(|property| {
+                            to_cell > 0
+                                && self.distance(cell, property.position) > 0
+                                && to_cell.saturating_add(self.distance(cell, property.position))
+                                    == self.distance(from, property.position)
+                        })
+                })
+            && self.is_separating_cell(cell, exits[0], exits[1])
+        {
+            return false;
+        }
         if self.enemies().next().is_none() {
             return true;
         }
@@ -591,6 +635,39 @@ impl ArtilleryFerry<'_> {
         }
         // 敵の脅威圏内では、前方に味方直接部隊の盾（スクリーン）が存在することが必須
         self.screened(cell)
+    }
+
+    /// セルを除くと両側が地上で繋がらない場合だけ、迂回不能な隘路とする。
+    fn is_separating_cell(&self, blocked: Cell, start: Cell, goal: Cell) -> bool {
+        let mut seen = HashSet::default();
+        let mut queue = std::collections::VecDeque::from([start]);
+        seen.insert(start);
+        while let Some(cell) = queue.pop_front() {
+            if cell == goal {
+                return false;
+            }
+            for next in self.board.map.get_adjacent(cell.0, cell.1) {
+                if next == blocked || seen.contains(&next) {
+                    continue;
+                }
+                let passable = self
+                    .board
+                    .map
+                    .get_terrain(next.0, next.1)
+                    .and_then(|terrain| {
+                        get_valid_movement_cost(
+                            &self.board.registry,
+                            MovementType::Infantry,
+                            terrain,
+                        )
+                    })
+                    .is_some();
+                if passable && seen.insert(next) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        true
     }
 
     /// `origin` から輸送車で `turns` 手番以内に運べる陣地と、その評価（[`Self::emplacement_value`]）・
@@ -906,7 +983,6 @@ impl ArtilleryFerry<'_> {
                     && gun
                         .ammo
                         .is_none_or(|(primary, _)| primary > 0 || gun.stats.max_ammo1 == 0)
-                    && !self.out_of_zone(gun)
             })
             .find_map(|gun| {
                 let (enemy, _) = self.best_shot(gun, Self::cell(gun.position))?;
@@ -1161,9 +1237,8 @@ impl ArtilleryFerry<'_> {
                     && self.can_act(gun)
                     && !self.moved.contains(&gun.entity)
                     && gun.fuel.is_none_or(|fuel| fuel > 0)
-                    && (self.out_of_zone(gun)
-                        || (self.best_shot(gun, Self::cell(gun.position)).is_none()
-                            && self.has_better_place(gun)))
+                    && self.best_shot(gun, Self::cell(gun.position)).is_none()
+                    && (self.out_of_zone(gun) || self.has_better_place(gun))
             })
             .collect()
     }
@@ -1176,9 +1251,24 @@ impl ArtilleryFerry<'_> {
         if self.on_own_facility(current) {
             return true;
         }
-        // 配分案の無い砲台は常に運ぶ。
+        // 配分案がない場合でも、交戦できる敵が全くいなければ無目的に積み直さない。
+        // 味方の一時的な占有で道が塞がれていても、敵がいる限り迎えを許す。
         if !self.routes.contains_key(&gun.entity) && !self.guards.contains_key(&gun.entity) {
-            return true;
+            return self.enemies().any(|enemy| self.shot_value(gun, enemy) > 0);
+        }
+        // 担当範囲内では、射程外の目標へ安全に十分前進できる場合だけ積み直す。
+        // 小さな位置変更で降車と乗車を繰り返さない。
+        if self.in_zone(gun, current) {
+            let Some(target) = self.routes.get(&gun.entity) else {
+                return false;
+            };
+            let distance = self.distance(current, *target);
+            return distance > gun.stats.max_range
+                && self.sites(gun, current, 1).iter().any(|(cell, ..)| {
+                    self.distance(*cell, *target)
+                        .saturating_add(gun.stats.min_range)
+                        <= distance
+                });
         }
         // 4手番以内に今すぐ敵を撃てる陣地があるなら運ぶ。
         if self
@@ -1424,7 +1514,10 @@ impl ArtilleryFerry<'_> {
             .find(|unit| {
                 self.can_act(unit)
                     && !self.moved.contains(&unit.entity)
-                    && (is_ferried_gun(&unit.stats) || self.tends_engaged_gun(unit))
+                    && (is_ferried_gun(&unit.stats)
+                        || self.tends_engaged_gun(unit)
+                        || (is_artillery_carrier(&unit.stats)
+                            && unit.cargo.is_some_and(|cargo| cargo.loaded == 0)))
                     && !self.on_own_facility(Self::cell(unit.position))
             })
             .map(|unit| {

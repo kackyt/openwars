@@ -68,6 +68,8 @@ fn frontline_capacity_follows_scanned_node_geometry() {
         capture_targets,
         crossing_exit: None,
         crossed: false,
+        dominant_since: None,
+        capture_release: false,
         state: victory_roadmap::RoadmapNodeState::Ready,
         assigned_squads: HashSet::default(),
     };
@@ -203,18 +205,23 @@ fn capture_node_requires_secured_for_both_area_and_point() {
         capture_targets: vec![pos(2, 2)],
         crossing_exit: None,
         crossed: false,
+        dominant_since: None,
+        capture_release: false,
         state: victory_roadmap::RoadmapNodeState::Dominant,
         assigned_squads: HashSet::default(),
     };
 
     assert!(
-        !capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Area)),
-        "Areaの局地優勢も全対象の所有権確保までは後続を開けない"
+        capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Area)),
+        "地域を制圧した前衛は、施設の占領担当を残して次地域へ進める"
     );
     assert!(
         !capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Point)),
         "単一Capture拠点は所有権確保まで後続を開けない"
     );
+    let mut sustained = operation(CapitalRouteNodeScope::Area);
+    sustained.capture_release = true;
+    assert!(capital_route_node_exit_satisfied(&sustained));
 }
 
 #[test]
@@ -242,6 +249,8 @@ fn dominant_area_capture_retains_one_escort_until_secured() {
         capture_targets: vec![id.anchor],
         crossing_exit: None,
         crossed: false,
+        dominant_since: None,
+        capture_release: false,
         state,
         assigned_squads: HashSet::default(),
     };
@@ -301,6 +310,8 @@ fn capture_frontline_reserves_both_capturer_and_control_lanes() {
         capture_targets,
         crossing_exit: None,
         crossed: false,
+        dominant_since: None,
+        capture_release: false,
         state: victory_roadmap::RoadmapNodeState::Ready,
         assigned_squads: HashSet::default(),
     };
@@ -348,6 +359,8 @@ fn nearest_capture_capable_combat_squad_can_take_the_capture_lane() {
         capture_targets: vec![pos(3, 2)],
         crossing_exit: None,
         crossed: false,
+        dominant_since: None,
+        capture_release: false,
         state: victory_roadmap::RoadmapNodeState::Ready,
         assigned_squads: HashSet::default(),
     };
@@ -761,6 +774,8 @@ fn unfinished_capture_node_reserves_property_cells_for_capturers() {
             capture_targets: vec![target],
             crossing_exit: None,
             crossed: false,
+            dominant_since: None,
+            capture_release: false,
             state: victory_roadmap::RoadmapNodeState::Capturing,
             assigned_squads: HashSet::default(),
         },
@@ -1339,6 +1354,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
             UnitStats {
                 cost: 100_000,
                 movement_type: MovementType::Tank,
+                max_range: 1,
                 ..UnitStats::mock()
             },
         ));
@@ -1368,6 +1384,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
         UnitStats {
             cost: 100_000,
             movement_type: MovementType::Tank,
+            max_range: 1,
             ..UnitStats::mock()
         },
     ));
@@ -1394,6 +1411,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
         UnitStats {
             cost: 100_000,
             movement_type: MovementType::Tank,
+            max_range: 1,
             ..UnitStats::mock()
         },
     ));
@@ -2005,4 +2023,70 @@ fn squad_route_follows_the_branch_of_its_own_target() {
         squad_target_route(topology, map, &MissionType::Defense, Some(south), &closed),
         None
     );
+}
+
+/// 首都周辺の施設は首都地域の並行目標であり、首都への中継Nodeにはしない。
+#[test]
+fn capital_region_owns_adjacent_factories_without_internal_dependencies() {
+    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+    let master = MasterDataRegistry::load().unwrap();
+    for player in [PlayerId(1), PlayerId(2)] {
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master,
+            "map_20",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        prepare_capital_route_topologies(&mut world, player);
+        ensure_capital_route_node_operations(&mut world, player);
+        let registry = world.resource::<CapitalRouteNodeOperationRegistry>();
+        let topologies = world.resource::<CapitalRouteTopologyRegistry>();
+        for (key, topology) in &topologies.topologies {
+            if key.player_id != player {
+                continue;
+            }
+            let goal = topology.nodes[topology.goal_node.0].anchor;
+            let goal_id = CapitalRouteNodeOperationId {
+                topology: *key,
+                anchor: goal,
+            };
+            let region = &registry.operations[&goal_id];
+            assert_eq!(region.scope, CapitalRouteNodeScope::Area);
+            let map = world.resource::<Map>();
+            for entity in world.iter_entities() {
+                let (Some(position), Some(property)) =
+                    (entity.get::<GridPosition>(), entity.get::<Property>())
+                else {
+                    continue;
+                };
+                if property.terrain != Terrain::Factory
+                    || map.distance(position.x, position.y, goal.x, goal.y) > 1
+                {
+                    continue;
+                }
+                assert!(
+                    region.capture_targets.contains(position),
+                    "首都隣接工場 {position:?} は同じ地域の目標"
+                );
+                assert!(
+                    !registry
+                        .operations
+                        .keys()
+                        .any(|id| id.topology == *key && id.anchor == *position),
+                    "地域内部に施設Nodeを作らない"
+                );
+            }
+            for target in &region.capture_targets {
+                assert_eq!(
+                    registry
+                        .operations
+                        .values()
+                        .filter(|operation| operation.id.topology == *key
+                            && operation.capture_targets.contains(target))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
 }

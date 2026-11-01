@@ -587,7 +587,7 @@ fn logistics_route_and_capital_segment_create_deterministic_dependencies() {
         replan_reason: crate::ai::v4::logistics_plan::LogisticsReplanReason::InitialSelection,
     };
 
-    registry.rebuild_dependencies(player, Some(IslandId(3)), Some(&logistics_plan));
+    registry.rebuild_dependencies(player, Some(IslandId(3)), Some(&logistics_plan), false);
 
     assert_eq!(
         registry.roadmap(player).unwrap().dependencies,
@@ -608,6 +608,29 @@ fn logistics_route_and_capital_segment_create_deterministic_dependencies() {
                 kind: RoadmapDependencyKind::CapitalRoute,
             },
         ]
+    );
+    // 首都圏へ到達しても別の島の兵站は残し、首都島内の占領待ちだけ外す。
+    registry.rebuild_dependencies(player, Some(IslandId(3)), Some(&logistics_plan), true);
+    let dependencies = &registry.roadmap(player).unwrap().dependencies;
+    assert!(
+        dependencies
+            .iter()
+            .any(|edge| edge.predecessor == second && edge.successor == capital)
+    );
+    assert!(
+        !dependencies
+            .iter()
+            .any(|edge| edge.predecessor == capital_regional && edge.successor == capital)
+    );
+    // 首都圏から撤退した場合は前提を再構築する。
+    registry.rebuild_dependencies(player, Some(IslandId(3)), Some(&logistics_plan), false);
+    assert!(
+        registry
+            .roadmap(player)
+            .unwrap()
+            .dependencies
+            .iter()
+            .any(|edge| edge.predecessor == capital_regional && edge.successor == capital)
     );
 }
 

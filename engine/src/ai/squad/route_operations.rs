@@ -514,7 +514,7 @@ fn advanced_offensive_target(
     // key から離れており、守りの進軍路の先ではない未所有施設
     next_properties.retain(|pos| {
         map.distance(pos.x, pos.y, key.x, key.y) > 0
-            && !super::objective_allocation::beyond_defended_route(map, *pos, orders)
+            && !super::objective_allocation::beyond_defended_route(world, map, *pos, orders)
     });
 
     if let Some(&next) = next_properties

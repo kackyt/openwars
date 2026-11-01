@@ -1109,7 +1109,7 @@ fn squad_route_role(
                         && operation.id.topology.island_id == island_id
                         && operation.id != node_operation.id
                         && operation.objective == CapitalRouteNodeObjective::Capture
-                        && !capital_route_node_exit_satisfied(operation)
+                        && operation.state != victory_roadmap::RoadmapNodeState::Secured
                         && operation.capture_targets.contains(&target)
                 })
             })
@@ -1810,6 +1810,8 @@ fn ground_route_member(
     let stats = world.get::<UnitStats>(entity)?;
     if faction.0 != player_id
         || world.get::<Transporting>(entity).is_some()
+        // 非武装支援車は攻撃ルートの前衛定員・戦力を消費しない。
+        || (stats.max_range == 0 && !stats.can_capture)
         || matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
     {
         return None;

@@ -570,7 +570,8 @@ fn emplacement_site(
             .min()
         {
             let travel = cost.div_ceil(movement);
-            return Some((false, travel.max(1)));
+            // 降車した砲台はその手番に射撃できない。
+            return Some((false, travel.max(1).saturating_add(1)));
         }
         stops
             .iter()
@@ -578,7 +579,7 @@ fn emplacement_site(
             .min()
             .map(|cost| {
                 let travel = cost.div_ceil(movement).saturating_add(1);
-                (true, travel.max(1))
+                (true, travel.max(1).saturating_add(1))
             })
     };
 
@@ -1273,7 +1274,7 @@ impl<'c> CombatRun<'c> {
         self.friendly_states.push(UnitCombatState::of(unit));
     }
 
-    /// `turn` 時点で戦場に生存している地上直接戦闘unit（保護対象の占領歩兵を含む）の数。
+    /// `turn` 時点で戦場に生存している地上直接戦闘unit（保護対象の占領歩兵を除く）の数。
     fn living_ground_direct_count(&self, turn: u32) -> u32 {
         let is_ground_direct = |stats: &UnitStats| {
             stats.min_range <= 1
@@ -1288,16 +1289,8 @@ impl<'c> CombatRun<'c> {
                     && is_ground_direct(&friendly.stats)
             })
             .count();
-        let protected = self
-            .catalog
-            .protected_units
-            .iter()
-            .zip(&self.protected_states)
-            .filter(|(unit, state)| {
-                state.hp > 0 && turn >= unit.available_turn && is_ground_direct(&unit.stats)
-            })
-            .count();
-        u32::try_from(combat.saturating_add(protected)).unwrap_or(u32::MAX)
+        // 占領を守られる歩兵は砲台を守る前衛として二重に数えない。
+        u32::try_from(combat).unwrap_or(u32::MAX)
     }
 
     fn friendly(&self, index: usize) -> &'c SimFriendly {
@@ -2963,6 +2956,69 @@ mod tests {
 
     /// 橋の出口を敵が塞いでいる対岸の敵へは、直線距離ではなく迂回と押しのけを含めて
     /// 接近を見積もる。直接攻撃できる数は、敵の周りの敵のいないマスに限られる。
+    #[test]
+    fn protected_capturer_does_not_form_a_combat_screen() {
+        let mut input = input();
+        let make_unit = |unit_type, movement_type| FriendlyPlanUnit {
+            stats: UnitStats {
+                movement_type,
+                min_range: 1,
+                max_range: 1,
+                max_cargo: 0,
+                ..stats(unit_type, 1000, 3)
+            },
+            position: GridPosition { x: 1, y: 0 },
+            hp: 100,
+            available_turn: 0,
+            engageable_enemy_indices: vec![0],
+            protection_completion_turn: None,
+        };
+        input
+            .protected_units
+            .push(make_unit(UnitType::Infantry, MovementType::Infantry));
+        let catalog = SimulationCatalog::new(&input);
+        assert_eq!(
+            CombatRun::start(&catalog, &SearchState::default()).living_ground_direct_count(1),
+            0
+        );
+        input
+            .existing_units
+            .push(make_unit(UnitType::Tank, MovementType::Tank));
+        let catalog = SimulationCatalog::new(&input);
+        assert_eq!(
+            CombatRun::start(&catalog, &SearchState::default()).living_ground_direct_count(1),
+            1
+        );
+    }
+
+    #[test]
+    fn ferried_artillery_fires_after_unloading_turn() {
+        let mut input = input();
+        input.deploy_anchor = Some(GridPosition { x: 10, y: 0 });
+        let carrier = input
+            .master_data
+            .create_unit_stats(&UnitName(UnitType::SupplyTruck.as_str().to_owned()))
+            .unwrap();
+        let gun = input
+            .master_data
+            .create_unit_stats(&UnitName(UnitType::Artillery.as_str().to_owned()))
+            .unwrap();
+        let origin = GridPosition { x: 0, y: 0 };
+        let approach = ApproachMap::new(&input, &carrier, origin);
+        let (site, earliest_fire) =
+            emplacement_site(&input, &carrier, &gun, origin, &approach).unwrap();
+        assert_ne!(site, origin);
+        assert_eq!(earliest_fire, 2, "移動・降車の次の手番から射撃できる");
+        let deployed = ApproachMap::new(&input, &carrier, site);
+        assert_eq!(
+            emplacement_site(&input, &carrier, &gun, site, &deployed)
+                .unwrap()
+                .1,
+            0,
+            "既に射撃位置にいる砲台には降車遅延を加えない"
+        );
+    }
+
     #[test]
     fn approach_map_measures_bridge_crossing_and_firing_slots() {
         // x=3 の列は海で、(3,0) だけが橋。対岸の出口 (4,0) に敵が陣取る。

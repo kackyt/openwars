@@ -396,7 +396,7 @@ fn set_previous_guns(world: &mut World, seen: &[Entity]) {
 }
 
 #[test]
-fn gun_away_from_its_attack_route_boards_even_with_a_target_in_range() {
+fn gun_away_from_its_attack_route_fires_at_a_target_in_range() {
     let mut world = naval_world(&["H.............................H"]);
     property(&mut world, 2, 0, 0);
     property(&mut world, 1, 30, 0);
@@ -404,7 +404,7 @@ fn gun_away_from_its_attack_route_boards_even_with_a_target_in_range() {
     chart.insert_damage(UnitType::Artillery, UnitType::HeavySpGun, 88);
     world.insert_resource(chart);
     // 攻めの進軍路の要衝は x=3、守りの進軍路の要衝は x=29。新しく作った砲台(x=16)は
-    // 攻めの進軍路へ割り当てられ、目の前の重自走砲(x=21)を撃てても、積んで攻めの側へ運ぶ。
+    // 攻めの進軍路へ割り当てられていても、目の前の重自走砲(x=21)を先に撃つ。
     set_route_posture(
         &mut world,
         GridPosition { x: 3, y: 0 },
@@ -412,18 +412,15 @@ fn gun_away_from_its_attack_route_boards_even_with_a_target_in_range() {
     );
     set_previous_guns(&mut world, &[]);
     let gun = spawn(&mut world, 1, UnitType::Artillery, 16, 0);
-    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 15, 0);
+    let _truck = spawn(&mut world, 1, UnitType::SupplyTruck, 15, 0);
     spawn(&mut world, 2, UnitType::HeavySpGun, 21, 0);
     spawn(&mut world, 2, UnitType::HeavySpGun, 0, 0);
 
     let (entity, command) = decide(&mut world).unwrap();
     assert_eq!(entity, gun);
     assert!(
-        matches!(
-            command,
-            AiCommand::Load { transport_entity, .. } if transport_entity == truck
-        ),
-        "攻めの進軍路へ運ぶために輸送車へ乗るはず: {command:?}"
+        matches!(command, AiCommand::Attack { .. }),
+        "射程内の敵へ先に射撃する: {command:?}"
     );
 }
 
@@ -559,33 +556,29 @@ fn gun_assigned_to_a_route_that_turned_defensive_keeps_its_post() {
 }
 
 #[test]
-fn defending_gun_beyond_range_of_its_post_returns() {
+fn defending_gun_beyond_range_of_its_post_fires_before_returning() {
     let mut world = naval_world(&["H.............................H"]);
     property(&mut world, 2, 0, 0);
     property(&mut world, 1, 30, 0);
     let mut chart = DamageChart::new();
     chart.insert_damage(UnitType::Artillery, UnitType::HeavySpGun, 88);
     world.insert_resource(chart);
-    // 守りの要衝(x=25)から射程(6)より前(x=17)へ出た守りの砲台は、撃てる敵(x=12)が居ても
-    // 追わずに積んで守り場所へ戻す。
+    // 守りの要衝(x=25)から離れた砲台も、射程内の敵(x=12)を先に撃つ。
     set_route_posture(
         &mut world,
         GridPosition { x: 3, y: 0 },
         GridPosition { x: 25, y: 0 },
     );
     let gun = spawn(&mut world, 1, UnitType::Artillery, 17, 0);
-    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 18, 0);
+    let _truck = spawn(&mut world, 1, UnitType::SupplyTruck, 18, 0);
     spawn(&mut world, 2, UnitType::HeavySpGun, 12, 0);
     set_previous_guns(&mut world, &[gun]);
 
     let (entity, command) = decide(&mut world).unwrap();
     assert_eq!(entity, gun);
     assert!(
-        matches!(
-            command,
-            AiCommand::Load { transport_entity, .. } if transport_entity == truck
-        ),
-        "守り場所へ戻るために輸送車へ乗るはず: {command:?}"
+        matches!(command, AiCommand::Attack { .. }),
+        "守備位置へ戻る前に射撃する: {command:?}"
     );
 }
 
@@ -642,5 +635,33 @@ fn defending_gun_near_its_post_waits_without_a_target() {
             AiCommand::Wait { target_pos } if target_pos == GridPosition { x: 24, y: 0 }
         ),
         "その場で待つはず: {command:?}"
+    );
+}
+
+#[test]
+fn ferry_defers_boarding_until_after_normal_actions() {
+    let mut world = line_world();
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 11, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 10, 0);
+    spawn(&mut world, 2, UnitType::HeavySpGun, 2, 0);
+    let skip = HashSet::default();
+    assert!(decide_artillery_ferry_phase(&mut world, PlayerId(1), &skip, false).is_none());
+    assert!(
+        matches!(decide_artillery_ferry_phase(&mut world, PlayerId(1), &skip, true),
+        Some((entity, AiCommand::Load { transport_entity, .. })) if entity == gun && transport_entity == truck)
+    );
+}
+
+#[test]
+fn unassigned_deployed_gun_without_a_destination_does_not_board() {
+    let mut world = naval_world(&["........."]);
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 4, 0);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 5, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let action = decide(&mut world);
+    assert!(
+        !matches!(action, Some((entity, AiCommand::Load { .. })) if entity == gun),
+        "目標も展開先もない砲台を積み直さない: {action:?}"
     );
 }
