@@ -73,3 +73,61 @@ fn detour_around_mountain_remains_a_wait_candidate() {
         }
     }
 }
+
+#[test]
+fn infantry_crosses_long_bridge_over_multiple_turns() {
+    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+    let mut world = world(true);
+    let mut map = Map::new(10, 3, Terrain::Sea, crate::resources::GridTopology::Square);
+    map.set_terrain(0, 1, Terrain::Plains).unwrap();
+    for x in 1..=7 {
+        map.set_terrain(x, 1, Terrain::Bridge).unwrap();
+    }
+    map.set_terrain(8, 1, Terrain::Plains).unwrap();
+    world.insert_resource(IslandMap::analyze(&map));
+    world.insert_resource(map);
+    let infantry = spawn(&mut world, PlayerId(1), UnitType::Infantry, pos(0, 1));
+    assign(&mut world, infantry, MissionType::Capture, pos(8, 1));
+    world.insert_resource(crate::resources::Players(vec![
+        crate::resources::Player::new(1, "P1".into()),
+    ]));
+    let mut schedule = Schedule::default();
+    schedule.add_systems(crate::systems::movement::move_unit_system);
+    // 一手番では渡り切れない橋でも、実際の移動を繰り返して目標へ到達する。
+    for _ in 0..4 {
+        let (entity, command) =
+            decide_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+        assert_eq!(entity, infantry);
+        crate::ai::execute_ai_command(&mut world, infantry, command);
+        schedule.run(&mut world);
+        world.entity_mut(infantry).insert((
+            crate::components::HasMoved(false),
+            crate::components::ActionCompleted(false),
+        ));
+    }
+    assert_eq!(*world.get::<GridPosition>(infantry).unwrap(), pos(8, 1));
+}
+
+#[test]
+fn bridge_move_competes_with_actual_vehicle_attack() {
+    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+    let mut world = world(true);
+    let mut map = Map::new(
+        10,
+        3,
+        Terrain::Plains,
+        crate::resources::GridTopology::Square,
+    );
+    map.set_terrain(1, 1, Terrain::Bridge).unwrap();
+    world.insert_resource(IslandMap::analyze(&map));
+    world.insert_resource(map);
+    let infantry = spawn(&mut world, PlayerId(1), UnitType::Infantry, pos(0, 1));
+    assign(&mut world, infantry, MissionType::Capture, pos(8, 1));
+    let tank = spawn(&mut world, PlayerId(1), UnitType::Tank, pos(0, 0));
+    assign(&mut world, tank, MissionType::Attack, pos(8, 1));
+    let enemy = spawn(&mut world, PlayerId(2), UnitType::Infantry, pos(2, 1));
+    // 車両の合法な攻撃も、歩兵の橋への移動と同じ決定器で比較される。
+    let (entity, command) = decide_action(&mut world, PlayerId(1), &HashSet::default()).unwrap();
+    assert_eq!(entity, tank);
+    assert!(matches!(command, AiCommand::Attack { target_entity, .. } if target_entity == enemy));
+}
