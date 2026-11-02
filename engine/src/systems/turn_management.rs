@@ -226,7 +226,10 @@ fn apply_income(
     // 収入を加算した結果が100,000以上（上限超え）の場合は強制的に最大値99,999とし、
     // その後の補給処理でそこから補給費用が差し引かれます。
     if let Some(player) = players.0.iter_mut().find(|p| p.id == active_player_id) {
-        player.funds = player.funds.saturating_add(budget_increase).min(MAX_FUNDS);
+        player.funds = player
+            .funds
+            .saturating_add(budget_increase)
+            .min(Player::MAX_FUNDS);
     }
 }
 
@@ -1028,7 +1031,7 @@ mod tests {
         schedule.run(&mut world);
 
         // 95,000 + 10,000 = 105,000 >= 100,000 なので、上限の99,999に丸められる
-        assert_eq!(world.resource::<Players>().0[1].funds, MAX_FUNDS);
+        assert_eq!(world.resource::<Players>().0[1].funds, Player::MAX_FUNDS);
     }
 
     #[test]
@@ -1091,7 +1094,10 @@ mod tests {
         schedule.run(&mut world);
 
         // 99,999 - 3350 = 96,649G
-        assert_eq!(world.resource::<Players>().0[1].funds, 99_999 - 3350);
+        assert_eq!(
+            world.resource::<Players>().0[1].funds,
+            Player::MAX_FUNDS.saturating_sub(3350)
+        );
 
         // ユニットのHP、燃料、弾薬が回復・補給されていること
         let health = world.get::<Health>(tank).unwrap();
