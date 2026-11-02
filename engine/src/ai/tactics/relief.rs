@@ -70,7 +70,6 @@ fn site_relief(
         player_id,
         &production_positions,
         include_active_missions,
-        is_extended_path,
     )?;
     let (occupied, unit_positions) = collect_unit_occupancy(world);
 
@@ -140,7 +139,6 @@ fn collect_relief_groups(
     player_id: PlayerId,
     production_positions: &HashSet<(usize, usize)>,
     include_active_missions: bool,
-    is_extended_path: bool,
 ) -> Option<Vec<(Vec<Entity>, Option<GridPosition>)>> {
     let manager = world.get_resource::<SquadManager>()?;
     let mut forming_groups: Vec<(Vec<Entity>, Option<GridPosition>)> = manager
@@ -193,20 +191,9 @@ fn collect_relief_groups(
                             || squad.plan.departure_authorized)
                 })
                 .map(|squad| {
-                    // 通常executorより先に工場を空ける場合も、DAG orderがあれば
-                    // 古いSquad.targetではなく現在Nodeの指令先を使う。
-                    let route_target = is_extended_path
-                        .then(|| {
-                            squad.members.iter().find_map(|entity| {
-                                crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
-                                    world, player_id, *entity,
-                                )
-                            })
-                        })
-                        .flatten();
                     (
                         squad.members.iter().copied().collect::<Vec<_>>(),
-                        route_target.unwrap_or(squad.plan.target),
+                        squad.plan.target,
                     )
                 }),
         );
@@ -339,6 +326,17 @@ fn select_relief_action_for_unit(
     let fuel = world
         .get::<crate::components::Fuel>(entity)
         .map_or(u32::MAX, |fuel| fuel.current);
+    // 工場からの最初の一歩も、通常V4の確定地域と各unitの役割を正本にする。
+    let follows_dag =
+        crate::ai::resolve_player_ai_version(world, player_id) == crate::ai::AiVersion::V4;
+    let mission_target = if follows_dag {
+        crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+            world, player_id, entity,
+        )
+        .unwrap_or(mission_target)
+    } else {
+        mission_target
+    };
     let reachable = calculate_reachable_tiles(
         map,
         unit_positions,
@@ -357,7 +355,7 @@ fn select_relief_action_for_unit(
     };
     // V4のDAG所属unitは、工場退避でも同じセル列を進む。単なる目標距離で
     // 選ぶと、map_25で敵側Nodeとは逆の旧Squad.targetへ初手だけ逸脱する。
-    let route_destination = is_extended_path
+    let route_destination = follows_dag
         .then(|| {
             crate::ai::v4::capital_route::tactical::capital_route_advance_destination(
                 world, player_id, entity, &reachable,
@@ -383,6 +381,7 @@ fn select_relief_action_for_unit(
     // 標準V4の早い退避では、任務目標から遠ざかる退避はしない。先に動く味方が目標側の
     // マスを空けた後の退避（遅い退避）で、目標へ近づく向きに工場を空ける。
     if require_progress
+        && route_destination.is_none()
         && let Some(target) = mission_target
         && map.distance(destination.0, destination.1, target.x, target.y)
             >= map.distance(position.x, position.y, target.x, target.y)

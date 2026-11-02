@@ -90,6 +90,11 @@ pub(in crate::ai::v4) fn capital_route_role_frontline_capacity(
     operation: &CapitalRouteNodeOperation,
     capture_role: bool,
 ) -> usize {
+    // 橋の一点へ立つ先遣と、そこを撃ち開く支援は同じ占位枠ではない。
+    // Control Pointでも、占領可能な先遣が唯一の戦闘支援枠を消費しない。
+    if operation.scope == CapitalRouteNodeScope::Point {
+        return 1;
+    }
     let total = capital_route_node_frontline_capacity(operation);
     if operation.objective != CapitalRouteNodeObjective::Capture {
         return total;
@@ -113,6 +118,9 @@ pub(in crate::ai::v4) fn capital_route_uses_capture_lane(
     capture_member_count: usize,
     assigned_capture_members: usize,
 ) -> bool {
+    if operation.scope == CapitalRouteNodeScope::Point {
+        return matches!(mission, MissionType::Capture) || capture_member_count > 0;
+    }
     if operation.objective != CapitalRouteNodeObjective::Capture {
         return false;
     }
@@ -278,7 +286,8 @@ pub(in crate::ai::v4) fn capital_route_dominant_capture_escort_node(
                 .is_some_and(|operation| {
                     operation.objective == CapitalRouteNodeObjective::Capture
                         && operation.scope == CapitalRouteNodeScope::Area
-                        && operation.state == victory_roadmap::RoadmapNodeState::Dominant
+                        && operation.local_control
+                        && operation.state != victory_roadmap::RoadmapNodeState::Secured
                 })
         })
 }
@@ -323,43 +332,43 @@ pub(in crate::ai::v4) fn capital_route_dag_nodes_for_target(
             .any(|successor| reaches_target[successor.0]);
     }
     let map = world.get_resource::<Map>()?;
-    let first = topology.nodes[topology.start_node.0]
-        .successor_nodes
-        .iter()
-        .copied()
-        .filter(|node| reaches_target[node.0])
-        .min_by_key(|node| {
-            let front = topology.routes[route.0].front;
-            (
-                map.distance(
-                    topology.nodes[node.0].anchor.x,
-                    topology.nodes[node.0].anchor.y,
-                    front.x,
-                    front.y,
-                ),
-                topology.nodes[node.0].anchor.y,
-                topology.nodes[node.0].anchor.x,
-            )
-        })?;
-    let mut path = vec![topology.start_node, first];
-    let mut current = first;
+    let front = topology.routes.get(route.0)?.front;
+    let front_node = topology.node_at(front)?;
+    let mut reaches_front = vec![false; topology.nodes.len()];
+    reaches_front[front_node.0] = true;
+    for index in (0..topology.nodes.len()).rev() {
+        reaches_front[index] |= topology.nodes[index]
+            .successor_nodes
+            .iter()
+            .any(|successor| reaches_front[successor.0]);
+    }
+    // 入口への近さを各セルで貪欲に比較するだけでは、担当した橋を通らず
+    // 別回廊へ流れる。目標へつながる入口なら必ずその入口を経由する。
+    let mut via_front = reaches_target[front_node.0] && reaches_front[topology.start_node.0];
+    let mut path = vec![topology.start_node];
+    let mut current = topology.start_node;
     while current != target_node {
+        if current == front_node {
+            via_front = false;
+        }
         let next = topology.nodes[current.0]
             .successor_nodes
             .iter()
             .copied()
-            .filter(|node| reaches_target[node.0])
+            .filter(|node| {
+                if via_front {
+                    reaches_front[node.0]
+                } else {
+                    reaches_target[node.0]
+                }
+            })
             .min_by_key(|node| {
-                let front = topology.routes[route.0].front;
+                let destination = if via_front { front } else { target };
+                let at = topology.nodes[node.0].anchor;
                 (
-                    map.distance(
-                        topology.nodes[node.0].anchor.x,
-                        topology.nodes[node.0].anchor.y,
-                        front.x,
-                        front.y,
-                    ),
-                    topology.nodes[node.0].anchor.y,
-                    topology.nodes[node.0].anchor.x,
+                    map.distance(at.x, at.y, destination.x, destination.y),
+                    at.y,
+                    at.x,
                 )
             })?;
         path.push(next);
@@ -431,6 +440,11 @@ struct RouteSquad {
     ground_member_count: usize,
     capture_member_count: usize,
     frontline_control_value: u64,
+    capital_destination: bool,
+    geographic_route: Option<usize>,
+    ground_positions: Vec<GridPosition>,
+    ground_members: Vec<Entity>,
+    route_operation: bool,
 }
 
 /// 今回の割当で共有する読み取り専用の盤面と前回指令。
@@ -485,12 +499,24 @@ struct SquadRouteRole {
     forward_target: GridPosition,
 }
 
+/// 現在地域と役割を先に確定し、実到達時間で前衛枠の配分順を決める。
+struct PreparedRouteSquad<'a> {
+    squad: &'a RouteSquad,
+    route: usize,
+    target: GridPosition,
+    active_anchor: GridPosition,
+    route_path: SquadRoutePath,
+    node_operation: CapitalRouteNodeOperation,
+    role: SquadRouteRole,
+}
+
 /// 一個のSquadの地上member・占領力・前進度を観測する。島境界を越える候補は除外する。
 fn route_squad(
     context: &AssignmentContext<'_>,
     squad: &crate::ai::squad::Squad,
     island_map: &crate::ai::islands::IslandMap,
     topology_islands: &HashSet<crate::ai::islands::IslandId>,
+    route_operation_members: &HashMap<Entity, GridPosition>,
 ) -> Option<(crate::ai::islands::IslandId, RouteSquad)> {
     let world = context.world;
     let player_id = context.player_id;
@@ -531,6 +557,39 @@ fn route_squad(
             })
             .max()
             .unwrap_or(0);
+        let topology = capital_route_topology_for(world, player_id, island_id)?;
+        let goal = topology.nodes[topology.goal_node.0].anchor;
+        // 射撃位置から目的を推測しない。進軍作戦への所属は本隊という意図だけを表す。
+        // 作戦の要衝座標は局地戦で更新されるため、固定の方面IDとして再解釈しない。
+        let route_operation = squad
+            .members
+            .iter()
+            .any(|entity| route_operation_members.contains_key(entity));
+        let capital_destination = crate::ai::strategy_profile::current_profile(world, player_id)
+            != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+            && ((route_operation && squad.plan.mission_type == MissionType::Attack)
+                || squad.plan.target.is_some_and(|target| {
+                    route_target_node_anchor(world, player_id, island_id, target) == goal
+                }));
+        let geographic_route = topology
+            .route_distances
+            .iter()
+            .enumerate()
+            .filter_map(|(route, distances)| {
+                let costs = squad
+                    .members
+                    .iter()
+                    .filter_map(|entity| world.get::<GridPosition>(*entity))
+                    .filter_map(|at| distances.get(at))
+                    .copied()
+                    .collect::<Vec<_>>();
+                (!costs.is_empty()).then_some((
+                    costs.iter().map(|cost| u64::from(*cost)).sum::<u64>(),
+                    route,
+                ))
+            })
+            .min()
+            .map(|(_, route)| route);
         return Some((
             island_id,
             RouteSquad {
@@ -542,6 +601,26 @@ fn route_squad(
                 ground_member_count,
                 capture_member_count,
                 frontline_control_value,
+                capital_destination,
+                geographic_route,
+                ground_positions: squad
+                    .members
+                    .iter()
+                    .filter_map(|entity| {
+                        ground_route_member(context, *entity, island_map, topology_islands)?;
+                        world.get::<GridPosition>(*entity).copied()
+                    })
+                    .collect(),
+                ground_members: squad
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|entity| {
+                        ground_route_member(context, *entity, island_map, topology_islands)
+                            .is_some()
+                    })
+                    .collect(),
+                route_operation,
             },
         ));
     }
@@ -572,8 +651,13 @@ fn collect_route_squads(
                 .iter()
                 .any(|entity| explicit_deployments.contains(entity))
     }) {
-        if let Some((island, candidate)) = route_squad(context, squad, island_map, topology_islands)
-        {
+        if let Some((island, candidate)) = route_squad(
+            context,
+            squad,
+            island_map,
+            topology_islands,
+            &manager.route_operation_members,
+        ) {
             squads_by_island.entry(island).or_default().push(candidate);
         }
     }
@@ -592,6 +676,7 @@ fn route_quotas(
     // 拠点の確保により次の区間へ進む。
     let frontiers = capital_route_dag_frontier_properties(world, player_id, island_id)
         .unwrap_or_else(|| vec![Vec::new(); topology.routes.len()]);
+    let goal = topology.nodes[topology.goal_node.0].anchor;
     let targets = frontiers
         .iter()
         .map(|properties| {
@@ -599,6 +684,8 @@ fn route_quotas(
                 .first()
                 .copied()
                 .map(|property| route_target_node_anchor(world, player_id, island_id, property))
+                // 各回廊は同じ首都へ合流する。途中施設が尽きても枝を終了しない。
+                .or(Some(goal))
         })
         .collect::<Vec<_>>();
     let mut demands = same_land_route_force_demands(world, player_id, island_id);
@@ -692,7 +779,7 @@ fn retain_previous_routes(
         if commitment.player_id != player_id
             || commitment.island_id != island_id
             || targets.get(route).copied().flatten() != Some(commitment.target)
-            || squad_target_route(topology, map, &squad.mission, squad.target, targets)
+            || preferred_squad_route(topology, map, squad, targets)
                 .is_some_and(|target_route| target_route != route)
         {
             continue;
@@ -744,6 +831,19 @@ pub(in crate::ai::v4) fn squad_target_route(
         .then_some(route)
 }
 
+/// 合流点や更新される射撃座標から方面を推測せず、首都へ向かう本隊は地形経路の近い軸を保つ。
+fn preferred_squad_route(
+    topology: &CapitalRouteTopology,
+    map: &Map,
+    squad: &RouteSquad,
+    targets: &[Option<GridPosition>],
+) -> Option<usize> {
+    squad
+        .geographic_route
+        .filter(|_| squad.capital_destination)
+        .or_else(|| squad_target_route(topology, map, &squad.mission, squad.target, targets))
+}
+
 /// 未配分Squadを占領目標または不足枠の順で枝へ置く。同点時の枝番号を保つ。
 fn assign_remaining_routes(
     topology: &CapitalRouteTopology,
@@ -765,8 +865,7 @@ fn assign_remaining_routes(
         if assigned_routes.contains_key(&squad.id) {
             continue;
         }
-        let preferred_target_route =
-            squad_target_route(topology, map, &squad.mission, squad.target, targets);
+        let preferred_target_route = preferred_squad_route(topology, map, squad, targets);
         let route = preferred_target_route.or_else(|| {
             (0..topology.routes.len())
                 .filter(|route| targets[*route].is_some())
@@ -887,17 +986,13 @@ fn assign_island_routes(
         staged_squads: HashMap::default(),
         retained_capture_escorts: HashSet::default(),
     };
-    for squad in &squads {
-        assign_route_squad(
-            context,
-            island_id,
-            topology,
-            &allocation,
-            squad,
-            &mut state,
-            draft,
-        );
-    }
+    let prepared = squads
+        .iter()
+        .filter_map(|squad| {
+            prepare_route_squad(context, island_id, topology, &allocation, squad, &mut state)
+        })
+        .collect::<Vec<_>>();
+    allocate_prepared_route_squads(context, island_id, prepared, &mut state, draft);
     draft.assignment_diagnostics.insert(
         CapitalRouteTopologyKey {
             player_id,
@@ -910,6 +1005,34 @@ fn assign_island_routes(
             path_unavailable_by_route: state.path_unavailable_counts,
         },
     );
+}
+
+/// 地域・役割を確定した後でのみ到達時間を比較し、同じNodeの前衛枠を配る。
+fn allocate_prepared_route_squads(
+    context: &AssignmentContext<'_>,
+    island_id: crate::ai::islands::IslandId,
+    mut prepared: Vec<PreparedRouteSquad<'_>>,
+    state: &mut IslandAssignment,
+    draft: &mut CommitmentDraft,
+) {
+    let mut distances = crate::ai::turn_distance::SourceTurnDistanceCache::default();
+    // 自首都から遠い側方部隊ではなく、実際の地域・橋出口へ早く着く部隊を前衛にする。
+    // 同着なら従来の役割・戦力・安定ID順を保ち、戦略上の枝配分は変更しない。
+    prepared.sort_by_cached_key(|order| {
+        (
+            frontline_arrival(context, order, &mut distances),
+            capital_route_frontline_sort_key(
+                order.squad.forward_progress,
+                &order.squad.mission,
+                order.squad.capture_member_count,
+                order.squad.frontline_control_value,
+                order.squad.id,
+            ),
+        )
+    });
+    for order in prepared {
+        assign_prepared_route_squad(context, island_id, order, state, draft);
+    }
 }
 
 /// 移動用セル列と作戦Milestone列を取り出す。経路不能は呼出し元で一度だけ数える。
@@ -1012,6 +1135,49 @@ fn active_squad_node(
             )
         })
         .unwrap_or(target_anchor);
+    if let Some(registry) = world.get_resource::<CapitalRouteNodeOperationRegistry>() {
+        let active_index = operation_path
+            .iter()
+            .position(|anchor| *anchor == active_anchor)
+            .unwrap_or(0);
+        // 既に前方地域へ実到達した小隊は、他の方面の前提が未完了でも呼び戻さない。
+        // 到達判定は代表点ではなく、地形から構築した地域の実セルで行う。
+        if let Some((index, _)) = operation_path
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, anchor)| {
+                *index > active_index
+                    && registry
+                        .operations
+                        .get(&CapitalRouteNodeOperationId {
+                            topology: topology_key,
+                            anchor: **anchor,
+                        })
+                        .is_some_and(|operation| {
+                            operation.scope == CapitalRouteNodeScope::Area
+                                && squad
+                                    .ground_positions
+                                    .iter()
+                                    .any(|at| operation.control_area.contains(at))
+                        })
+            })
+        {
+            active_anchor = operation_path[index..]
+                .iter()
+                .copied()
+                .find(|anchor| {
+                    registry
+                        .operations
+                        .get(&CapitalRouteNodeOperationId {
+                            topology: topology_key,
+                            anchor: *anchor,
+                        })
+                        .is_none_or(|operation| !capital_route_node_exit_satisfied(operation))
+                })
+                .unwrap_or(target_anchor);
+        }
+    }
     if squad.capture_member_count == 0
         && squad.mission == MissionType::Attack
         && preferred_capture_escort_by_route
@@ -1088,18 +1254,34 @@ fn squad_route_role(
     // 既存targetが別枝の首都側を指していても、現在Nodeより前方ならControl
     // Squadである。現在Nodeを飛ばして遠方targetへ行かせず、まずAreaを制圧する。
     let target_is_on_or_beyond_active_node = squad.target.is_some_and(|target| {
-        path.contains(&target)
-            || topology
+        if let Some(target_index) = path.iter().position(|cell| *cell == target) {
+            target_index
+                >= path
+                    .iter()
+                    .position(|cell| *cell == node_operation.anchor)
+                    .unwrap_or(path.len())
+        } else {
+            topology
                 .from_home
                 .get(&target)
                 .is_some_and(|progress| *progress >= active_node_progress)
+        }
     });
     // Captureの明示目標は、単に自首都から遠いだけでは現在Nodeへ
     // 取り込まない。現在Nodeの拠点、または選択済みDAG経路上の目標だけが
     // Roadmapに属し、外周の拠点任務はSquad独自の進路を保つ。
-    let capture_target_matches_active_route = squad.target.is_some_and(|target| {
-        path.contains(&target) || node_operation.capture_targets.contains(&target)
-    });
+    // 小規模拡張は全施設の同時割当を使う専用工程を維持する。
+    let explicit_capital_destination =
+        crate::ai::strategy_profile::current_profile(world, player_id)
+            != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+            && route_target.1 == topology.nodes[topology.goal_node.0].anchor
+            && squad.target.is_some_and(|target| {
+                route_target_node_anchor(world, player_id, island_id, target) == route_target.1
+            });
+    let capture_target_matches_active_route = explicit_capital_destination
+        || squad.target.is_some_and(|target| {
+            path.contains(&target) || node_operation.capture_targets.contains(&target)
+        });
     let target_belongs_to_other_capture_node = squad.target.is_some_and(|target| {
         world
             .get_resource::<CapitalRouteNodeOperationRegistry>()
@@ -1118,7 +1300,7 @@ fn squad_route_role(
         &squad.mission,
         squad.target.is_some(),
         capture_target_matches_active_route,
-        target_belongs_to_other_capture_node,
+        target_belongs_to_other_capture_node && !explicit_capital_destination,
     ) {
         // 後方・別枝の地域占領はSquad orderを正本とし、DAG commitmentを
         // 作らない。完了後に前方目標へ変われば、現在Nodeへ再参加する。
@@ -1172,10 +1354,10 @@ fn squad_forward_target(
         // 将来的に地上輸送SquadがDAG orderを持つ場合も、配送先が区間外なら
         // 前線拠点を使う。現行ではTransport Squadをorder対象から除外している。
         CapitalRouteExecutionPhase::Supply => directive_target.unwrap_or(target),
-        // 防衛は任意の後方待機ではなく、指定された同一区間の拠点、または
-        // Gate/最後に確保した拠点までを守備範囲にする。
+        // 保持役の具体的な防衛・射撃位置は回廊セル上とは限らない。
+        // 明示された地点を保持し、指示がない場合だけ後方拠点へ補完する。
         CapitalRouteExecutionPhase::Hold => {
-            if let Some(target) = directive_target {
+            if let Some(target) = squad.target {
                 target
             } else {
                 let gate_index = path
@@ -1216,6 +1398,19 @@ fn allocate_frontline_phase(
     let staged_squads = &mut state.staged_squads;
     let requested_phase = role.requested_phase;
     let forward_target = role.forward_target;
+    // 間接射撃は橋上の占位枠を使わない。通過役と同じ枠で制限すると、
+    // 一門だけを前へ出して残りの砲兵・戦車を後方へ押し戻し、橋を撃ち開けない。
+    if requested_phase == CapitalRouteExecutionPhase::Advance
+        && node_operation.scope == CapitalRouteNodeScope::Point
+        && !squad.ground_members.is_empty()
+        && squad.ground_members.iter().all(|entity| {
+            world
+                .get::<UnitStats>(*entity)
+                .is_some_and(|stats| stats.min_range > 1)
+        })
+    {
+        return (requested_phase, forward_target, false);
+    }
     let assigned_capture_members = frontline_members
         .get(&(operation_id, true))
         .copied()
@@ -1279,29 +1474,50 @@ fn record_frontline_role(
     }
 }
 
-/// 経路・Node・役割・前衛枠の結果を一つのSquad指令として組み立てる。
-fn assign_route_squad(
+/// 前衛枠を消費する前に、各Squadの地域・役割・経路を確定する。
+fn prepare_route_squad<'a>(
     context: &AssignmentContext<'_>,
     island_id: crate::ai::islands::IslandId,
     topology: &CapitalRouteTopology,
     allocation: &RouteAllocation,
-    squad: &RouteSquad,
+    squad: &'a RouteSquad,
     state: &mut IslandAssignment,
-    draft: &mut CommitmentDraft,
-) {
+) -> Option<PreparedRouteSquad<'a>> {
     let world = context.world;
     let player_id = context.player_id;
-    let Some(route) = allocation.assigned_routes.get(&squad.id).copied() else {
-        return;
-    };
-    let Some(target) = allocation.targets[route] else {
-        return;
-    };
+    let route = allocation.assigned_routes.get(&squad.id).copied()?;
+    let mut target = allocation.targets[route]?;
+    // 首都圏への明示的な作戦命令を、枝の先頭に残る側方拠点で上書きしない。
+    // 終点だけを維持し、実際の当面目標は下の地域列・橋Gateから求める。
+    // 他のSquadは従来どおり途中地域を処理するので、全軍の首都集中にはならない。
+    let goal = topology.nodes[topology.goal_node.0].anchor;
+    // 地域への前進作戦は首都を終点とし、現在地域は次の実行区間として残す。
+    // これを同じtargetへ潰すと、局地目標の更新ごとに首都への進軍命令を失う。
+    let regional_offensive = squad.mission == MissionType::Attack
+        && (squad.route_operation
+            || squad.target.is_some_and(|position| {
+                position == topology.routes[route].front
+                    || (!context.owned_properties.contains(&position)
+                        && topology.property_routes.get(&position) == Some(&CapitalRouteId(route)))
+            }));
+    if crate::ai::strategy_profile::current_profile(world, player_id)
+        != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+        && matches!(
+            squad.mission,
+            MissionType::Attack | MissionType::Capture | MissionType::Defense
+        )
+        && (regional_offensive
+            || squad.target.is_some_and(|position| {
+                route_target_node_anchor(world, player_id, island_id, position) == goal
+            }))
+    {
+        target = goal;
+    }
     let Some(route_path) = squad_route_path(world, player_id, island_id, topology, route, target)
     else {
         state.path_unavailable_counts[route] =
             state.path_unavailable_counts[route].saturating_add(1);
-        return;
+        return None;
     };
     let active_anchor = active_squad_node(
         context,
@@ -1319,9 +1535,9 @@ fn assign_route_squad(
     let Some(node_operation) = assigned_node_operation(world, topology_key, active_anchor) else {
         state.path_unavailable_counts[route] =
             state.path_unavailable_counts[route].saturating_add(1);
-        return;
+        return None;
     };
-    let Some(role) = squad_route_role(
+    let role = squad_route_role(
         context,
         topology_key,
         topology,
@@ -1329,9 +1545,90 @@ fn assign_route_squad(
         &node_operation,
         &route_path.path,
         (route, target),
-    ) else {
-        return;
+    )?;
+    Some(PreparedRouteSquad {
+        squad,
+        route,
+        target,
+        active_anchor,
+        route_path,
+        node_operation,
+        role,
+    })
+}
+
+/// 地域入口までの地形移動時間。Pointだけは橋向こうの出口へ実到達する必要がある。
+fn frontline_arrival(
+    context: &AssignmentContext<'_>,
+    order: &PreparedRouteSquad<'_>,
+    cache: &mut crate::ai::turn_distance::SourceTurnDistanceCache,
+) -> (u32, u32) {
+    let world = context.world;
+    let Some(map) = world.get_resource::<Map>() else {
+        return (u32::MAX, u32::MAX);
     };
+    let Some(master) = world.get_resource::<MasterDataRegistry>() else {
+        return (u32::MAX, u32::MAX);
+    };
+    order
+        .squad
+        .ground_members
+        .iter()
+        .filter_map(|entity| {
+            if crate::ai::v4::capital_route::tactical::capital_route_is_recovering(
+                world,
+                context.player_id,
+                *entity,
+            ) {
+                return None;
+            }
+            let at = world.get::<GridPosition>(*entity)?;
+            let stats = world.get::<UnitStats>(*entity)?;
+            let distances = crate::ai::turn_distance::calculate_source_turn_distances_cached(
+                map,
+                master,
+                &HashMap::default(),
+                (at.x, at.y),
+                stats.movement_type,
+                stats.max_movement,
+                context.player_id,
+                cache,
+            );
+            if order.node_operation.scope == CapitalRouteNodeScope::Point {
+                distances.get(&order.role.forward_target).copied()
+            } else {
+                order
+                    .node_operation
+                    .control_area
+                    .iter()
+                    .filter_map(|cell| distances.get(cell))
+                    .copied()
+                    .min()
+            }
+        })
+        .min()
+        .map(|distance| (distance.turns, distance.used_mp))
+        .unwrap_or((u32::MAX, u32::MAX))
+}
+
+/// 到達順で確定済みの地域へ前衛枠を割り当て、一つのSquad指令を作る。
+fn assign_prepared_route_squad(
+    context: &AssignmentContext<'_>,
+    island_id: crate::ai::islands::IslandId,
+    order: PreparedRouteSquad<'_>,
+    state: &mut IslandAssignment,
+    draft: &mut CommitmentDraft,
+) {
+    let player_id = context.player_id;
+    let PreparedRouteSquad {
+        squad,
+        route,
+        target,
+        active_anchor,
+        route_path,
+        node_operation,
+        role,
+    } = order;
     let frontline_capacity = capital_route_node_frontline_capacity(&node_operation);
     let (phase, execution_target, uses_capture_lane) = allocate_frontline_phase(
         context,
@@ -1670,6 +1967,9 @@ pub fn capital_route_diagnostics_for_player(
                     "squad_phase": squad_phase,
                     "squad_target_x": squad_target.map(|target| target.x),
                     "squad_target_y": squad_target.map(|target| target.y),
+                    "route_operation_target": world.get_resource::<crate::ai::squad::SquadManager>()
+                        .and_then(|manager| manager.route_operation_members.get(&entity.id()))
+                        .map(|point| serde_json::json!({"x": point.x, "y": point.y})),
                     "departure_authorized": departure_authorized,
                     "operation_squad_id": operation_squad_id.map(|squad_id| squad_id.0),
                     "order_resolved": order_resolved,
@@ -1736,6 +2036,10 @@ pub fn capital_route_diagnostics_for_player(
                         "x": operation.anchor.x,
                         "y": operation.anchor.y,
                         "state": format!("{:?}", operation.state),
+                        "local_control": operation.local_control,
+                        "forward_released": capital_route_node_exit_satisfied(operation),
+                        "capture_complete": operation.objective == CapitalRouteNodeObjective::Capture
+                            && operation.state == victory_roadmap::RoadmapNodeState::Secured,
                         "objective": format!("{:?}", operation.objective),
                         "scope": format!("{:?}", operation.scope),
                         "control_area": operation.control_area.iter().map(|position| {
@@ -1835,4 +2139,137 @@ fn ground_route_member(
         can_capture: stats.can_capture,
         control_value: frontline_control_value,
     })
+}
+
+#[cfg(test)]
+mod arrival_tests {
+    use super::*;
+    use crate::ai::v4::test_support::{flat_map, pos};
+
+    /// 側方へ遠回りした部隊が、出口直前の部隊を後方待機へ押しのけない。
+    #[test]
+    fn closest_bridge_capturer_advances_before_a_more_distant_lateral_squad() {
+        let player = PlayerId(1);
+        let island = crate::ai::islands::IslandId(0);
+        let mut world = World::new();
+        world.insert_resource(flat_map(30, 20));
+        let master = MasterDataRegistry::load().unwrap();
+        let stats = master
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Infantry.as_str().to_owned(),
+            ))
+            .unwrap();
+        let far_at = pos(25, 1);
+        let near_at = pos(9, 9);
+        let far = world
+            .spawn((
+                far_at,
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let near = world
+            .spawn((
+                near_at,
+                stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        world.insert_resource(master);
+        let make_squad = |entity, at, progress, id| RouteSquad {
+            id: SquadId(id),
+            operation_id: crate::ai::squad::SquadOperationId(u64::from(id)),
+            mission: MissionType::Capture,
+            target: Some(pos(10, 11)),
+            forward_progress: progress,
+            ground_member_count: 1,
+            capture_member_count: 1,
+            frontline_control_value: 0,
+            capital_destination: true,
+            geographic_route: Some(0),
+            ground_positions: vec![at],
+            ground_members: vec![entity],
+            route_operation: false,
+        };
+        // 自首都(0,0)からの距離では遠方が先になる条件を作る。
+        let far_squad = make_squad(far, far_at, 26, 1);
+        let near_squad = make_squad(near, near_at, 18, 2);
+        let anchor = pos(10, 10);
+        let exit = pos(10, 11);
+        let operation = CapitalRouteNodeOperation {
+            id: CapitalRouteNodeOperationId {
+                topology: CapitalRouteTopologyKey {
+                    player_id: player,
+                    island_id: island,
+                },
+                anchor,
+            },
+            anchor,
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            objective: CapitalRouteNodeObjective::Control,
+            scope: CapitalRouteNodeScope::Point,
+            control_area: vec![anchor, exit],
+            capture_targets: Vec::new(),
+            crossing_exit: Some(exit),
+            crossed: false,
+            local_control: false,
+            state: victory_roadmap::RoadmapNodeState::Ready,
+            assigned_squads: Default::default(),
+        };
+        let prepare = |squad| PreparedRouteSquad {
+            squad,
+            route: 0,
+            target: exit,
+            active_anchor: anchor,
+            route_path: SquadRoutePath {
+                path: vec![pos(0, 0), anchor, exit],
+                target_anchor: exit,
+                operation_path: vec![anchor],
+            },
+            node_operation: operation.clone(),
+            role: SquadRouteRole {
+                is_capture_squad: true,
+                is_control_squad: false,
+                requested_phase: CapitalRouteExecutionPhase::Advance,
+                forward_target: exit,
+            },
+        };
+        let existing = CapitalRoutePathRegistry::default();
+        let context = AssignmentContext {
+            world: &world,
+            player_id: player,
+            existing: &existing,
+            owned_properties: &HashSet::default(),
+        };
+        let mut state = IslandAssignment {
+            committed_counts: vec![0],
+            path_unavailable_counts: vec![0],
+            frontline_members: Default::default(),
+            staged_squads: Default::default(),
+            retained_capture_escorts: Default::default(),
+        };
+        let mut draft = CommitmentDraft::default();
+        allocate_prepared_route_squads(
+            &context,
+            island,
+            vec![prepare(&far_squad), prepare(&near_squad)],
+            &mut state,
+            &mut draft,
+        );
+        assert_eq!(
+            draft.commitments[&near_squad.id].phase,
+            CapitalRouteExecutionPhase::Advance
+        );
+        assert_eq!(
+            draft.commitments[&far_squad.id].phase,
+            CapitalRouteExecutionPhase::Stage
+        );
+    }
 }

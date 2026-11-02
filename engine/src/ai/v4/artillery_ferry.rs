@@ -163,6 +163,33 @@ pub(crate) fn decide_artillery_ferry_phase(
         .collect::<HashMap<_, _>>();
     let occupancy = board.occupancy();
     let threat = ThreatMap::new(&board, &chart, &occupancy, player_id);
+    let regional_targets = world
+        .get_resource::<GunRouteAssignment>()
+        .and_then(|memory| memory.by_player.get(&player_id))
+        .map(|memory| {
+            memory
+                .regions
+                .iter()
+                .filter_map(|(entity, area)| {
+                    let gun = board.units.iter().find(|unit| unit.entity == *entity)?;
+                    let targets = board
+                        .units
+                        .iter()
+                        .filter(|enemy| {
+                            enemy.owner != player_id
+                                && enemy.is_deployed()
+                                && area.contains(&enemy.position)
+                                && enemy.health.is_none_or(|hp| hp > 0)
+                                && best_damage(&chart, gun.stats.unit_type, enemy.stats.unit_type)
+                                    > 0
+                        })
+                        .map(|enemy| enemy.entity)
+                        .collect::<HashSet<_>>();
+                    (!targets.is_empty()).then_some((*entity, targets))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let ferry = ArtilleryFerry {
         board: &board,
         chart: &chart,
@@ -173,6 +200,7 @@ pub(crate) fn decide_artillery_ferry_phase(
         skip,
         routes: &routes,
         guards: &guards,
+        regional_targets: &regional_targets,
     };
     let decision = if post {
         ferry
@@ -213,9 +241,11 @@ pub(crate) struct GunRouteAssignment {
 
 #[derive(Debug, Clone, Default)]
 struct GunRoutes {
-    /// 割り当てを決めた手番。手番の途中では決め直さない。
+    /// 互換の要衝割当を決めた手番。確定DAG指示の更新は同手番でも投影する。
     turn: u32,
     routes: HashMap<Entity, GridPosition>,
+    /// 搭載で地上DAGから外れても、確定済みの制圧地域を配送完了まで保持する。
+    regions: HashMap<Entity, Vec<GridPosition>>,
     /// 前の手番までに居た砲台。ここに無い砲台は新しく作った砲台。
     seen: HashSet<Entity>,
 }
@@ -273,7 +303,16 @@ fn update_gun_routes(
         .and_then(|memory| memory.by_player.get(&player))
         .cloned();
     if let Some(routes) = previous.as_ref().filter(|routes| routes.turn == turn) {
-        return routes.routes.clone();
+        let mut regions = routes.regions.clone();
+        let mut routes = routes.routes.clone();
+        apply_committed_gun_routes(world, player, &mut routes, &mut regions);
+        if let Some(mut memory) = world.get_resource_mut::<GunRouteAssignment>()
+            && let Some(cached) = memory.by_player.get_mut(&player)
+        {
+            cached.routes = routes.clone();
+            cached.regions = regions;
+        }
+        return routes;
     }
     let orders = world
         .get_resource::<crate::ai::v4::capital_route::force_demand::RoutePostureMemory>()
@@ -309,6 +348,8 @@ fn update_gun_routes(
             .iter()
             .min_by_key(|(candidate, _)| (distance(*candidate, *point), candidate.y, candidate.x));
         let kept = match nearest {
+            // 搭載で地上DAGの観測から外れた間も、積み込む直前の確定配送先を維持する。
+            _ if world.get::<Transporting>(*entity).is_some() => *point,
             Some((key_point, false)) => *key_point,
             _ => *point,
         };
@@ -367,6 +408,12 @@ fn update_gun_routes(
         };
         routes.insert(*entity, *point);
     }
+    let mut regions = previous
+        .as_ref()
+        .map(|memory| memory.regions.clone())
+        .unwrap_or_default();
+    regions.retain(|entity, _| guns.iter().any(|(gun, ..)| gun == entity));
+    apply_committed_gun_routes(world, player, &mut routes, &mut regions);
     let seen = guns.iter().map(|(entity, ..)| *entity).collect();
     let mut memory = world
         .remove_resource::<GunRouteAssignment>()
@@ -376,11 +423,53 @@ fn update_gun_routes(
         GunRoutes {
             turn,
             routes: routes.clone(),
+            regions,
             seen,
         },
     );
     world.insert_resource(memory);
     routes
+}
+
+/// 前進する砲台は、別の要衝割当でなくDAGの現在地域を配送先の正本にする。
+/// 保持役・DAG外の砲台は、既存の防衛・輸送割当を維持する。
+fn committed_gun_route(world: &World, player: PlayerId, gun: Entity) -> Option<GridPosition> {
+    let order = crate::ai::v4::capital_route::commitment::capital_route_commitment_for_entity(
+        world, player, gun,
+    )?;
+    (order.phase == crate::ai::v4::capital_route::model::CapitalRouteExecutionPhase::Advance)
+        .then_some(order.execution_target)
+}
+
+fn apply_committed_gun_routes(
+    world: &mut World,
+    player: PlayerId,
+    routes: &mut HashMap<Entity, GridPosition>,
+    regions: &mut HashMap<Entity, Vec<GridPosition>>,
+) {
+    for (gun, ..) in own_guns(world, player) {
+        if let Some(order) =
+            crate::ai::v4::capital_route::commitment::capital_route_commitment_for_entity(
+                world, player, gun,
+            )
+        {
+            if order.phase
+                == crate::ai::v4::capital_route::model::CapitalRouteExecutionPhase::Advance
+            {
+                routes.insert(gun, order.execution_target);
+                regions.insert(gun, order.control_area.clone());
+            } else {
+                regions.remove(&gun);
+            }
+        } else if world
+            .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
+            .and_then(|registry| registry.attack_target(gun))
+            .is_some()
+        {
+            // 新しい明示配備は、古い地域の記憶より優先する。
+            regions.remove(&gun);
+        }
+    }
 }
 
 /// 運搬中の砲台について、記憶している攻めの進軍路の要衝を返す（生産の既存戦力照合用）。
@@ -389,11 +478,13 @@ pub(in crate::ai::v4) fn assigned_attack_route(
     player: PlayerId,
     gun: Entity,
 ) -> Option<GridPosition> {
-    world
-        .get_resource::<GunRouteAssignment>()
-        .and_then(|memory| memory.by_player.get(&player))
-        .and_then(|routes| routes.routes.get(&gun))
-        .copied()
+    committed_gun_route(world, player, gun).or_else(|| {
+        world
+            .get_resource::<GunRouteAssignment>()
+            .and_then(|memory| memory.by_player.get(&player))
+            .and_then(|routes| routes.routes.get(&gun))
+            .copied()
+    })
 }
 
 /// 攻めに割り当てていない砲台の守り場所: 最も近い守りの進軍路の要衝（攻めの砲台の居ない
@@ -467,6 +558,8 @@ struct ArtilleryFerry<'a> {
     routes: &'a HashMap<Entity, GridPosition>,
     /// 攻めに割り当てていない砲台から、守り場所へ（[`guard_posts`]）。
     guards: &'a HashMap<Entity, GridPosition>,
+    /// 確定済み地域に有効な敵が残る砲台だけの標的。射撃・輸送・据え付けで共用する。
+    regional_targets: &'a HashMap<Entity, HashSet<Entity>>,
 }
 
 impl ArtilleryFerry<'_> {
@@ -500,9 +593,18 @@ impl ArtilleryFerry<'_> {
         (position.x, position.y)
     }
 
+    /// 別地域の敵を撃って行動済みになると搭載もできないため、制圧中の地域を優先する。
+    /// 地域内の有効な敵を掃討した後・DAG外・保持役では従来どおり周囲も撃てる。
+    fn serves_mission(&self, gun: &BoardUnit, enemy: &BoardUnit) -> bool {
+        self.regional_targets
+            .get(&gun.entity)
+            .is_none_or(|targets| targets.contains(&enemy.entity))
+    }
+
     /// 砲台が `cell` から射程に捉える敵のうち、与える損害の価値が最大のものとその価値。
     fn best_shot(&self, gun: &BoardUnit, cell: Cell) -> Option<(&BoardUnit, i64)> {
         self.enemies()
+            .filter(|enemy| self.serves_mission(gun, enemy))
             .filter(|enemy| {
                 (gun.stats.min_range..=gun.stats.max_range)
                     .contains(&self.distance(cell, enemy.position))
@@ -527,8 +629,9 @@ impl ArtilleryFerry<'_> {
     /// 敵の移動力いっぱいまで数えると、工場の上の砲台まで待ち続けて運べなくなる。
     fn enemy_near(&self, gun: &BoardUnit) -> bool {
         self.enemies().any(|enemy| {
-            self.distance(Self::cell(gun.position), enemy.position)
-                <= gun.stats.max_range.saturating_add(HOLD_MARGIN)
+            self.serves_mission(gun, enemy)
+                && self.distance(Self::cell(gun.position), enemy.position)
+                    <= gun.stats.max_range.saturating_add(HOLD_MARGIN)
         })
     }
 
@@ -985,7 +1088,28 @@ impl ArtilleryFerry<'_> {
                         .is_none_or(|(primary, _)| primary > 0 || gun.stats.max_ammo1 == 0)
             })
             .find_map(|gun| {
-                let (enemy, _) = self.best_shot(gun, Self::cell(gun.position))?;
+                let (enemy, _) = self.best_shot(gun, Self::cell(gun.position)).or_else(|| {
+                    // 地域の敵が遠く、今は搭載もできない砲台まで射撃禁止にしない。
+                    // 迎車は後処理で進め、隣接して搭載できる手番だけ移動用の行動を残す。
+                    let can_board = self.own().any(|carrier| {
+                        is_artillery_carrier(&carrier.stats)
+                            && self.has_room(carrier)
+                            && self.boardable_from(gun, Self::cell(carrier.position))
+                    }) && self.has_better_place(gun);
+                    if can_board {
+                        return None;
+                    }
+                    self.enemies()
+                        .filter(|enemy| {
+                            (gun.stats.min_range..=gun.stats.max_range)
+                                .contains(&self.distance(Self::cell(gun.position), enemy.position))
+                        })
+                        .map(|enemy| (enemy, self.shot_value(gun, enemy)))
+                        .filter(|(_, value)| *value > 0)
+                        .max_by_key(|(enemy, value)| {
+                            (*value, Reverse((enemy.position.y, enemy.position.x)))
+                        })
+                })?;
                 Some((
                     gun.entity,
                     AiCommand::Attack {
@@ -1251,10 +1375,21 @@ impl ArtilleryFerry<'_> {
         if self.on_own_facility(current) {
             return true;
         }
+        // 地域の代表点が射程内でも、実際の障害へ届くとは限らない。
+        // 現在は地域の敵を撃てず、安全な据え付けで撃てるようになるなら運ぶ。
+        // 撃てる状態ではidle_gunsへ入らないので、射撃中の無用な積み直しは増やさない。
+        if self.regional_targets.contains_key(&gun.entity) {
+            return self
+                .sites(gun, current, FAR_SITE_SEARCH_TURNS)
+                .iter()
+                .any(|(cell, ..)| *cell != current);
+        }
         // 配分案がない場合でも、交戦できる敵が全くいなければ無目的に積み直さない。
         // 味方の一時的な占有で道が塞がれていても、敵がいる限り迎えを許す。
         if !self.routes.contains_key(&gun.entity) && !self.guards.contains_key(&gun.entity) {
-            return self.enemies().any(|enemy| self.shot_value(gun, enemy) > 0);
+            return self
+                .enemies()
+                .any(|enemy| self.serves_mission(gun, enemy) && self.shot_value(gun, enemy) > 0);
         }
         // 担当範囲内では、射程外の目標へ安全に十分前進できる場合だけ積み直す。
         // 小さな位置変更で降車と乗車を繰り返さない。

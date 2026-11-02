@@ -190,10 +190,11 @@ pub(crate) fn squad_target_path_approach_score(
     unit: &UnitState,
     position: GridPosition,
     target: GridPosition,
+    range: u32,
     distances: &mut ApproachDistances,
 ) -> i32 {
     let stats = &unit.stats;
-    let turns = distances.turns(stats, position, target, stats.max_range);
+    let turns = distances.turns(stats, position, target, range);
     path_approach_bonus(turns, manhattan(position, target), stats.max_movement)
 }
 

@@ -92,6 +92,9 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     let path = code_path::for_player(world, player_id);
     let _code_path = code_path::enter(path);
     let step = TurnStep::begin(world, player_id, path);
+    if step.is_v4 {
+        crate::ai::v4::capital_route::tactical::prepare_region_tactical_cache(world);
+    }
 
     if has_queued_production(world, &step)
         && let Some(command) = take_next_queued_production_command(world, player_id, step.turn)

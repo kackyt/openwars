@@ -387,6 +387,7 @@ fn set_previous_guns(world: &mut World, seen: &[Entity]) {
     memory.by_player.insert(
         PlayerId(1),
         GunRoutes {
+            regions: HashMap::default(),
             turn: u32::MAX,
             routes: HashMap::default(),
             seen: seen.iter().copied().collect(),
@@ -539,6 +540,7 @@ fn gun_assigned_to_a_route_that_turned_defensive_keeps_its_post() {
     memory.by_player.insert(
         PlayerId(1),
         GunRoutes {
+            regions: HashMap::default(),
             turn: u32::MAX,
             routes: [(gun, GridPosition { x: 12, y: 0 })].into_iter().collect(),
             seen: [gun].into_iter().collect(),
@@ -663,5 +665,182 @@ fn unassigned_deployed_gun_without_a_destination_does_not_board() {
     assert!(
         !matches!(action, Some((entity, AiCommand::Load { .. })) if entity == gun),
         "目標も展開先もない砲台を積み直さない: {action:?}"
+    );
+}
+
+/// 砲台も、小隊へ確定したDAG地域を運搬先の正本として使う。
+#[test]
+fn forward_gun_transport_uses_committed_region_including_cached_and_loaded_steps() {
+    use crate::ai::v4::capital_route::model::{
+        CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteId,
+        CapitalRouteNodeObjective, CapitalRouteNodeScope, CapitalRoutePathRegistry,
+    };
+    let mut world = line_world();
+    let player = PlayerId(1);
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 12, 0);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 13, 0);
+    spawn(&mut world, 2, UnitType::HeavySpGun, 0, 0);
+    let squad = crate::ai::v4::test_support::assign_route_squad(
+        &mut world,
+        player,
+        crate::ai::squad::MissionType::Attack,
+        &[gun],
+    );
+    let goal = GridPosition { x: 1, y: 0 };
+    world.insert_resource(CapitalRoutePathRegistry {
+        commitments: HashMap::from_iter([(
+            squad,
+            CapitalRouteCommitment {
+                player_id: player,
+                island_id: crate::ai::islands::IslandId(0),
+                route: CapitalRouteId(0),
+                target: goal,
+                target_anchor: goal,
+                objective: CapitalRouteNodeObjective::Control,
+                scope: CapitalRouteNodeScope::Area,
+                control_area: vec![goal],
+                capture_targets: Vec::new(),
+                crossing_exit: None,
+                crossed: false,
+                execution_target: goal,
+                frontline_capacity: 1,
+                path: vec![GridPosition { x: 12, y: 0 }, goal],
+                phase: CapitalRouteExecutionPhase::Advance,
+            },
+        )]),
+        ..Default::default()
+    });
+    set_previous_guns(&mut world, &[gun]);
+    let previous = world
+        .resource_mut::<GunRouteAssignment>()
+        .into_inner()
+        .by_player
+        .get_mut(&player)
+        .unwrap();
+    previous.turn = 1;
+    previous.routes.insert(gun, GridPosition { x: 12, y: 0 });
+    assert_eq!(
+        update_gun_routes(&mut world, player, 1)[&gun],
+        goal,
+        "キャッシュした後方要衝で地域指示を上書きしない"
+    );
+    assert_eq!(assigned_attack_route(&world, player, gun), Some(goal));
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision,Some((actor,AiCommand::Load{transport_entity,..})) if actor==gun && transport_entity==truck),
+        "前進先の敵を撃つために実際に搭載する: {decision:?}"
+    );
+    let next = GridPosition { x: 2, y: 0 };
+    world
+        .resource_mut::<CapitalRoutePathRegistry>()
+        .commitments
+        .get_mut(&squad)
+        .unwrap()
+        .execution_target = next;
+    assert_eq!(
+        update_gun_routes(&mut world, player, 1)[&gun],
+        next,
+        "同手番の新しい確定指示も配送へ渡す"
+    );
+    world.entity_mut(gun).insert(Transporting(truck));
+    world
+        .resource_mut::<CapitalRoutePathRegistry>()
+        .commitments
+        .clear();
+    set_route_posture(
+        &mut world,
+        GridPosition { x: 12, y: 0 },
+        GridPosition { x: 14, y: 0 },
+    );
+    assert_eq!(
+        update_gun_routes(&mut world, player, 2)[&gun],
+        next,
+        "輸送中に地上DAGから外れても配送先を巻き戻さない"
+    );
+    assert_eq!(
+        world.resource::<GunRouteAssignment>().by_player[&player].regions[&gun],
+        vec![goal],
+        "搭載中の据え付け先・射撃対象も同じ制圧地域を使う"
+    );
+}
+
+/// 専用射撃が通常戦術を横取りしても、地域の障害より別地域の価格を優先しない。
+#[test]
+fn ferry_fire_and_transport_keep_the_committed_regional_objective() {
+    use crate::ai::v4::capital_route::model::{
+        CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteId,
+        CapitalRouteNodeObjective, CapitalRouteNodeScope, CapitalRoutePathRegistry,
+    };
+    let mut world = line_world();
+    let player = PlayerId(1);
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 8, 0);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 9, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let blocker = spawn(&mut world, 2, UnitType::Infantry, 12, 0);
+    let unrelated = spawn(&mut world, 2, UnitType::HeavySpGun, 2, 0);
+    world
+        .resource_mut::<DamageChart>()
+        .insert_damage(UnitType::Artillery, UnitType::Infantry, 95);
+    let squad = crate::ai::v4::test_support::assign_route_squad(
+        &mut world,
+        player,
+        crate::ai::squad::MissionType::Attack,
+        &[gun],
+    );
+    let goal = GridPosition { x: 12, y: 0 };
+    world.insert_resource(CapitalRoutePathRegistry {
+        commitments: HashMap::from_iter([(
+            squad,
+            CapitalRouteCommitment {
+                player_id: player,
+                island_id: crate::ai::islands::IslandId(0),
+                route: CapitalRouteId(0),
+                target: goal,
+                target_anchor: goal,
+                objective: CapitalRouteNodeObjective::Control,
+                scope: CapitalRouteNodeScope::Area,
+                control_area: vec![goal],
+                capture_targets: Vec::new(),
+                crossing_exit: None,
+                crossed: false,
+                execution_target: goal,
+                frontline_capacity: 1,
+                path: vec![GridPosition { x: 8, y: 0 }, goal],
+                phase: CapitalRouteExecutionPhase::Advance,
+            },
+        )]),
+        ..Default::default()
+    });
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Attack { target_entity, .. })) if actor==gun && target_entity==blocker),
+        "専用の射撃も価格の高い別地域の敵より制圧対象を撃つ: {decision:?}"
+    );
+    // 同手番の地域変更も射撃・配送へ渡す。射程外なら無関係な敵を撃って搭載不能にしない。
+    let next = GridPosition { x: 15, y: 0 };
+    world.entity_mut(blocker).insert(next);
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.control_area = vec![next];
+    order.target_anchor = next;
+    order.execution_target = next;
+    world.despawn(truck);
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Attack { target_entity, .. })) if actor==gun && target_entity==unrelated),
+        "まだ搭載できない手番は地域外の射撃も継続する: {decision:?}"
+    );
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 9, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Load { transport_entity, .. })) if actor==gun && transport_entity==truck),
+        "地域内の敵へ届くため、周辺射撃で輸送を止めず実際に搭載する: {decision:?}"
+    );
+    world.despawn(blocker);
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Attack { target_entity, .. })) if actor==gun && target_entity==unrelated),
+        "地域を掃討した後は周囲の有利な射撃も残す: {decision:?}"
     );
 }

@@ -23,16 +23,31 @@ pub(in crate::ai::v4) fn capital_route_node_control_area(
 ) -> Vec<GridPosition> {
     let mut control_area = match scope {
         CapitalRouteNodeScope::Point => vec![anchor],
-        CapitalRouteNodeScope::Area => (0..map.height)
-            .flat_map(|y| (0..map.width).map(move |x| GridPosition { x, y }))
-            .filter(|position| {
-                map.distance(anchor.x, anchor.y, position.x, position.y)
-                    <= CAPITAL_ROUTE_REGION_RADIUS
-                    && island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == island_id)
-            })
-            .collect::<Vec<_>>(),
+        CapitalRouteNodeScope::Area => {
+            // 同じ陸塊でも川を挟む地域は橋の通過点で分ける。格子上で近いだけの
+            // 対岸を含めると、橋を越える前に地域へ到達したと誤認してしまう。
+            let mut cells = Vec::new();
+            let mut queue = VecDeque::from([(anchor, 0_u32)]);
+            let mut visited = HashSet::from_iter([anchor]);
+            while let Some((cell, distance)) = queue.pop_front() {
+                cells.push(cell);
+                if distance >= CAPITAL_ROUTE_REGION_RADIUS {
+                    continue;
+                }
+                for (x, y) in map.get_adjacent(cell.x, cell.y) {
+                    let next = GridPosition { x, y };
+                    if map.get_terrain(x, y) != Some(Terrain::Bridge)
+                        && island_map
+                            .get_island_at(&next)
+                            .is_some_and(|island| island.id == island_id)
+                        && visited.insert(next)
+                    {
+                        queue.push_back((next, distance + 1));
+                    }
+                }
+            }
+            cells
+        }
     };
     control_area.extend(capture_targets.iter().copied());
     control_area.sort_unstable_by_key(|position| (position.y, position.x));
@@ -383,8 +398,7 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
                     capture_targets: capture_targets_at(index).clone(),
                     crossing_exit,
                     crossed: false,
-                    dominant_since: None,
-                    capture_release: false,
+                    local_control: false,
                     state: victory_roadmap::RoadmapNodeState::Locked,
                     assigned_squads: HashSet::default(),
                 });
@@ -436,9 +450,7 @@ pub(in crate::ai::v4) fn capital_route_node_exit_satisfied(
         ),
         CapitalRouteNodeObjective::Capture => {
             operation.state == victory_roadmap::RoadmapNodeState::Secured
-                || operation.capture_release
-                || (operation.scope == CapitalRouteNodeScope::Area
-                    && operation.state == victory_roadmap::RoadmapNodeState::Dominant)
+                || (operation.scope == CapitalRouteNodeScope::Area && operation.local_control)
         }
     }
 }
@@ -479,9 +491,7 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
         .get_resource::<CapitalRoutePathRegistry>()
         .map(|registry| registry.commitments.clone())
         .unwrap_or_default();
-    let current_turn = world
-        .get_resource::<crate::resources::MatchState>()
-        .map_or(0, |state| state.current_turn_number.0);
+
     let properties = world
         .iter_entities()
         .filter_map(|entity| {
@@ -498,6 +508,9 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             let position = *entity.get::<GridPosition>()?;
             let stats = entity.get::<UnitStats>()?;
             let health = entity.get::<Health>()?;
+            if entity.get::<crate::components::Transporting>().is_some() {
+                return None;
+            }
             // 非武装車両の価格は局地優勢や橋の通過戦力に加算しない。
             if stats.max_range == 0 && !stats.can_capture {
                 return None;
@@ -529,7 +542,7 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             .copied()
             .filter(|id| id.topology == key)
             .collect::<Vec<_>>();
-        operation_ids.sort_unstable_by_key(|id| progress_order(&topology.from_home, id.anchor));
+        operation_ids.sort_unstable_by_key(|id| topology.node_at(id.anchor).map(|node| node.0));
         // まず担当情報だけを毎手番リセットする。`crossed`は橋を越えた盤面事実なので
         // 消さず、Node状態は下の観測・dependency計算で再構築する。
         for id in &operation_ids {
@@ -543,7 +556,7 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
                 victory_roadmap::RoadmapNodeState::Locked
             };
         }
-        // DAGのedgeは進捗を必ず増やすため、前方への線形走査で前提Nodeの出口条件を
+        // DAGのNode番号は依存順なので、前方への線形走査で前提Nodeの出口条件を
         // 評価できる。地形DAGの合流edgeは「複数経路のいずれから来てもよい」という
         // 代替関係であり、全経路の同時制圧を要求する依存辺ではない。
         for &id in &operation_ids {
@@ -555,22 +568,16 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             };
             let predecessors_ready =
                 capital_route_node_predecessors_released(&operations.operations, &operation);
-            if !predecessors_ready {
-                if let Some(op) = operations.operations.get_mut(&id) {
-                    op.dominant_since = None;
-                    op.capture_release = false;
-                }
-                continue;
-            }
-
             let mut friendly_power = 0_u64;
             let mut enemy_power = 0_u64;
             let mut friendly_ground_on_exit = false;
             let mut capturer_on_target = false;
+            let mut friendly_ground_in_area = false;
             for (owner, position, power, can_capture, is_ground) in &unit_observations {
                 if operation.control_area.contains(position) {
                     if *owner == player_id {
                         friendly_power = friendly_power.saturating_add(*power);
+                        friendly_ground_in_area |= *is_ground;
                     } else {
                         enemy_power = enemy_power.saturating_add(*power);
                     }
@@ -585,6 +592,15 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
                 {
                     capturer_on_target = true;
                 }
+            }
+
+            // 依存辺は未到着の後続の進行条件。実際に別経路で地域へ入った
+            // 前衛まで未観測のLockedへ戻さず、現地の争奪・占領状態を記録する。
+            if !predecessors_ready && !friendly_ground_in_area && !friendly_ground_on_exit {
+                if let Some(op) = operations.operations.get_mut(&id) {
+                    op.local_control = false;
+                }
+                continue;
             }
 
             let owned_capture_targets = operation
@@ -631,48 +647,14 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             } else {
                 victory_roadmap::RoadmapNodeState::Ready
             };
-            // 近接拠点が別々の後続Nodeに分割されていても、同じ局地の保有状況として数える。
-            let mut regional_targets = operation.capture_targets.clone();
-            let mut successor_targets = HashSet::default();
-            for successor in &operation.successors {
-                if let Some(next) = operations.operations.get(successor) {
-                    for target in &next.capture_targets {
-                        if operation.control_area.contains(target) {
-                            successor_targets.insert(*target);
-                            regional_targets.push(*target);
-                        }
-                    }
-                }
-            }
-            regional_targets.sort_unstable_by_key(|position| (position.y, position.x));
-            regional_targets.dedup();
-            let owned_region = regional_targets
-                .iter()
-                .filter(|target| properties.get(target) == Some(&Some(player_id)))
-                .count();
-            let front_advanced = unit_observations
-                .iter()
-                .any(|(owner, position, _, _, ground)| {
-                    *owner == player_id && *ground && successor_targets.contains(position)
-                });
+            // 地域の通過許可は局地戦力から独立に観測する。占領中という状態名や
+            // 未所有施設の割合で、優勢な前衛の前進を止めない。
             let dominant = friendly_power > 0
                 && (enemy_power == 0
                     || friendly_power.saturating_mul(4) >= enemy_power.saturating_mul(5));
             if let Some(operation) = operations.operations.get_mut(&id) {
                 operation.crossed |= friendly_ground_on_exit;
-                let sustained_control = operation.objective == CapitalRouteNodeObjective::Capture
-                    && !regional_targets.is_empty()
-                    && owned_region.saturating_mul(2) > regional_targets.len()
-                    && dominant
-                    && front_advanced;
-                if sustained_control {
-                    let start = *operation.dominant_since.get_or_insert(current_turn);
-                    // 同一手番の再観測を2手番と誤認しない。
-                    operation.capture_release = current_turn > start;
-                } else {
-                    operation.dominant_since = None;
-                    operation.capture_release = false;
-                }
+                operation.local_control = dominant;
                 operation.state = state;
             }
         }
@@ -761,7 +743,7 @@ pub(in crate::ai::v4) fn capital_route_dag_frontier_properties(
             .successor_nodes
             .is_empty()
     );
-    // DAGは自首都からの距離順に構築済みであり、successorは必ず次の距離帯にある。
+    // DAGはトポロジカル順に構築済みであり、successorのNode番号は必ず大きい。
     for (index, node) in topology.nodes.iter().enumerate() {
         if !reachable[index] {
             continue;
@@ -929,8 +911,10 @@ pub(crate) fn capital_assault_geometry(
     let map = world.get_resource::<Map>()?;
     let capital = topology.nodes[topology.goal_node.0].anchor;
     let front_properties = capital_route_front_properties(world, player_id, island_id)?;
-    if !front_properties.iter().flatten().all(|front| {
-        map.distance(front.x, front.y, capital.x, capital.y) <= CAPITAL_ROUTE_REGION_RADIUS
+    if !front_properties.iter().any(|properties| {
+        properties.iter().all(|front| {
+            map.distance(front.x, front.y, capital.x, capital.y) <= CAPITAL_ROUTE_REGION_RADIUS
+        })
     }) {
         return None;
     }

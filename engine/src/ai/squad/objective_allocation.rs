@@ -737,18 +737,28 @@ fn route_front_responsibilities(
     if fronts.len() < 2 || remaining.is_empty() {
         return Vec::new();
     }
-    // 全進軍路の前線が敵首都の地域に入った終盤は、前線拠点の防衛ではなく首都への攻撃にする。
-    if let Some(geometry) = crate::ai::v4::capital_route::node_operation::capital_assault_geometry(
-        world, player, island,
-    ) {
-        return capital_assault_responsibilities(world, map, player, geometry, remaining);
-    }
-    let demands = crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
+    // 首都へ進める方面だけを切り替える。他方の地域処理を全軍の待機条件にしない。
+    let capital_geometry = crate::ai::v4::capital_route::node_operation::capital_assault_geometry(
         world, player, island,
     );
-    let slots = crate::ai::v4::capital_route::force_demand::apportion_route_force_slots(
-        remaining.len(),
-        &demands,
+    let regional_fronts =
+        crate::ai::v4::capital_route::node_operation::capital_route_front_properties(
+            world, player, island,
+        )
+        .unwrap_or_default();
+    let capital_axes = regional_fronts
+        .iter()
+        .map(|properties| {
+            capital_geometry.is_some_and(|geometry| {
+                properties.iter().all(|front| {
+                    map.distance(front.x, front.y, geometry.capital.x, geometry.capital.y)
+                <= crate::ai::v4::capital_route::node_operation::capital_assault_region_radius()
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let demands = crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
+        world, player, island,
     );
     // 配る先は進軍路の固定識別点ではなく、DAGで求めた各進軍路の現在の前線にする。
     // まだ橋を突破していない進軍路は、手前の橋のGateを前線目標にして橋の防衛・確保を確実にする。
@@ -757,6 +767,32 @@ fn route_front_responsibilities(
         crate::ai::v4::capital_route::force_demand::same_land_pending_bridgeheads(
             world, player, island,
         );
+    // 地域を処理し終えた方面の既存部隊を、別方面の不足へ引き戻さない。
+    // 首都への射程を持つ方面だけを先へ送り、残りは従来の地域需要で配分する。
+    let mut responsibilities = Vec::new();
+    if let Some(geometry) = capital_geometry {
+        let mut advance = Vec::new();
+        remaining.retain(|entity| {
+            let ready = crate::ai::v4::capital_route::topology::capital_route_nearest_axis(
+                world, player, island, *entity,
+            )
+            .is_some_and(|route| {
+                capital_axes.get(route).copied().unwrap_or(false)
+                    && pending_bridgeheads.get(route).copied().flatten().is_none()
+            });
+            if ready {
+                advance.push(*entity);
+            }
+            !ready
+        });
+        responsibilities.extend(capital_assault_responsibilities(
+            world,
+            map,
+            player,
+            geometry,
+            &mut advance,
+        ));
+    }
     let fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
         world, player, island,
     )
@@ -775,20 +811,43 @@ fn route_front_responsibilities(
             .collect::<Vec<_>>()
     })
     .unwrap_or(fronts);
+    let slots = crate::ai::v4::capital_route::force_demand::apportion_route_force_slots(
+        remaining.len(),
+        &demands,
+    );
     let groups = super::combat_responsibilities::distribute_members_across_route_fronts(
         world, map, remaining, &fronts, &slots,
     );
     remaining.clear();
-    fronts
-        .into_iter()
-        .zip(groups)
-        .filter(|(_, members)| !members.is_empty())
-        .map(|(front, members)| CampaignResponsibility {
-            mission_type: MissionType::Defense,
-            target: front,
-            members,
-        })
-        .collect()
+    responsibilities.extend(
+        fronts
+            .into_iter()
+            .zip(groups)
+            .enumerate()
+            .filter(|(_, (_, members))| !members.is_empty())
+            .flat_map(|(route, (front, mut members))| {
+                if let Some(geometry) = capital_geometry
+                    && capital_axes.get(route).copied().unwrap_or(false)
+                    && pending_bridgeheads.get(route).copied().flatten().is_none()
+                {
+                    return capital_assault_responsibilities(
+                        world,
+                        map,
+                        player,
+                        geometry,
+                        &mut members,
+                    );
+                }
+                vec![CampaignResponsibility {
+                    // 未制圧地域への前進は攻勢。Defenseでは必要な不利交換まで
+                    // 戦術側で拒否され、敵を削る役が永久に待つため区別する。
+                    mission_type: MissionType::Attack,
+                    target: front,
+                    members,
+                }]
+            }),
+    );
+    responsibilities
 }
 
 /// 敵首都の攻略で、余った戦闘役を首都への攻撃（Attack）へ回す。首都の地域にいる敵に

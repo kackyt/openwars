@@ -70,7 +70,7 @@ pub(in crate::ai::v4) enum CapitalRouteNodeScope {
 /// 首都間の最短装甲回廊を構成する一マス分のDAGノード。
 ///
 /// 同距離の別ノードは並列に進め、後段の同一ノードへ合流できる。DAGは枝に沿った
-/// 通り道の選択と分岐・合流の検出だけに使い、前後の判定は `from_home` の距離表で行う。
+/// 通り道の選択と分岐・合流の検出に使う。依存順はNode番号、地理距離は`from_home`で表す。
 #[derive(Debug, Clone)]
 pub(in crate::ai::v4) struct CapitalRouteNode {
     pub(in crate::ai::v4) anchor: GridPosition,
@@ -97,6 +97,8 @@ pub(in crate::ai::v4) struct CapitalRouteTopology {
     /// このセル集合で行い、DAGのノード番号や辺には依存させない。
     pub(in crate::ai::v4) corridor: Vec<GridPosition>,
     pub(in crate::ai::v4) routes: Vec<CapitalRoute>,
+    /// 各装甲回廊入口からの地形距離。合流する首都目標を、部隊の現在方面へ結び直す。
+    pub(in crate::ai::v4) route_distances: Vec<HashMap<GridPosition, u32>>,
     pub(in crate::ai::v4) property_routes: HashMap<GridPosition, CapitalRouteId>,
     /// 自首都からの装甲移動ステップ数。前方・後方の判定はすべてこの距離表で行う。
     pub(in crate::ai::v4) from_home: HashMap<GridPosition, u32>,
@@ -143,9 +145,8 @@ pub(in crate::ai::v4) struct CapitalRouteNodeOperation {
     /// 前進しても、橋Nodeを未達へ戻さない。
     pub(in crate::ai::v4) crossed: bool,
     pub(in crate::ai::v4) state: victory_roadmap::RoadmapNodeState,
-    /// 過半数確保と局地優勢が継続した最初の手番。
-    pub(in crate::ai::v4) dominant_since: Option<u32>,
-    pub(in crate::ai::v4) capture_release: bool,
+    /// 施設所有とは独立した、現在の局地優勢。前衛の通過許可に使う。
+    pub(in crate::ai::v4) local_control: bool,
     pub(in crate::ai::v4) assigned_squads: HashSet<SquadId>,
 }
 
