@@ -314,36 +314,6 @@ fn best_action_for_unit(
     let state = &unit.state;
     let mut best = BestAction::default();
     let mut tiles = unit.candidate_tiles(world, board, blockade);
-    if unit.campaign.is_some() {
-        let region_reached =
-            crate::ai::v4::capital_route::tactical::capital_route_allows_tactical_position(
-                world,
-                board.player_id,
-                state.entity,
-                state.position,
-            ) == Some(true);
-        tiles.retain(|&(x, y)| {
-            let position = GridPosition { x, y };
-            let inside =
-                crate::ai::v4::capital_route::tactical::capital_route_allows_tactical_position(
-                    world,
-                    board.player_id,
-                    state.entity,
-                    position,
-                )
-                .unwrap_or(true);
-            // 地域内の占領先は一対一の割当を実行まで守る。首都の即時占領は優先する。
-            let other_capture_target = region_reached
-                && state.stats.can_capture
-                && unit.squad_target != Some(position)
-                && board.properties.iter().any(|(site, terrain, owner)| {
-                    *site == position
-                        && *owner != Some(board.player_id)
-                        && *terrain != crate::resources::Terrain::Capital
-                });
-            inside && !other_capture_target
-        });
-    }
     if unit.treats_target_as_reference() {
         // 敵の生産口は、占領役の予約より占位（補充の遮断）を優先して候補に残す。
         // 予約で外すと、占領役が着くまで敵が空いた生産口で補充を続ける。
@@ -698,20 +668,15 @@ fn consider_attacks(
             }
             continue;
         };
-        let Some(priority) = attack_priority(
-            world,
-            board.player_id,
-            unit,
-            target,
-            exchange.is_favorable_matchup(),
-        )
-        .map(|priority| {
-            if tile.blockade.holds_site {
-                priority.max(ActionPriority::EnemyProductionBlockade)
-            } else {
-                priority
-            }
-        }) else {
+        let Some(priority) =
+            attack_priority(unit, target, exchange.is_favorable_matchup()).map(|priority| {
+                if tile.blockade.holds_site {
+                    priority.max(ActionPriority::EnemyProductionBlockade)
+                } else {
+                    priority
+                }
+            })
+        else {
             if let Some(trace) = probe.as_deref_mut() {
                 trace.reject("attack_priority_rejected",tile.position,||json!({"target_id":target.to_bits(),"damage":exchange.expected_damage,"counter_damage":exchange.expected_counter_damage,"favorable":exchange.is_favorable_matchup()}));
             }
@@ -736,30 +701,19 @@ fn consider_attacks(
     }
 }
 
-/// 攻撃の優先度。V4は確定した配備目標・地域内の敵を戦略標的とする。
-/// 地域外の有利な攻撃も残すが、地域内の有利な必要攻撃より先に選ばない。
-/// V2/V3は従来どおり攻勢Squad自体を戦略上の必要性とする。
+/// 攻撃の優先度。V4はEntity単位の配備目標、V2/V3は攻勢Squad自体を戦略上の必要性とする。
 /// 上陸cargoはSquad再編の境界でCapture・Transport・Attackのいずれにもなり得るため、
 /// その差で必要攻撃を非決定的に枝刈りしてはならない。作戦上の必要性がない不利交換はNone。
 fn attack_priority(
-    world: &World,
-    player_id: PlayerId,
     unit: &UnitTactics,
     target: Entity,
     favorable_matchup: bool,
 ) -> Option<ActionPriority> {
-    let regional_target = unit.campaign.as_ref().and_then(|_| {
-        crate::ai::v4::capital_route::tactical::capital_route_attack_target_is_strategic(
-            world,
-            player_id,
-            unit.state.entity,
-            target,
-        )
-    });
-    let is_strategic_target = unit.deployment_target.map_or(
-        unit.has_offensive_mission && regional_target.unwrap_or(true),
-        |deployment| deployment == target,
-    );
+    let is_strategic_target = unit
+        .deployment_target
+        .map_or(unit.has_offensive_mission, |deployment| {
+            deployment == target
+        });
     let has_strategic_mission = unit.deployment_target.is_some() || unit.has_offensive_mission;
     match (is_strategic_target, favorable_matchup) {
         (true, true) => Some(ActionPriority::FavorableStrategicTarget),
@@ -828,6 +782,9 @@ fn consider_wait(
             // 地域Controlの一点目標なしは、その地域内での展開を許可する指示。
             // 地域内の展開と、地域指示を一時解除した回復移動は通常採点へ委ねる。
             // 修理地点に一手で届かなくても、中間地点への移動を禁止しない。
+            // （DEEPSEEK計画3-2は`is_none_or`への差し戻しを指示するが、DAG指令の投影を
+            // 残したままそれを行うと地域内・回復中unitの移動Waitを全面禁止することになり、
+            // 計画自身の「禁止を足さない」方針と逆になるため、この分岐は維持する。）
             return !(unit.regional_control || state.combat_ineffective);
         }
         context.target.is_some_and(|target| {

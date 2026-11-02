@@ -3134,9 +3134,11 @@ fn point_fire_support_does_not_require_occupancy_while_assault_units_advance() {
     );
 }
 
-/// 高価な別地域の敵への射撃が、現在地域の出口を空ける攻撃を永久に後回しにしない。
+/// 通常戦術（tactics/v2）は攻撃対象を地域内外で絞り込まず、既存の採点だけで選ぶ。
+/// 地域の障害を先に撃つ順序付けは、手番ループの撃破→進入の段（fire_follow_order）が担う。
+/// （試作の「地域外の有利交換を戦略標的から外す」制約は計画3-2で差し戻した。）
 #[test]
-fn regional_blocker_is_attacked_before_a_more_valuable_unrelated_target() {
+fn standard_tactics_do_not_filter_attack_targets_by_region() {
     let (mut world, gun, squad) = standard_region_world();
     let stats = world
         .resource::<MasterDataRegistry>()
@@ -3181,16 +3183,16 @@ fn regional_blocker_is_attacked_before_a_more_valuable_unrelated_target() {
         crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
     assert!(
         matches!(decision, Some((actor, crate::ai::command::AiCommand::Attack { target_entity, .. }))
-        if actor==gun && target_entity==blocker),
-        "有効な地域内攻撃で出口を空ける: {decision:?}"
+        if actor==gun && target_entity==unrelated),
+        "地域外の有利な射撃を禁止しない（採点どおり高価な敵を撃つ）: {decision:?}"
     );
-    world.despawn(blocker);
+    world.despawn(unrelated);
     let decision =
         crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
     assert!(
         matches!(decision, Some((actor, crate::ai::command::AiCommand::Attack { target_entity, .. }))
-        if actor==gun && target_entity==unrelated),
-        "地域内の標的を除去後は他地域の有利な射撃も許す: {decision:?}"
+        if actor==gun && target_entity==blocker),
+        "地域内の障害も通常の攻撃候補に残る: {decision:?}"
     );
 }
 

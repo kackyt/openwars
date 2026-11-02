@@ -7,13 +7,14 @@
 //! 2. （手番の最初だけ）Squad編成と目標探索
 //! 3. 生産施設上でFormingする作戦unitの退避
 //! 4. 輸送Squadの1手
-//! 5. 通常行動（戦術による最良の1手）
-//! 6. （V4）Squadを失ったunitを再接続した後の通常行動
-//! 7. （V4）通常行動で進めなかった作戦unitの生産施設からの退避
-//! 8. 生産
-//! 9. 手番終了（遊兵の計上と次フェーズの要求）
+//! 5. （通常経路V4）撃破→進入の順序: DAG前進区間を塞ぐ敵への撃破担当の静止射撃
+//! 6. 通常行動（戦術による最良の1手）
+//! 7. （V4）Squadを失ったunitを再接続した後の通常行動
+//! 8. （V4）通常行動で進めなかった作戦unitの生産施設からの退避
+//! 9. 生産
+//! 10. 手番終了（遊兵の計上と次フェーズの要求）
 //!
-//! 版・経路で異なるのは、通常行動を選ぶ戦術（[`TurnTactics`]）と、3の退避の対象だけである。
+//! 版・経路で異なるのは、通常行動を選ぶ戦術（[`TurnTactics`]）と、3の退避の対象、5の有無である。
 
 use crate::ai::code_path::{self, CodePath};
 use crate::ai::command::AiCommand;
@@ -182,7 +183,26 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     if let Some((entity, command)) = select_transport_step(world, &step) {
         return Some(issue_transport_command(world, entity, command));
     }
-    let decision_skip = decision_skip_entities(world, &step);
+    let mut decision_skip = decision_skip_entities(world, &step);
+    // 標準経路のV4だけ。DAGの前進区間を塞ぐ敵に対し、撃破担当の静止射撃を通常行動より
+    // 先に確定し、別の進入役の行動を撃破まで残す（採点・候補集合は変えない）。
+    // 小規模経路は既存の squad_executor の静止射撃順序を使うため適用しない。
+    if step.is_v4 && step.tactics == TurnTactics::Standard {
+        crate::ai::wait_probe::stage(world, "fire_follow_order");
+        if let Some((entity, command)) = crate::ai::v4::fire_follow_order::decide_fire_follow_action(
+            world,
+            step.player_id,
+            &decision_skip,
+        ) {
+            return Some(issue_unit_command(world, entity, command));
+        }
+        // 有効な注文の進入役は、撃破担当が撃ち終えるまで通常行動の候補から外す。
+        if let Some(registry) =
+            world.get_resource::<crate::ai::v4::fire_follow_order::FireFollowOrderRegistry>()
+        {
+            decision_skip.extend(registry.active_entries(step.player_id));
+        }
+    }
     crate::ai::wait_probe::stage(world, "normal_tactics");
     if let Some((entity, command)) = decide_normal_action(world, &step, &decision_skip) {
         return Some(issue_unit_command(world, entity, command));

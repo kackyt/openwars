@@ -96,23 +96,6 @@ pub(crate) fn capital_route_tactical_mission(
     }
 }
 
-/// 確定した地域内の障害を攻撃上の戦略標的とする。DAG外では従来のSquad方針を使う。
-/// 戦術側に作戦の内部状態を漏らさず、地域外の有利な攻撃も通常候補に残す。
-pub(crate) fn capital_route_attack_target_is_strategic(
-    world: &World,
-    player_id: PlayerId,
-    entity: Entity,
-    target: Entity,
-) -> Option<bool> {
-    let order = capital_route_commitment_for_entity(world, player_id, entity)?;
-    Some(
-        order.phase == CapitalRouteExecutionPhase::Advance
-            && world
-                .get::<GridPosition>(target)
-                .is_some_and(|at| order.control_area.contains(at)),
-    )
-}
-
 /// Areaへ到達した後の移動候補を、Roadmapが指示した局地戦領域へ限定する。
 ///
 /// `None` はDAG外、到達前、保持・補給、回復中のいずれかであり、呼び出し側の通常の

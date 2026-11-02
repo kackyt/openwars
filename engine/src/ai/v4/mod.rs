@@ -22,6 +22,7 @@ mod candidate;
 mod combat_input;
 mod combat_profile;
 pub mod deployment;
+pub mod fire_follow_order;
 pub(crate) mod forming_capture;
 pub(crate) mod ground_lift;
 pub mod logistics_plan;
