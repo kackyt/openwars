@@ -339,6 +339,10 @@ impl Map {
     }
 }
 
+/// プレイヤーが保持できる資金の最大値（所持金上限）。
+/// ターン開始時に収入が入った際に100,000以上ある場合は強制的にこの値に切り詰められます。
+pub const MAX_FUNDS: u32 = 99_999;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Player {
     pub id: PlayerId,
@@ -347,6 +351,9 @@ pub struct Player {
 }
 
 impl Player {
+    /// プレイヤー資金の最大値
+    pub const MAX_FUNDS: u32 = MAX_FUNDS;
+
     pub fn new(id: u32, name: String) -> Self {
         Self {
             id: PlayerId(id),

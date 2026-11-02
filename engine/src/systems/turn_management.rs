@@ -223,8 +223,10 @@ fn apply_income(
     }
 
     // 3. プレイヤー資金への反映
+    // 収入を加算した結果が100,000以上（上限超え）の場合は強制的に最大値99,999とし、
+    // その後の補給処理でそこから補給費用が差し引かれます。
     if let Some(player) = players.0.iter_mut().find(|p| p.id == active_player_id) {
-        player.funds += budget_increase;
+        player.funds = player.funds.saturating_add(budget_increase).min(MAX_FUNDS);
     }
 }
 
@@ -1001,5 +1003,102 @@ mod tests {
 
         assert_eq!(world.get::<Health>(cargo).unwrap().current, 100);
         assert_eq!(world.get::<Fuel>(cargo).unwrap().current, 50);
+    }
+
+    #[test]
+    fn test_income_funds_max_cap() {
+        let (mut world, mut schedule) = setup_world();
+
+        // P2の初期資金を95,000に設定
+        {
+            let mut players = world.resource_mut::<Players>();
+            players.0[1].funds = 95_000;
+        }
+
+        // P2の所有都市を10個配置 (1都市1000G × 10 = 10,000G収入)
+        for i in 0..10 {
+            world.spawn((
+                GridPosition { x: i % 5, y: i / 5 },
+                Property::new(Terrain::City, Some(PlayerId(2)), 200),
+            ));
+        }
+
+        // P1 -> P2 (P2のターン開始、収入が入る)
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        // 95,000 + 10,000 = 105,000 >= 100,000 なので、上限の99,999に丸められる
+        assert_eq!(world.resource::<Players>().0[1].funds, MAX_FUNDS);
+    }
+
+    #[test]
+    fn test_income_funds_max_cap_and_resupply_deduction() {
+        let (mut world, mut schedule) = setup_world();
+
+        // P2の初期資金を95,000に設定
+        {
+            let mut players = world.resource_mut::<Players>();
+            players.0[1].funds = 95_000;
+        }
+
+        // P2の所有都市を10個配置 (1都市1000G × 10 = 10,000G収入)
+        for i in 0..10 {
+            world.spawn((
+                GridPosition { x: i % 5, y: i / 5 },
+                Property::new(Terrain::City, Some(PlayerId(2)), 200),
+            ));
+        }
+
+        // 都市(0, 0)に損傷・弾薬消費したP2の戦車を配置
+        // cost: 16000, 20HP修理費: 16000 * 20 / 100 = 3200G
+        // 弾薬2発補充: 2 * 50 = 100G
+        // 燃料10消費: 10 * 5 = 50G
+        // 合計補給費: 3350G
+        let tank = world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type: UnitType::TankZ,
+                    cost: 16000,
+                    max_fuel: 50,
+                    max_ammo1: 8,
+                    ammo1_cost: 50,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+                Fuel {
+                    current: 40,
+                    max: 50,
+                },
+                Ammo {
+                    ammo1: 6,
+                    max_ammo1: 8,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id();
+
+        // P1 -> P2 (P2のターン開始: 収入10,000Gが入り105,000G -> 99,999Gになり、そこから補給費3,350Gが引かれる)
+        world.send_event(NextPhaseCommand);
+        schedule.run(&mut world);
+
+        // 99,999 - 3350 = 96,649G
+        assert_eq!(world.resource::<Players>().0[1].funds, 99_999 - 3350);
+
+        // ユニットのHP、燃料、弾薬が回復・補給されていること
+        let health = world.get::<Health>(tank).unwrap();
+        let fuel = world.get::<Fuel>(tank).unwrap();
+        let ammo = world.get::<Ammo>(tank).unwrap();
+        assert_eq!(health.current, 70); // 50 + 20
+        assert_eq!(fuel.current, 50);
+        assert_eq!(ammo.ammo1, 8);
     }
 }
