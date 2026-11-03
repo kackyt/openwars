@@ -905,8 +905,10 @@ impl BoardScan {
                 );
                 campaign_objectives = efforts.objectives;
                 economy_anchors = efforts.economy_anchors;
+                let main_properties = efforts.main_properties;
                 route_posture = efforts.posture.map(|main| RoutePostureDecision {
                     main,
+                    main_properties,
                     regions: region_state,
                     orders: efforts.orders,
                 });

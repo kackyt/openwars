@@ -166,6 +166,7 @@ fn deployed_unassigned_gun_is_retained_for_production_planning() {
         player,
         crate::ai::v4::capital_route::force_demand::RoutePostureDecision {
             main: None,
+            main_properties: Vec::new(),
             regions: vec![],
             orders: vec![crate::ai::v4::capital_route::force_demand::RouteOrder {
                 key_point: defend,
