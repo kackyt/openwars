@@ -892,6 +892,7 @@ impl BoardScan {
                     .collect::<Vec<_>>();
                 let efforts = concentrate_route_efforts(
                     &map,
+                    &master_data,
                     campaign_objectives,
                     &all_own_units,
                     &enemy_units,
@@ -920,16 +921,19 @@ impl BoardScan {
                     .collect::<Vec<_>>();
                 campaign_objectives = defend_outmatched_routes(
                     &map,
+                    &master_data,
                     campaign_objectives,
                     &all_own_units,
                     &enemy_units,
                     &own_positions,
-                    funds.saturating_add(my_income.saturating_mul(budget_turns)),
-                    // 敵の見込み生産を比較に入れるかは実験中（OPENWARS_ROUTE_ENEMY_BUDGET）。
-                    if std::env::var_os("OPENWARS_ROUTE_ENEMY_BUDGET").is_some() {
-                        enemy_income.saturating_mul(budget_turns)
-                    } else {
-                        0
+                    PostureBudgets {
+                        own: funds.saturating_add(my_income.saturating_mul(budget_turns)),
+                        // 敵の見込み生産を比較に入れるかは実験中（OPENWARS_ROUTE_ENEMY_BUDGET）。
+                        enemy: if std::env::var_os("OPENWARS_ROUTE_ENEMY_BUDGET").is_some() {
+                            enemy_income.saturating_mul(budget_turns)
+                        } else {
+                            0
+                        },
                     },
                 );
             }

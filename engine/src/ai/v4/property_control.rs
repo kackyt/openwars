@@ -155,6 +155,37 @@ pub(crate) fn capture_arrival_turns(
     .map(|distance| distance.turns)
 }
 
+/// 地形・射程・構え直しを含む射撃位置への最早到達時刻。砲兵の支援を目標セルの占位と混同しない。
+/// 敵との武器相性・占有・弾薬の検査は含まないため、射撃を実行できる保証には使わない。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_arrival_turns(
+    map: &Map,
+    registry: &MasterDataRegistry,
+    start: (usize, usize),
+    target: (usize, usize),
+    stats: &crate::components::UnitStats,
+    fuel: u32,
+    player_id: PlayerId,
+    cache: &mut ActionTurnDistanceCache,
+) -> Option<u32> {
+    let distance = calculate_action_distance_to_range(
+        map,
+        registry,
+        &HashMap::default(),
+        start,
+        target,
+        stats.movement_type,
+        stats.max_movement,
+        if fuel == 0 { u32::MAX } else { fuel },
+        stats.min_range,
+        stats.max_range,
+        player_id,
+        cache,
+    )?;
+    // ActionTurnDistanceは移動後の遠距離射撃に必要な構え直しも含む。二重加算しない。
+    Some(distance.turns)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

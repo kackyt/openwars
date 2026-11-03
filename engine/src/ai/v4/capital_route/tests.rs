@@ -1754,6 +1754,7 @@ fn advancing_route_registry_exposes_the_current_segment_roster() {
         ]),
         squads_by_operation: HashMap::default(),
         assignment_diagnostics: HashMap::default(),
+        carried_routes: HashMap::default(),
     };
 
     let advancing_entities = registry.advancing_combat_entities(player, &manager);
@@ -2974,7 +2975,6 @@ fn control_bridge_advances_direct_units_first_and_stages_indirect_fire() {
         .find(|(key, _)| key.player_id == player)
         .unwrap();
     let island = key.island_id;
-    let goal = topology.nodes[topology.goal_node.0].anchor;
     let gate = topology.routes[0].front;
     let map = world.resource::<Map>();
     let bank = map
@@ -3018,7 +3018,9 @@ fn control_bridge_advances_direct_units_first_and_stages_indirect_fire() {
         .remove_resource::<crate::ai::squad::SquadManager>()
         .unwrap();
     for squad in &mut manager.squads {
-        squad.plan.target = Some(goal);
+        // この検査は同じ橋に配属された直接役・間接役の枠配分を扱う。
+        // 全方面の合流点である首都ではなく、検査対象の橋を明示する。
+        squad.plan.target = Some(gate);
         squad.plan.target_island = Some(island);
     }
     super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);

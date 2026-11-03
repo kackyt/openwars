@@ -1,5 +1,8 @@
 //! 撃破→進入の実行順序の単体テスト（固定盤面）。
 
+#[path = "entry_tests.rs"]
+mod entry_tests;
+
 use super::*;
 use crate::ai::squad::MissionType;
 use crate::ai::v4::capital_route::model::{
@@ -209,12 +212,11 @@ fn three_shooters_fire_first_and_reserved_entry_enters_after_removal() {
         world.get::<GridPosition>(enemy).is_none(),
         "3発で排除される"
     );
-    assert!(decide_fire_follow_action(&mut world, PlayerId(1), &skip).is_none());
+    let decision = decide_fire_follow_action(&mut world, PlayerId(1), &skip);
     assert!(
         active_entries(&world).is_empty(),
-        "排除後は進入役を解放する"
+        "排除後は予約を消費し、進入役自身へ命令を渡す"
     );
-    let decision = crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &skip);
     assert!(
         matches!(decision, Some((actor, AiCommand::Wait { target_pos })) if actor == entry && target_pos == CELL),
         "進入役が同じ手番に空いたセルへ入る: {decision:?}"

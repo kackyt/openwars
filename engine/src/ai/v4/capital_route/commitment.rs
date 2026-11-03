@@ -8,6 +8,7 @@ use crate::ai::v4::capital_route::model::{
     CapitalRouteId, CapitalRouteNodeId, CapitalRouteNodeObjective, CapitalRouteNodeOperation,
     CapitalRouteNodeOperationId, CapitalRouteNodeOperationRegistry, CapitalRouteNodeScope,
     CapitalRoutePathRegistry, CapitalRouteTopologyKey, CapitalRouteTopologyRegistry,
+    CarriedCapitalRoute,
 };
 use crate::ai::v4::capital_route::model::{CapitalRouteTopology, RouteForceDemand};
 use crate::ai::v4::capital_route::node_operation::{
@@ -158,12 +159,16 @@ pub(in crate::ai::v4) fn capital_route_frontline_sort_key(
 
 /// 前衛枠が埋まったSquadの待機線を、同じDAG区間の既通過セルから決める。
 ///
-/// 生産施設セルを候補から外し、起点から前線までの道に順番に置く。これにより後続も
-/// Squadとして同じ作戦へ所属し続ける一方、先頭のCapture Nodeへ全員が殺到しない。
+/// 待機線は前線Nodeの入口のすぐ手前から後ろへ順に並べる。前衛が倒れたり前へ進んだり
+/// したときに、次のSquadがすぐ枠を埋められるようにするためである。経路の起点（自軍首都）
+/// から並べると、枠からあふれた部隊が前線から遠い後方へ逆送され、枠が空いても何手番も
+/// 届かない。前衛の通り道を空けるため、前線Node自身の地域と生産施設セルは使わない。
+/// 後続もSquadとして同じ作戦へ所属し続ける一方、先頭のNodeへ全員が殺到しない。
 pub(in crate::ai::v4) fn capital_route_staging_target(
     world: &World,
     player_id: PlayerId,
     path: &[GridPosition],
+    node_operation: &CapitalRouteNodeOperation,
     execution_target: GridPosition,
     stage_index: usize,
 ) -> GridPosition {
@@ -184,12 +189,31 @@ pub(in crate::ai::v4) fn capital_route_staging_target(
         .iter()
         .rposition(|cell| *cell == execution_target)
         .unwrap_or(path.len());
-    let staging_cells = path
+    // 前線Nodeの地域（橋なら橋のマス）は前衛が使う。待機線はその手前から始める。
+    let node_cells = node_operation
+        .control_area
+        .iter()
+        .copied()
+        .chain(std::iter::once(node_operation.anchor))
+        .collect::<HashSet<_>>();
+    let not_production = |cell: &GridPosition| !production_sites.contains(cell);
+    let mut staging_cells = path
         .iter()
         .take(end_index)
+        .rev()
         .copied()
-        .filter(|cell| !production_sites.contains(cell))
+        .filter(|cell| not_production(cell) && !node_cells.contains(cell))
         .collect::<Vec<_>>();
+    if staging_cells.is_empty() {
+        // 起点がすでに前線Nodeの中にある場合は、地域内でも手前から並べる。
+        staging_cells = path
+            .iter()
+            .take(end_index)
+            .rev()
+            .copied()
+            .filter(not_production)
+            .collect();
+    }
     staging_cells
         .get(stage_index % staging_cells.len().max(1))
         .copied()
@@ -443,6 +467,8 @@ struct RouteSquad {
     ground_positions: Vec<GridPosition>,
     ground_members: Vec<Entity>,
     route_operation: bool,
+    /// 全地上memberが実通過済みの同じ方面を持つ場合だけ継承する。
+    carried_route: Option<usize>,
 }
 
 /// 今回の割当で共有する読み取り専用の盤面と前回指令。
@@ -559,6 +585,21 @@ fn route_squad(
             .members
             .iter()
             .any(|entity| route_operation_members.contains_key(entity));
+        let carried = squad
+            .members
+            .iter()
+            .filter(|entity| {
+                ground_route_member(context, **entity, island_map, topology_islands).is_some()
+            })
+            .map(|entity| carried_route_for_entity(world, player_id, *entity))
+            .collect::<Option<Vec<_>>>();
+        let carried_route = carried.and_then(|routes| {
+            let first = routes.first()?;
+            routes
+                .iter()
+                .all(|route| route == first)
+                .then_some(first.route.0)
+        });
         return Some((
             island_id,
             RouteSquad {
@@ -588,10 +629,144 @@ fn route_squad(
                     })
                     .collect(),
                 route_operation,
+                carried_route,
             },
         ));
     }
     None
+}
+
+/// 所有者・陸塊・輸送状態が変われば方面継承を解除する。区間目標の占領では解除しない。
+fn carried_route_for_entity(
+    world: &World,
+    player: PlayerId,
+    entity: Entity,
+) -> Option<CarriedCapitalRoute> {
+    let carried = *world
+        .get_resource::<CapitalRoutePathRegistry>()?
+        .carried_routes
+        .get(&entity)?;
+    if carried.player_id != player
+        || world.get::<Faction>(entity)?.0 != player
+        || world
+            .get::<crate::components::Transporting>(entity)
+            .is_some()
+    {
+        return None;
+    }
+    let at = world.get::<GridPosition>(entity)?;
+    let island = world
+        .get_resource::<crate::ai::islands::IslandMap>()?
+        .get_island_at(at)?;
+    if island.id != carried.island_id {
+        return None;
+    }
+    capital_route_topology_for(world, player, island.id)?
+        .routes
+        .get(carried.route.0)?;
+    departed_with_route(world, entity, carried).then_some(carried)
+}
+
+/// 出撃前は増援配分を見直せる。出撃後は「停止したセルがpath上にあるか」に依存せず
+/// 選択済みの方面を保持する。境界は既存の配属処理と同じ自首都の生産圏を用いる。
+fn departed_with_route(world: &World, entity: Entity, carried: CarriedCapitalRoute) -> bool {
+    let Some(at) = world.get::<GridPosition>(entity) else {
+        return false;
+    };
+    let Some(topology) = capital_route_topology_for(world, carried.player_id, carried.island_id)
+    else {
+        return false;
+    };
+    let Some(map) = world.get_resource::<Map>() else {
+        return false;
+    };
+    let start = topology.nodes[topology.start_node.0].anchor;
+    map.distance(start.x, start.y, at.x, at.y) > crate::systems::production::PRODUCTION_RANGE as u32
+}
+
+/// 再編時のpartitionキー。進軍済みの異なる方面を一つの小隊へ混ぜないために使う。
+pub(crate) fn carried_axis_for_entity(
+    world: &World,
+    player: PlayerId,
+    entity: Entity,
+) -> Option<GridPosition> {
+    if crate::ai::resolve_player_ai_version(world, player) != crate::ai::AiVersion::V4 {
+        return None;
+    }
+    let carried = carried_route_for_entity(world, player, entity)?;
+    Some(
+        capital_route_topology_for(world, player, carried.island_id)?
+            .routes
+            .get(carried.route.0)?
+            .front,
+    )
+}
+
+/// 選択した方面を記録する。出撃前は更新可能、出撃後は小隊目標の変更だけでは振り替えない。
+fn record_carried_routes(
+    world: &World,
+    player: PlayerId,
+    manager: &crate::ai::squad::SquadManager,
+    registry: &mut CapitalRoutePathRegistry,
+) {
+    if crate::ai::strategy_profile::current_profile(world, player)
+        == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+    {
+        return;
+    }
+    registry.carried_routes.retain(|entity, carried| {
+        world
+            .get::<Faction>(*entity)
+            .is_some_and(|faction| faction.0 == carried.player_id)
+            && world
+                .get::<crate::components::Transporting>(*entity)
+                .is_none()
+            && world
+                .get::<GridPosition>(*entity)
+                .and_then(|at| {
+                    world
+                        .get_resource::<crate::ai::islands::IslandMap>()?
+                        .get_island_at(at)
+                })
+                .is_some_and(|island| island.id == carried.island_id)
+    });
+    for squad in manager
+        .squads
+        .iter()
+        .filter(|squad| squad.plan.owner_id == Some(player))
+    {
+        let Some(order) = registry.commitments.get(&squad.id) else {
+            continue;
+        };
+        for entity in &squad.members {
+            if world.get::<UnitStats>(*entity).is_none_or(|stats| {
+                matches!(
+                    stats.movement_type,
+                    crate::resources::MovementType::Air | crate::resources::MovementType::Ship
+                )
+            }) || world
+                .get::<crate::components::Transporting>(*entity)
+                .is_some()
+            {
+                continue;
+            }
+            if registry
+                .carried_routes
+                .get(entity)
+                .is_some_and(|carried| departed_with_route(world, *entity, *carried))
+            {
+                continue;
+            }
+            registry.carried_routes.insert(
+                *entity,
+                CarriedCapitalRoute {
+                    player_id: player,
+                    island_id: order.island_id,
+                    route: order.route,
+                },
+            );
+        }
+    }
 }
 
 /// 生産時の明示Deploymentを除き、候補Squadを元の一覧順のまま島へまとめる。
@@ -810,6 +985,21 @@ fn preferred_squad_route(
     squad: &RouteSquad,
     targets: &[Option<GridPosition>],
 ) -> Option<usize> {
+    // 攻守や小隊目標が変わっても、入口を実通過した部隊は同じ方面の次区間を進む。
+    // 占領の明示契約は別の責務なので、その指定先を優先する。
+    if matches!(squad.mission, MissionType::Attack | MissionType::Defense)
+        && let Some(route) = squad.carried_route
+        && targets.get(route).is_some_and(Option::is_some)
+    {
+        return Some(route);
+    }
+    // 首都は全方面の合流点であり、新規部隊の方面を決める根拠にはしない。
+    // まだ入口を通っていない本隊は、不足枠による通常の配分へ渡す。
+    if squad.mission == MissionType::Attack
+        && squad.target == Some(topology.nodes[topology.goal_node.0].anchor)
+    {
+        return None;
+    }
     squad_target_route(topology, map, &squad.mission, squad.target, targets)
 }
 
@@ -1427,8 +1617,14 @@ fn allocate_frontline_phase(
             return (requested_phase, forward_target, false);
         }
         let stage_index = staged_squads.entry(operation_id).or_default();
-        let target =
-            capital_route_staging_target(world, player_id, path, forward_target, *stage_index);
+        let target = capital_route_staging_target(
+            world,
+            player_id,
+            path,
+            node_operation,
+            forward_target,
+            *stage_index,
+        );
         *stage_index = stage_index.saturating_add(1);
         return (CapitalRouteExecutionPhase::Stage, target, false);
     }
@@ -1462,8 +1658,14 @@ fn allocate_frontline_phase(
             (CapitalRouteExecutionPhase::Advance, forward_target)
         } else {
             let stage_index = staged_squads.entry(operation_id).or_default();
-            let target =
-                capital_route_staging_target(world, player_id, path, forward_target, *stage_index);
+            let target = capital_route_staging_target(
+                world,
+                player_id,
+                path,
+                node_operation,
+                forward_target,
+                *stage_index,
+            );
             *stage_index = stage_index.saturating_add(1);
             (CapitalRouteExecutionPhase::Stage, target)
         }
@@ -1853,6 +2055,7 @@ fn commit_route_assignments(
     registry
         .assignment_diagnostics
         .extend(assignment_diagnostics);
+    record_carried_routes(world, player_id, manager, &mut registry);
     world.insert_resource(registry);
 }
 
@@ -2262,6 +2465,7 @@ mod arrival_tests {
             ground_positions: vec![at],
             ground_members: vec![entity],
             route_operation: false,
+            carried_route: None,
         };
         // 自首都(0,0)からの距離では遠方が先になる条件を作る。
         let far_squad = make_squad(far, far_at, 26, 1);

@@ -218,13 +218,22 @@ pub(in crate::ai::v4) enum CapitalRouteExecutionPhase {
 
 #[derive(Resource, Debug, Default, Clone)]
 pub(crate) struct CapitalRoutePathRegistry {
-    /// EntityではなくSquadをキーにする。memberの追加・回復・退却があっても、
-    /// Squad orderのidentityとDAG上の担当区間は変わらない。
+    /// 実行指令の正本はSquadをキーにする。小隊再編をまたぐ方面の継承は
+    /// carried_routesで保持し、各Squadの現在区間はここへ投影する。
     pub(in crate::ai::v4) commitments: HashMap<SquadId, CapitalRouteCommitment>,
     /// 論理作戦IDから現在の実行形へ引く索引。指令本文やmember集合を二重保持しない。
     pub(in crate::ai::v4) squads_by_operation: HashMap<crate::ai::squad::SquadOperationId, SquadId>,
     pub(in crate::ai::v4) assignment_diagnostics:
         HashMap<CapitalRouteTopologyKey, CapitalRouteAssignmentDiagnostics>,
+    /// 選択済みの方面。出撃前は更新でき、出撃後は区間目標やSquad IDの更新では失効させない。
+    pub(in crate::ai::v4) carried_routes: HashMap<Entity, CarriedCapitalRoute>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ai::v4) struct CarriedCapitalRoute {
+    pub(in crate::ai::v4) player_id: PlayerId,
+    pub(in crate::ai::v4) island_id: crate::ai::islands::IslandId,
+    pub(in crate::ai::v4) route: CapitalRouteId,
 }
 
 /// 首都戦役DAGの現在区間へ前進している実Entityを、島と区間目標で集計した結果。

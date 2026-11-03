@@ -2330,6 +2330,8 @@ fn assign_campaign_responsibilities_scoped(
     managed_missions: &[MissionType],
     scope: CampaignAssignmentScope<'_>,
 ) {
+    // 作戦目標を更新しても、異なる入口を実通過した部隊を一つの小隊へ合流させない。
+    responsibilities = route_partition::partition(world, player_id, responsibilities);
     // 生産目的が続くSquadはcampaign再編の受入先に転用せず、空になっても解散しない。
     // 後段の配備接続が同じidentityへ差分を戻すため、新しい孤立Entityを生まない。
     let deployment_ids = world
@@ -11300,6 +11302,7 @@ mod local_assignment;
 mod objective_allocation;
 mod planning_policy;
 mod route_operations;
+mod route_partition;
 
 // 再編本体と通常／拡張hookの差分契約。
 // 未追跡のテスト資産のため、ファイルが存在する場合だけ build.rs がcfgを立てる。

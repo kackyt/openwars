@@ -86,6 +86,15 @@ pub(crate) fn decide_fire_follow_action(
     player_id: PlayerId,
     skip: &HashSet<Entity>,
 ) -> Option<(Entity, AiCommand)> {
+    // 排除直後の空きセルへの進入は、新しい注文や通常採点より先に確定する。
+    // 診断用knownではなく前ステップの実注文を使うため、traceのON/OFFに依存しない。
+    if let Some(action) = released_entry_action(world, player_id, skip) {
+        world
+            .resource_mut::<FireFollowOrderRegistry>()
+            .orders
+            .retain(|order| order.entry != action.0);
+        return Some(action);
+    }
     let orders = observe(world, player_id, skip);
     let turn = world
         .get_resource::<crate::resources::MatchState>()
@@ -128,6 +137,74 @@ pub(crate) fn decide_fire_follow_action(
     command
 }
 
+/// 敵の排除後に予約した進入役へ実命令を渡す。再占有・行動済み・到達不能なら解放する。
+fn released_entry_action(
+    world: &mut World,
+    player_id: PlayerId,
+    skip: &HashSet<Entity>,
+) -> Option<(Entity, AiCommand)> {
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    let previous = world
+        .get_resource::<FireFollowOrderRegistry>()
+        .filter(|registry| registry.player == Some(player_id) && registry.turn == turn)?
+        .orders
+        .clone();
+    if previous.is_empty() {
+        return None;
+    }
+    let (movable, occupancy) =
+        crate::ai::tactics::board::movable_units_and_occupancy(world, player_id, skip, None);
+    for order in previous {
+        if world.get::<GridPosition>(order.target).is_some()
+            || occupancy.contains_key(&(order.cell.x, order.cell.y))
+            || !movable.contains(&order.entry)
+        {
+            continue;
+        }
+        let Some(entry) = select_entry(
+            world,
+            player_id,
+            &[order.entry],
+            &occupancy,
+            &HashSet::default(),
+            &HashSet::default(),
+            order.cell,
+        ) else {
+            continue;
+        };
+        let captures = world
+            .get::<UnitStats>(entry)
+            .is_some_and(|stats| stats.can_capture)
+            && world.iter_entities().any(|entity| {
+                entity.get::<GridPosition>() == Some(&order.cell)
+                    && entity
+                        .get::<crate::components::Property>()
+                        .is_some_and(|property| property.owner_id != Some(player_id))
+            });
+        let command = if captures {
+            AiCommand::Capture {
+                target_pos: order.cell,
+            }
+        } else {
+            AiCommand::Wait {
+                target_pos: order.cell,
+            }
+        };
+        if let Some(mut registry) = world.get_resource_mut::<FireFollowOrderRegistry>()
+            && registry.trace_enabled == Some(true)
+        {
+            registry
+                .trace
+                .push(json!({"kind":"enter", "turn":turn, "player_id":player_id.0,
+                "entry":entry.to_bits(), "cell":[order.cell.x,order.cell.y]}));
+        }
+        return Some((entry, command));
+    }
+    None
+}
+
 /// 盤面から今ステップの注文を作る。決定的に同じ盤面からは同じ注文になる。
 pub(crate) fn observe(
     world: &mut World,
@@ -155,13 +232,25 @@ pub(crate) fn observe(
     if !cells.is_empty() {
         let (movable, occupancy) =
             crate::ai::tactics::board::movable_units_and_occupancy(world, player_id, skip, None);
+        // 射撃可能な敵集合は各部隊につき1回だけ観測する。
+        let attackable = movable
+            .iter()
+            .filter_map(|&shooter| {
+                let at = *world.get::<GridPosition>(shooter)?;
+                Some((
+                    shooter,
+                    crate::systems::combat::get_attackable_targets_at(world, shooter, at, true),
+                ))
+            })
+            .collect::<crate::collections::HashMap<_, _>>();
         // 1体は1注文にだけ使う（同じ手番に二度撃てない・二か所へ入れない）。
         let mut used: HashSet<Entity> = HashSet::default();
         for (target, cell) in cells {
             let Some(target_hp) = world.get::<Health>(target).map(|hp| hp.current) else {
                 continue;
             };
-            let Some(fire_tasks) = select_fire_tasks(world, &movable, &used, target, target_hp)
+            let Some(fire_tasks) =
+                select_fire_tasks(world, &movable, &attackable, &used, target, target_hp)
             else {
                 continue;
             };
@@ -194,7 +283,7 @@ fn blocked_route_cells(world: &World, player_id: PlayerId) -> Vec<(Entity, GridP
         return Vec::new();
     };
     let mut cells = std::collections::BTreeSet::new();
-    for commitment in paths.commitments.values() {
+    for (squad_id, commitment) in &paths.commitments {
         if commitment.player_id != player_id
             || commitment.phase != CapitalRouteExecutionPhase::Advance
         {
@@ -207,6 +296,34 @@ fn blocked_route_cells(world: &World, player_id: PlayerId) -> Vec<(Entity, GridP
                 .chain(std::iter::once(&commitment.execution_target))
                 .map(|cell| (cell.y, cell.x)),
         );
+        // 終点だけでなく、この小隊の最前から実行終点までの進路上の障害も排除する。
+        // 別方面・後方の敵へ火力を奪われないよう、実際の小隊位置で区間を限定する。
+        let squad = world
+            .get_resource::<crate::ai::squad::SquadManager>()
+            .and_then(|manager| manager.squads.iter().find(|squad| squad.id == *squad_id));
+        let front = squad.and_then(|squad| {
+            squad
+                .members
+                .iter()
+                .filter_map(|entity| {
+                    let at = world.get::<GridPosition>(*entity)?;
+                    commitment.path.iter().position(|cell| cell == at)
+                })
+                .max()
+        });
+        let end = commitment
+            .path
+            .iter()
+            .rposition(|cell| *cell == commitment.execution_target);
+        if let (Some(front), Some(end)) = (front, end)
+            && front < end
+        {
+            cells.extend(
+                commitment.path[front + 1..=end]
+                    .iter()
+                    .map(|cell| (cell.y, cell.x)),
+            );
+        }
     }
     if cells.is_empty() {
         return Vec::new();
@@ -238,8 +355,9 @@ fn is_ground(stats: &UnitStats) -> bool {
 ///
 /// 期待ダメージは通常行動と同じ交換予測（`evaluate_attack_exchange`）をそのまま使う。
 fn select_fire_tasks(
-    world: &mut World,
+    world: &World,
     movable: &[Entity],
+    attackable: &crate::collections::HashMap<Entity, Vec<Entity>>,
     used: &HashSet<Entity>,
     target: Entity,
     target_hp: u32,
@@ -253,8 +371,9 @@ fn select_fire_tasks(
             continue;
         };
         // 移動しない射撃なので間接攻撃も許す（移動後の間接射撃は不可のため移動射撃は扱わない）。
-        if !crate::systems::combat::get_attackable_targets_at(world, shooter, at, true)
-            .contains(&target)
+        if !attackable
+            .get(&shooter)
+            .is_some_and(|targets| targets.contains(&target))
         {
             continue;
         }
@@ -293,6 +412,10 @@ fn select_entry(
     fire_tasks: &HashSet<Entity>,
     cell: GridPosition,
 ) -> Option<Entity> {
+    // 専用占領役の予約を、通過・封鎖のための進入役で奪わない。
+    if crate::ai::v4::capital_route::tactical::is_capture_target_reserved(world, player_id, cell) {
+        return None;
+    }
     let map = world.get_resource::<Map>()?;
     let registry = world.get_resource::<MasterDataRegistry>()?;
     // 排除後の盤面: 対象の敵が居たセルを空ける。

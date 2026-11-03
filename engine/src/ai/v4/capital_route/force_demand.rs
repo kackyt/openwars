@@ -1161,29 +1161,64 @@ pub(in crate::ai::v4) fn split_route_front_objectives(
 pub(in crate::ai::v4) const ROUTE_CONTEST_WINDOW: u32 = 4;
 
 /// 目標へ見積もり期間内に届く部隊の戦力価値（価格×HP）。
-fn route_contest_value(map: &Map, units: &[UnitSnapshot], target: GridPosition) -> u32 {
+fn route_contest_value(
+    units: &[UnitSnapshot],
+    target: GridPosition,
+    travel: &mut RouteTravel<'_>,
+) -> u32 {
     units
         .iter()
         .filter(|unit| {
-            map.distance(unit.pos.x, unit.pos.y, target.x, target.y)
-                .div_ceil(unit.stats.max_movement.max(1))
-                <= ROUTE_CONTEST_WINDOW
+            travel
+                .arrival(unit, target)
+                .is_some_and(|eta| eta <= ROUTE_CONTEST_WINDOW)
         })
         .map(|unit| unit.stats.cost.saturating_mul(unit.hp) / 100)
         .fold(0_u32, u32::saturating_add)
+}
+
+/// 部隊ごとの実移動種別・移動力・燃料で測る地形到着時間。
+/// 占有・交戦による遅延は含まないため、攻勢成立の保証ではなく戦力計上の必要条件とする。
+struct RouteTravel<'a> {
+    map: &'a Map,
+    master: &'a MasterDataRegistry,
+    cache: crate::ai::turn_distance::ActionTurnDistanceCache,
+}
+
+impl<'a> RouteTravel<'a> {
+    fn new(map: &'a Map, master: &'a MasterDataRegistry) -> Self {
+        Self {
+            map,
+            master,
+            cache: Default::default(),
+        }
+    }
+
+    fn arrival(&mut self, unit: &UnitSnapshot, target: GridPosition) -> Option<u32> {
+        property_control::fire_arrival_turns(
+            self.map,
+            self.master,
+            (unit.pos.x, unit.pos.y),
+            (target.x, target.y),
+            &unit.stats,
+            unit.stats.max_fuel,
+            PlayerId(0),
+            &mut self.cache,
+        )
+    }
 }
 
 /// 各部隊を最も早く着ける進軍路（`anchors`のSome）一つにだけ割り当て、見積もり期間内に
 /// 着ける部隊の戦力価値を進軍路ごとに合計する。首都周りの部隊を複数の進軍路へ重ねて
 /// 数えないためである。
 fn partitioned_route_values(
-    map: &Map,
+    travel: &mut RouteTravel<'_>,
     units: &[UnitSnapshot],
     anchors: &[Option<GridPosition>],
 ) -> Vec<u32> {
     let mut values = vec![0_u32; anchors.len()];
     for unit in units {
-        if let Some(index) = route_of_unit(map, unit, anchors) {
+        if let Some(index) = route_of_unit(travel, unit, anchors) {
             values[index] =
                 values[index].saturating_add(unit.stats.cost.saturating_mul(unit.hp) / 100);
         }
@@ -1193,13 +1228,13 @@ fn partitioned_route_values(
 
 /// [`partitioned_route_values`] と同じ割り当てで、進軍路ごとの部隊数を数える。
 fn partitioned_route_counts(
-    map: &Map,
+    travel: &mut RouteTravel<'_>,
     units: &[UnitSnapshot],
     anchors: &[Option<GridPosition>],
 ) -> Vec<u32> {
     let mut counts = vec![0_u32; anchors.len()];
     for unit in units {
-        if let Some(index) = route_of_unit(map, unit, anchors) {
+        if let Some(index) = route_of_unit(travel, unit, anchors) {
             counts[index] = counts[index].saturating_add(1);
         }
     }
@@ -1208,7 +1243,7 @@ fn partitioned_route_counts(
 
 /// 部隊が最も早く着ける進軍路（見積もり期間内に着けなければNone）。
 fn route_of_unit(
-    map: &Map,
+    travel: &mut RouteTravel<'_>,
     unit: &UnitSnapshot,
     anchors: &[Option<GridPosition>],
 ) -> Option<usize> {
@@ -1217,9 +1252,7 @@ fn route_of_unit(
         .enumerate()
         .filter_map(|(index, anchor)| {
             let anchor = (*anchor)?;
-            let eta = map
-                .distance(unit.pos.x, unit.pos.y, anchor.x, anchor.y)
-                .div_ceil(unit.stats.max_movement.max(1));
+            let eta = travel.arrival(unit, anchor)?;
             Some((eta, index))
         })
         .min()?;
@@ -1614,15 +1647,18 @@ fn posture_score(
     for &route in contested {
         let prospect = &prospects[route];
         let own = u64::from(prospect.own).saturating_add(added[route]);
-        // 集中案で守りに回す進軍路は、守りの地点の前面で同時に戦える敵とだけ戦う。
-        let engaged = if posture.is_some_and(|main| main != route) {
-            enemy[route].min(u64::from(prospect.contact_cap))
-        } else {
+        // 増援の重点先と攻守を分離し、命令生成と同じ戦力比較で攻勢を見積もる。
+        // 非重点方面も既存戦力で敵の全戦力を上回れば攻める。届かない場合だけ、
+        // 守備地点の接触幅を利用して受け止め、獲得拠点や首都到達を計上しない。
+        let attacks = own > enemy[route];
+        let engaged = if attacks {
             enemy[route]
+        } else {
+            enemy[route].min(u64::from(prospect.contact_cap))
         };
         let outcome = route_battle_outcome(own as f64, engaged as f64);
         score += outcome;
-        if outcome > 0.0 {
+        if outcome > 0.0 && attacks {
             score += f64::from(prospect.gains).min(capacity(outcome)) * f64::from(values.property);
             if let Some(turns) = prospect.capital_turns {
                 fastest_capital = Some(fastest_capital.map_or(turns, |best| best.min(turns)));
@@ -1675,19 +1711,19 @@ fn choose_route_posture(
     best
 }
 
-/// 戦力を一つの進軍路へ集中する案と分散する案を比べ、集中する方が良ければ、主戦場以外の
-/// 敵のいる進軍路を最小限の戦力で守る。
+/// 増援を集中・分散する案を比べ、各方面の攻守はその時点の戦況から別に決める。
 ///
 /// 敵が見積もり期間内に戦力を寄せている進軍路が二つ以上あるとき、各進軍路の見通し
 /// （戦力、得る地域、失う地域、首都までの実ターン）を作り、[`choose_route_posture`]
-/// で配分案を選ぶ。集中案なら、主戦場以外の敵のいる進軍路を、目標に最も近い自軍拠点を
-/// 守るDefense作戦（戦力節約の守り）へ切り替え、その地点を返す。守りの作戦は保持できる
-/// 最も安い編成だけを買うので、資金は主戦場へ回る。敵のいない進軍路の占領は安く取れる
-/// ので、どの案でもそのまま残す。`decided` は地域の状況が変わっていないときの決定済みの案で、
-/// あれば比べ直さず、主戦場・要衝・攻守もそのままに遂行する。`turns` は占領役の足で測る実ターン（届かなければNone）。
+/// で増援の配分案を選ぶ。重点外でも既存戦力と割当増援で攻められる方面はCaptureを
+/// 継続し、攻められない方面だけ保持地点を守るDefense作戦へ切り替える。
+/// `decided` があるとき保持するのは増援の重点先であり、過去の攻守命令ではない。
+/// `turns` は占領役の足で測る地域間の実ターン（届かなければNone）。個々の戦力の計上は
+/// `master_data` と各兵種の能力を使った地形到着時間で行う。
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ai::v4) fn concentrate_route_efforts(
     map: &Map,
+    master_data: &MasterDataRegistry,
     objectives: Vec<CampaignPlanningObjective>,
     my_units: &[UnitSnapshot],
     enemy_units: &[UnitSnapshot],
@@ -1700,11 +1736,12 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
     turns: &mut dyn FnMut(GridPosition, GridPosition) -> Option<u32>,
 ) -> RouteEffortPlan {
     let (own_capital, enemy_capital) = capitals;
+    let mut travel = RouteTravel::new(map, master_data);
     let route_anchors = objectives
         .iter()
         .map(|objective| (objective.kind == OperationKind::Capture).then_some(objective.anchor))
         .collect::<Vec<_>>();
-    let enemy_values = partitioned_route_values(map, enemy_units, &route_anchors);
+    let enemy_values = partitioned_route_values(&mut travel, enemy_units, &route_anchors);
     let contested = (0..objectives.len())
         .filter(|index| enemy_values[*index] > 0)
         .collect::<Vec<_>>();
@@ -1724,8 +1761,8 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
         .enumerate()
         .map(|(index, anchor)| anchor.filter(|_| contested.contains(&index)))
         .collect::<Vec<_>>();
-    let own_values = partitioned_route_values(map, my_units, &contested_anchors);
-    let enemy_counts = partitioned_route_counts(map, enemy_units, &route_anchors);
+    let own_values = partitioned_route_values(&mut travel, my_units, &contested_anchors);
+    let enemy_counts = partitioned_route_counts(&mut travel, enemy_units, &route_anchors);
     let within_window =
         |turns: Option<u32>| turns.is_some_and(|turns| turns <= ROUTE_CONTEST_WINDOW);
     // 地域ごとの得失。自軍が押さえていない地域は、実ターンで最も近い進軍路の目標から
@@ -1792,13 +1829,7 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
             .find(|&&route| objectives[route].anchor == anchor)
             .map(|&route| Some(route)),
     });
-    // 決めた案を遂行する間は、各進軍路の要衝と攻守も決めたときのまま保つ（戦力の配分だけを
-    // 今の盤面で更新する）。見積もりの揺れで攻守が手番ごとに入れ替わると、部隊が要衝へ
-    // 着く前に行き先が変わる。
-    let decided_orders = decided_posture
-        .and(decided)
-        .map(|decision| decision.orders.as_slice())
-        .filter(|orders| orders.len() == contested.len());
+    // 記憶するのは増援の重点先だけ。既存部隊で攻められるかは毎回見直す。
     let posture = decided_posture
         .unwrap_or_else(|| choose_route_posture(&prospects, &contested, budgets, values));
     // 配分案の戦力で各進軍路の要衝を決める。勝てる進軍路（分散案の全進軍路、集中案の
@@ -1857,15 +1888,6 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
                 return objective;
             };
             let force = u32::try_from(intended(index)).unwrap_or(u32::MAX);
-            // 決めた案を遂行中なら、要衝と攻守を決めたときのまま保つ。
-            if let Some(order) = decided_orders.map(|orders| orders[route]) {
-                orders.push(RouteOrder { force, ..order });
-                return if order.defend {
-                    defense_objective(objective, order.key_point)
-                } else {
-                    objective
-                };
-            }
             // 攻めるか守るかは戦闘の見積もりで決める。敵より先に押さえられる最も前の地点は、
             // 守りの要衝、または攻めの集結点にする。
             let committed_force = u64::from(own_values[index]).saturating_add(allocation[index]);
@@ -1880,7 +1902,8 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
                 own_capital,
                 turns,
             );
-            let attacks = wins && posture.is_none_or(|main| main == index);
+            // 重点外でも既存戦力と割当増援で攻められる方面は攻勢を続ける。
+            let attacks = wins;
             if attacks {
                 let staging = key_point
                     .or_else(|| nearest_own_property(map, own_properties, objective.anchor))
@@ -1932,13 +1955,14 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
 /// 次の手番から再びCaptureへ戻る。
 pub(in crate::ai::v4) fn defend_outmatched_routes(
     map: &Map,
+    master_data: &MasterDataRegistry,
     objectives: Vec<CampaignPlanningObjective>,
     my_units: &[UnitSnapshot],
     enemy_units: &[UnitSnapshot],
     own_properties: &[GridPosition],
-    production_budget: u32,
-    enemy_production_budget: u32,
+    budgets: PostureBudgets,
 ) -> Vec<CampaignPlanningObjective> {
+    let mut travel = RouteTravel::new(map, master_data);
     let capture_count = objectives
         .iter()
         .filter(|objective| objective.kind == OperationKind::Capture)
@@ -1946,10 +1970,9 @@ pub(in crate::ai::v4) fn defend_outmatched_routes(
     if capture_count == 0 {
         return objectives;
     }
-    let budget_share = production_budget / u32::try_from(capture_count).unwrap_or(u32::MAX);
+    let budget_share = budgets.own / u32::try_from(capture_count).unwrap_or(u32::MAX);
     // 敵も同じ期間に収入で増援を作れるので、見込みの生産額を経路数で割って敵側にも足す。
-    let enemy_budget_share =
-        enemy_production_budget / u32::try_from(capture_count).unwrap_or(u32::MAX);
+    let enemy_budget_share = budgets.enemy / u32::try_from(capture_count).unwrap_or(u32::MAX);
     objectives
         .into_iter()
         .map(|objective| {
@@ -1957,9 +1980,10 @@ pub(in crate::ai::v4) fn defend_outmatched_routes(
                 return objective;
             }
             let target = objective.anchor;
-            let enemy =
-                route_contest_value(map, enemy_units, target).saturating_add(enemy_budget_share);
-            let own = route_contest_value(map, my_units, target).saturating_add(budget_share);
+            let enemy = route_contest_value(enemy_units, target, &mut travel)
+                .saturating_add(enemy_budget_share);
+            let own =
+                route_contest_value(my_units, target, &mut travel).saturating_add(budget_share);
             if own >= enemy {
                 return objective;
             }
@@ -1967,6 +1991,10 @@ pub(in crate::ai::v4) fn defend_outmatched_routes(
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "posture_scenarios.rs"]
+mod posture_scenarios;
 
 #[cfg(test)]
 mod posture_tests {
@@ -1996,7 +2024,7 @@ mod posture_tests {
     }
 
     #[test]
-    fn existing_posture_keeps_defense_target_even_with_artillery_on_another_route() {
+    fn existing_priority_revalidates_defense_against_current_owned_sites() {
         let map = Map::new(
             12,
             12,
@@ -2051,6 +2079,7 @@ mod posture_tests {
         };
         let plan = concentrate_route_efforts(
             &map,
+            &MasterDataRegistry::load().unwrap(),
             targets.into_iter().map(objective).collect(),
             &[snapshot(targets[1], UnitType::Artillery)],
             &[
@@ -2066,7 +2095,8 @@ mod posture_tests {
             &mut |a, b| Some(map.distance(a.x, a.y, b.x, b.y)),
         );
         assert_eq!(plan.posture, Some(Some(targets[0])));
-        assert_eq!(plan.orders[1].key_point, orders[1].key_point);
+        // 重点先は保持するが、過去の(8,8)を無条件に守り続けず、現在の自軍拠点を使う。
+        assert_eq!(plan.orders[1].key_point, point(7, 7));
         assert!(plan.orders[1].defend);
     }
 
@@ -2124,6 +2154,33 @@ mod posture_tests {
         let score =
             |posture| posture_score(posture, &prospects, &[0, 1], budgets(90_000, 0), VALUES);
         assert!(score(Some(1)) > score(Some(0)));
+    }
+
+    /// 非重点方面も攻められる場合は、その攻勢の成果を配分案に正しく含める。
+    #[test]
+    fn attackable_nonpriority_route_earns_capture_value() {
+        let mut prospects = [
+            route(100_000, 10_000, 1, 1, 8),
+            route(100_000, 10_000, 1, 1, 2),
+        ];
+        let before = posture_score(Some(0), &prospects, &[0, 1], budgets(0, 0), VALUES);
+        prospects[1].gains += 1;
+        let after = posture_score(Some(0), &prospects, &[0, 1], budgets(0, 0), VALUES);
+        assert_eq!(after - before, f64::from(VALUES.property));
+    }
+
+    /// 守備地点の接触幅なら受け止められても、敵主力へ攻め込めなければ獲得拠点は数えない。
+    #[test]
+    fn holding_a_contact_front_does_not_earn_offensive_gains() {
+        let mut prospects = [
+            route(100_000, 10_000, 1, 1, 8),
+            route(10_000, 100_000, 1, 1, 2),
+        ];
+        prospects[1].contact_cap = 5_000;
+        let before = posture_score(Some(0), &prospects, &[0, 1], budgets(0, 0), VALUES);
+        prospects[1].gains += 1;
+        let after = posture_score(Some(0), &prospects, &[0, 1], budgets(0, 0), VALUES);
+        assert_eq!(after, before);
     }
 
     #[test]

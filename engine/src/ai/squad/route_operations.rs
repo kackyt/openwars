@@ -9,6 +9,10 @@
 //! 要衝へ着けるか、所属の戦力が要衝周りの敵を上回るなら直ちに進出し、どちらでもなければ
 //! 集結点（敵より先に押さえられる最も前の地点）へ集まって戦力が揃うのを待つ。
 
+mod guard;
+#[cfg(test)]
+mod guard_tests;
+
 use super::{CampaignResponsibility, MissionType, SquadManager};
 use crate::ai::v4::capital_route::force_demand::RouteOrder;
 use crate::components::{Faction, GridPosition, Health, PlayerId, Property, UnitStats};
@@ -281,6 +285,27 @@ pub(super) fn responsibilities(
         let launched = !order.defend
             && (previous_launch.get(index).copied().unwrap_or(false)
                 || launches(world, map, player, order, &members));
+        let guard_duties = if launched {
+            guard::duties(world, map, player, island, order, &members, connectivity)
+        } else {
+            Vec::new()
+        };
+        let retained = guard_duties
+            .iter()
+            .flat_map(|duty| duty.members.iter().copied())
+            .collect::<crate::collections::HashSet<_>>();
+        responsibilities.extend(guard_duties);
+        let members = members
+            .into_iter()
+            .filter(|entity| !retained.contains(entity))
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
+        }
+        // 守備役を取り分けた後の前進部隊だけで、初回出撃が成立するかを検査する。
+        let launched = launched
+            && (previous_launch.get(index).copied().unwrap_or(false)
+                || launches(world, map, player, order, &members));
         let target = if order.defend {
             order.key_point
         } else if launched {
@@ -403,12 +428,31 @@ fn launches(
     members: &[Entity],
 ) -> bool {
     let key = order.key_point;
-    let eta = |entity: Entity| -> Option<u32> {
+    let Some(master) = world.get_resource::<crate::resources::master_data::MasterDataRegistry>()
+    else {
+        return false;
+    };
+    let mut travel = crate::ai::turn_distance::ActionTurnDistanceCache::default();
+    let mut eta = |entity: Entity| -> Option<u32> {
         let at = world.get::<GridPosition>(entity)?;
         let stats = world.get::<UnitStats>(entity)?;
-        Some(
-            map.distance(at.x, at.y, key.x, key.y)
-                .div_ceil(stats.max_movement.max(1)),
+        let fuel = world
+            .get::<crate::components::Fuel>(entity)
+            .map_or(stats.max_fuel, |fuel| fuel.current);
+        // 実燃料ゼロの部隊は現在地以外へ到達できない。距離関数のテスト用センチネルと区別する。
+        if fuel == 0 && world.get::<crate::components::Fuel>(entity).is_some() && *at != key {
+            return None;
+        }
+        crate::ai::v4::property_control::capture_arrival_turns(
+            map,
+            master,
+            (at.x, at.y),
+            (key.x, key.y),
+            stats.movement_type,
+            stats.max_movement,
+            fuel,
+            player,
+            &mut travel,
         )
     };
     let our_arrival = members.iter().filter_map(|member| eta(*member)).min();
@@ -422,13 +466,38 @@ fn launches(
         .map(|entity| entity.id())
         .collect::<Vec<_>>();
     let enemy_arrival = enemies.iter().filter_map(|enemy| eta(*enemy)).min();
+    // 占位の先着競争と、砲兵を含む射撃支援の到着を分ける。
+    let mut fire_cache = crate::ai::turn_distance::ActionTurnDistanceCache::default();
+    let mut fire_eta = |entity: Entity| -> Option<u32> {
+        let at = world.get::<GridPosition>(entity)?;
+        let stats = world.get::<UnitStats>(entity)?;
+        let fuel = world
+            .get::<crate::components::Fuel>(entity)
+            .map_or(stats.max_fuel, |fuel| fuel.current);
+        if fuel == 0 && world.get::<crate::components::Fuel>(entity).is_some() {
+            let distance = map.distance(at.x, at.y, key.x, key.y);
+            return (distance >= stats.min_range && distance <= stats.max_range).then_some(0);
+        }
+        crate::ai::v4::property_control::fire_arrival_turns(
+            map,
+            master,
+            (at.x, at.y),
+            (key.x, key.y),
+            stats,
+            fuel,
+            player,
+            &mut fire_cache,
+        )
+    };
     let enemy_near = enemies
         .iter()
-        .filter(|enemy| eta(**enemy).is_some_and(|turns| turns <= KEY_POINT_ENEMY_TURNS))
+        .filter(|enemy| fire_eta(**enemy).is_some_and(|turns| turns <= KEY_POINT_ENEMY_TURNS))
         .map(|enemy| unit_value(world, *enemy))
         .sum::<u32>();
+    // 後方の大軍を即時の突破戦力として数えず、同じ交戦期間に届く部隊だけを比較する。
     let our_force = members
         .iter()
+        .filter(|member| fire_eta(**member).is_some_and(|turns| turns <= KEY_POINT_ENEMY_TURNS))
         .map(|member| unit_value(world, *member))
         .sum::<u32>();
     let wins_race = match (our_arrival, enemy_arrival) {
@@ -872,7 +941,9 @@ mod tests {
             let plan = RouteOperationPlan {
                 members: vec![vec![gun]],
                 free: Vec::new(),
-                launched: vec![false],
+                // 本テストは開始済み作戦の任務継承を検査する。燃料1の砲台が遠方へ
+                // 自走して初回出撃できる、という地形到達と矛盾する前提にはしない。
+                launched: vec![true],
             };
             let (assigned, _) = responsibilities(
                 &world,
@@ -892,6 +963,97 @@ mod tests {
             );
             assert_ne!(role.target, order.key_point, "砲台へは射撃位置を渡す");
         }
+    }
+
+    /// 配分判断の下流にある出撃判定も、実Entityと地形を置いて独立に検査する。
+    #[test]
+    fn launch_scenario_matrix() {
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let mut failures = Vec::new();
+        for (name, ours, enemies, blocked, expected) in [
+            ("unopposed_advance_on_land", vec![2], vec![18], false, true),
+            (
+                "outnumbered_at_enemy_position",
+                vec![2],
+                vec![8, 9, 10],
+                false,
+                false,
+            ),
+            ("reinforcements_at_front", vec![8, 7], vec![9], false, true),
+            (
+                "sea_blocks_the_apparent_first_arrival",
+                vec![2],
+                vec![18],
+                true,
+                false,
+            ),
+        ] {
+            let mut world = World::new();
+            let mut map = Map::new(
+                20,
+                5,
+                crate::resources::Terrain::Plains,
+                crate::resources::GridTopology::Square,
+            );
+            if blocked {
+                for y in 0..map.height {
+                    map.set_terrain(5, y, crate::resources::Terrain::Sea)
+                        .unwrap();
+                }
+                assert!(
+                    crate::systems::movement::get_valid_movement_cost(
+                        &data,
+                        stats.movement_type,
+                        crate::resources::Terrain::Sea,
+                    )
+                    .is_none()
+                );
+            }
+            world.insert_resource(map.clone());
+            world.insert_resource(data.clone());
+            let mut members = Vec::new();
+            for (player, positions) in [(1, ours), (2, enemies)] {
+                for x in positions {
+                    let entity = world
+                        .spawn((
+                            Faction(PlayerId(player)),
+                            GridPosition { x, y: 2 },
+                            stats.clone(),
+                            Health {
+                                current: 100,
+                                max: 100,
+                            },
+                        ))
+                        .id();
+                    if player == 1 {
+                        members.push(entity);
+                    }
+                }
+            }
+            let order = RouteOrder {
+                key_point: GridPosition { x: 8, y: 2 },
+                staging: GridPosition { x: 2, y: 2 },
+                defend: false,
+                force: stats.cost,
+            };
+            let actual = launches(&world, &map, PlayerId(1), &order, &members);
+            println!(
+                "{} {name} expected_launch={expected} actual_launch={actual}",
+                if actual == expected { "PASS" } else { "FAIL" }
+            );
+            if actual != expected {
+                failures.push(name);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "出撃判断が期待に反した局面: {failures:?}"
+        );
     }
 
     #[test]
