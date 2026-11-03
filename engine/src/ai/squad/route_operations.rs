@@ -155,8 +155,23 @@ pub(super) fn responsibilities(
         launched: previous_launch,
     } = plan;
     let mut pool = free;
+    let enemies = enemy_units(world, player);
+    // 部隊の周り（作戦が攻撃に向かってよい範囲）に敵がいるか。交戦中の部隊は戦線を
+    // 支えているので、余剰として別の進軍路へ回さない。
+    let engaged = |entity: Entity| {
+        world.get::<GridPosition>(entity).is_some_and(|at| {
+            enemies
+                .iter()
+                .any(|(enemy, _)| map.distance(at.x, at.y, enemy.x, enemy.y) <= ENGAGEMENT_RADIUS)
+        })
+    };
     // 防衛の所要戦力を満たした後の余剰まで固定所属に残すと、配分案の集中が
     // 実行されず、主攻勢には火力が届かない。現在の要衝へ近い部隊を所要分だけ残す。
+    //
+    // ただし回すのは周りに敵のいない余剰だけにする。攻めの目標を取って配分案が主戦場を
+    // 別の進軍路へ切り替えるたびに、敵地で交戦中の部隊まで丸ごと地図の反対側へ引き抜くと、
+    // 全軍が進軍路の間を往復して前進が積み上がらない（map_20後手で数ターンごとに
+    // 50体以上が南北を入れ替わった）。後方の守備に溜まった余剰は従来どおり攻勢へ回る。
     for (index, order) in orders.iter().enumerate().filter(|(_, order)| order.defend) {
         members[index].sort_by_key(|entity| {
             let turns = world
@@ -170,7 +185,7 @@ pub(super) fn responsibilities(
         });
         let mut retained = 0_u64;
         members[index].retain(|entity| {
-            if retained < u64::from(order.force) {
+            if retained < u64::from(order.force) || engaged(*entity) {
                 retained = retained.saturating_add(u64::from(unit_value(world, *entity)));
                 true
             } else {
@@ -256,7 +271,6 @@ pub(super) fn responsibilities(
     }
     // 作戦ごとに、所属部隊だけで目標（守りの要衝、攻めは進出するなら要衝・待つなら集結点）
     // を妨げる敵へ有効な部隊を当て、残りを目標へ前進させる。
-    let enemies = enemy_units(world, player);
     let mut responsibilities = Vec::new();
     for (index, (order, members)) in orders.iter().zip(members.iter().cloned()).enumerate() {
         if members.is_empty() {
@@ -963,6 +977,72 @@ mod tests {
     }
 
     /// 防衛の余剰と新規部隊が、充足済みの近い守備隊へ再吸収されない。
+    /// 敵と交戦中の部隊は、守りの所要戦力を超えていても別の進軍路へ引き抜かない。
+    #[test]
+    fn engaged_defense_surplus_is_not_pulled_to_another_route() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(
+            20,
+            5,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        ));
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let cost = stats.cost;
+        world.insert_resource(data);
+        world.insert_resource(crate::resources::DamageChart::new());
+        let mut spawn = |player: u32| {
+            world
+                .spawn((
+                    Faction(PlayerId(player)),
+                    GridPosition { x: 2, y: 2 },
+                    stats.clone(),
+                    Health {
+                        current: 100,
+                        max: 100,
+                    },
+                ))
+                .id()
+        };
+        let units = (0..3).map(|_| spawn(1)).collect::<Vec<_>>();
+        let enemy = spawn(2);
+        world.entity_mut(enemy).insert(GridPosition { x: 4, y: 2 });
+        let orders = [
+            RouteOrder {
+                key_point: GridPosition { x: 3, y: 2 },
+                staging: GridPosition { x: 3, y: 2 },
+                defend: true,
+                force: cost,
+            },
+            RouteOrder {
+                key_point: GridPosition { x: 17, y: 2 },
+                staging: GridPosition { x: 10, y: 2 },
+                defend: false,
+                force: cost * 3,
+            },
+        ];
+        let plan = RouteOperationPlan {
+            members: vec![units.clone(), Vec::new()],
+            free: Vec::new(),
+            launched: vec![false, true],
+        };
+        let (_, members) = responsibilities(
+            &world,
+            PlayerId(1),
+            crate::ai::islands::IslandId(0),
+            &orders,
+            plan,
+            &mut Default::default(),
+        );
+        assert_eq!(members[0].len(), units.len(), "交戦中の部隊は戦線に残す");
+        assert!(members[1].is_empty(), "地図の反対側へ引き抜かない");
+    }
+
     #[test]
     fn defense_keeps_required_force_and_releases_surplus_to_the_offensive() {
         let mut world = World::new();
