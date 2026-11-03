@@ -9,6 +9,9 @@
 //! 要衝へ着けるか、所属の戦力が要衝周りの敵を上回るなら直ちに進出し、どちらでもなければ
 //! 集結点（敵より先に押さえられる最も前の地点）へ集まって戦力が揃うのを待つ。
 
+mod city_defense;
+#[cfg(test)]
+mod city_defense_tests;
 mod guard;
 #[cfg(test)]
 mod guard_tests;
@@ -325,8 +328,61 @@ pub(super) fn responsibilities(
             .iter()
             .copied()
             .partition(|member| is_indirect(world, *member));
+
+        // 自軍都市の防衛なら、都市防衛計画（通路封鎖・都市からの間接支援）を試みる。
+        let master = world.get_resource::<crate::resources::master_data::MasterDataRegistry>();
+        let is_own_city = world.iter_entities().any(|entity| {
+            entity.get::<GridPosition>() == Some(&target)
+                && entity.get::<Property>().is_some_and(|p| {
+                    p.owner_id == Some(player) && p.terrain == crate::resources::Terrain::City
+                })
+        });
+        let city_plan = if order.defend && is_own_city {
+            master.and_then(|reg| {
+                let indirect_ranges = indirect
+                    .iter()
+                    .filter_map(|e| world.get::<UnitStats>(*e))
+                    .map(|s| (s.min_range, s.max_range))
+                    .collect::<Vec<_>>();
+                let mut occupied = crate::collections::HashSet::default();
+                for entity in world.iter_entities() {
+                    if let Some(pos) = entity.get::<GridPosition>() {
+                        if entity.get::<Faction>().is_some_and(|f| f.0 == player) {
+                            if let Some(health) = entity.get::<Health>() {
+                                if health.current < health.max {
+                                    occupied.insert(*pos);
+                                }
+                            }
+                        }
+                    }
+                }
+                city_defense::plan_city_defense(
+                    map,
+                    reg,
+                    target,
+                    &enemies,
+                    direct.len(),
+                    &indirect_ranges,
+                    &occupied,
+                )
+            })
+        } else {
+            None
+        };
+
         let mut taken = crate::collections::HashSet::default();
-        for gun in indirect {
+        let mut indirect_iter = indirect.into_iter();
+        if let Some(support_city) = city_plan.as_ref().and_then(|p| p.support_city) {
+            if let Some(gun) = indirect_iter.next() {
+                taken.insert(support_city);
+                responsibilities.push(CampaignResponsibility {
+                    mission_type: mission_type.clone(),
+                    target: support_city,
+                    members: vec![gun],
+                });
+            }
+        }
+        for gun in indirect_iter {
             let found = firing_position(world, map, player, &enemies, gun, target, front, &taken);
             if std::env::var_os("OPENWARS_ROUTE_OPS_DEBUG").is_some() {
                 let stats = world.get::<UnitStats>(gun);
@@ -375,6 +431,83 @@ pub(super) fn responsibilities(
         }
         if direct.is_empty() {
             continue;
+        }
+
+        // 都市防衛計画の封鎖地点がある場合、直接部隊を各封鎖地点へ配備する
+        if let Some(ref plan) = city_plan {
+            if !plan.chokepoints.is_empty() {
+                let mut direct_pool = direct;
+                let mut assigned_chokes = Vec::new();
+
+                for &chokepoint in &plan.chokepoints {
+                    if direct_pool.is_empty() {
+                        break;
+                    }
+                    let nearest_idx = direct_pool
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entity)| {
+                            world.get::<GridPosition>(**entity).map_or(u32::MAX, |at| {
+                                map.distance(at.x, at.y, chokepoint.x, chokepoint.y)
+                            })
+                        })
+                        .map(|(idx, _)| idx);
+
+                    if let Some(idx) = nearest_idx {
+                        let chosen = direct_pool.remove(idx);
+                        let local = super::objective_allocation::route_operation_responsibilities(
+                            world,
+                            player,
+                            island,
+                            &[chosen],
+                            chokepoint,
+                            connectivity,
+                        );
+                        if local.is_empty() {
+                            assigned_chokes.push(CampaignResponsibility {
+                                mission_type: MissionType::Defense,
+                                target: chokepoint,
+                                members: vec![chosen],
+                            });
+                        } else {
+                            assigned_chokes.extend(local);
+                        }
+                    }
+                }
+
+                // 余剰部隊があれば最も脅威度の高い封鎖地点へ配備
+                let fallback = plan.chokepoints[0];
+                if !direct_pool.is_empty() {
+                    let rest_assigned =
+                        super::objective_allocation::route_operation_responsibilities(
+                            world,
+                            player,
+                            island,
+                            &direct_pool,
+                            fallback,
+                            connectivity,
+                        );
+                    let covered_rest = rest_assigned
+                        .iter()
+                        .flat_map(|r| r.members.iter().copied())
+                        .collect::<crate::collections::HashSet<_>>();
+                    let really_rest = direct_pool
+                        .into_iter()
+                        .filter(|m| !covered_rest.contains(m))
+                        .collect::<Vec<_>>();
+                    assigned_chokes.extend(rest_assigned);
+                    if !really_rest.is_empty() {
+                        assigned_chokes.push(CampaignResponsibility {
+                            mission_type: MissionType::Defense,
+                            target: fallback,
+                            members: really_rest,
+                        });
+                    }
+                }
+
+                responsibilities.extend(assigned_chokes);
+                continue;
+            }
         }
         // 作戦の目標から離れた敵を追うと、作戦の部隊が要衝から散る。前面の周りの敵への
         // 攻撃だけを残し、それ以外は前面へ向かわせる。

@@ -1,4 +1,104 @@
-# HANDOFF — 2026-11-03 狭い道での攻守更新・経路継承・砲撃後進入（未完了）
+# Handoff: 都市防衛と砲台陣地の試作
+
+**Generated**: 2026-11-03 20:01 JST  
+**Branch**: `feature/cooperative-ordering-20261103`（HEAD `9be87db`）  
+**Status**: In Progress — **都市防衛の実現は未達。試作を採用済みと扱わない。**
+
+## Goal
+
+狭い道のmap_20などで、都市の前の通路を直接部隊ができるだけ塞ぎ、その後ろの有効な都市から砲台・重自走砲が敵を射程に収める。複数都市がある場合、直接部隊の回復場所も確保する。長期目標は敵首都圏の生産地の確保と通常勝利。
+
+## ユーザーの明示事項
+
+- 主戦場＝増援重点であり、別方面の攻勢を中止する根拠ではない。DAGの同一方面で中間地域確保後は次へ進む。
+- 「守りやすさ」は単なる地形効果ではない。都市に砲台を置くか、直接部隊の回復に使うかを実際の状況で判断する。
+- **都市そのものを直接部隊で守るのが基本ではない**。通路を直接部隊で塞ぎ、間接部隊を都市から支援させる。都市が複数なら回復用の都市を空けることも重要。
+- 降車の「作戦地域内」「橋から半径2」「一本道禁止」「既に盾があること」はユーザーの要求ではない。橋やその手前を塞がず、**降車した場所に盾を付ける**ことが要求。多くの敵防衛部隊を射程に収めることと都市の重要性を考える。
+- 評価値ハック・特定map/座標分岐・根拠のない閾値追加は禁止。損失だけを理由に攻勢を止めない。
+- **同一シードを3回繰り返さない**。異なるシード各1局で比較。並列数は原則 `--jobs 8`。この指示は既存スキル中の `--repeats 3` 推奨より優先。
+- 失敗した案を単に消すのでなく、計画→指令→実際の配置・射撃→結果の食い違いを分析する。
+
+## Completed
+
+- [x] 比較基準のバイナリを `target/release` から固定: `.tmp/order/city-defense-base/mcp-server.exe`。基準は今回の作業直前の未コミット砲台試作を含む。HEAD単体や旧 `continued` 版とは異なる。
+- [x] 都市防衛試作を `engine/src/ai/squad/route_operations/city_defense.rs` に追加。歩兵地形のBFSで都市周囲の輪と敵からの到達を調べ、直接部隊向けの候補を生成。`route_operations.rs` の防衛作戦へ暫定接続した。
+- [x] 敵が立っているセルを「味方が配置できる封鎖地点」と誤認する問題、および直接部隊0体なのに封鎖地点を残す問題を局面テストで再現して修正。直前のseed1実戦では修正前後の盤面・イベント・DAG指令が全20手番一致。
+- [x] 後攻20Tの基準／第一試作をseed1〜3で比較。基準および第一試作は各seedの記録を1局ずつ集計（指摘前に基準の同一seed反復も実施してしまったが、今後は行わない）。
+- [x] 現在の作業ツリーで `cargo test --release --workspace` 成功（engine単体1226成功・1 ignored、CLI16、構造3、生産契約4、再現性5、golden8、MCP8、doctest15）。`cargo clippy --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 成功。**テスト成功は実戦での盾・都市配置の達成を意味しない。**
+
+## 20Tの実対戦結果（V200先手 vs V4後手、Hex）
+
+| seed | T20所有拠点 基準→第一試作 | 敵首都からの地上戦闘部隊の最短距離 基準→第一試作 | 砲台の累積攻撃 基準→第一試作 | T20都市上の砲台・重自走砲 基準→第一試作 |
+|---|---|---|---|---|
+| 1 | 19→20 | 10→11 | 18→33 | 1→0 |
+| 2 | 19→19 | 10→11 | 23→23 | 1→1 |
+| 3 | 19→20 | 11→10 | 18→12 | 1→0 |
+
+- 全6局とも `P1_Win_MaxTurns`（20T上限の判定負け）。通常勝敗の評価ではない。
+- seed1の**修正後版 candidate2**は第一試作と盤面・イベント・DAG指令が全20手番一致。seed2/3は誤認修正前の第一試作のみで、現作業ツリーのseed2/3の結果ではない。
+- 修正後seed1 T20: 砲台 `(23,9)` と `(23,7)` はそれぞれ最寄敵距離1で、最寄敵より敵側に近い直接部隊が砲台周囲2マス内に0体。これは簡易観測であり、経路遮断の厳密な証明ではないが、**前衛が砲台を守れているとは言えない**。
+- seed1 T20、自軍の位置不変かつ攻撃なしは基準10体→試作26体。補給・その他の行動を含むため、全員を遊兵と断定しない。
+- 結論: 拠点数や射撃数に一部改善はあるが、都市の間接部隊と通路を塞ぐ直接部隊の協働は実証されておらず、**ユーザーの要求に達したとは言えない**。
+
+## Failed Approaches (Don't Repeat These)
+
+- 降車候補に `in_zone`、橋半径2、一本道禁止、既存スクリーン必須、`emplacement_value > 0`、再乗車可能、未所有拠点禁止、修理予約都市禁止を重ねた。ユーザーの要求外の制約で砲台が後退・未降車。診断版では候補の主な棄却は地形・占有・`out_of_zone`。**既に盾があることを降車前提にするのは因果が逆**。
+- 「敵を射程に収める数が同じなら都市」の辞書順だけで都市を選ぶ案。ユーザーが否定。守りやすさは地形効果だけでなく、直接部隊による通路の遮蔽、都市の重要性、回復用都市との競合を含めて考える。
+- `city_defense` の最初のテストで川を歩兵が通行不能と誤認し、橋だけの遮断を期待した。**歩兵は川を移動できる**。海峡盤面に修正。
+- 過去の経路継承の多数決案は、個々の細かい往復を減らしても南北の大移動に変わり、成績が悪化。詳細は本ファイルの以前の記録を参照。
+
+## Not Yet Done / Known Defects
+
+- [ ] **実際の封鎖を確認・実装する。** `city_defense.rs` の `is_fully_blocked` は地形上の仮想セルを塞いだ結果であり、担当部隊の到達可能性・実際の占位・同じ手番の行動順は保証しない。
+- [ ] `route_operations.rs` の封鎖役は最寄りを直線距離で選び、その後 `route_operation_responsibilities` が別の敵をAttack対象にすることがある。選んだマスへ実際に立つか、敵の侵攻路が残らないかを固定盤面→実命令→対戦で検査する。
+- [ ] 間接部隊は「どれかの兵種の射程が都市から封鎖線を覆う」場合に `indirect_iter.next()` の最初の部隊を選ぶだけで、**選んだ砲自身の射程・都市への到達・敵防衛部隊を多数射程に収めることを確認していない**。同一都市上での別部隊との競合も未解決。
+- [ ] 重自走砲の都市選択には、砲台フェリーの `repair_cities` と同じ回復用都市予約を接続していない。しかも現行 `repair_cities` は「HPが20以上減少した部隊を近い都市へ割り当て、必ず1都市を残す」という前担当者の仮説実装であり、ユーザーに妥当性を確認・実戦検証したものではない。地形・到達・必要な回復場所数を盤面から再検討する。
+- [ ] `artillery_ferry.rs` の `drop_allowed` は依然として `bridge_approach_cells`（橋から半径2）を使用。ユーザーは**半径2を要求していない**。橋とその手前の実際の通路閉塞を扱う設計が必要。既存 `tactics/v2.rs` と射撃位置側の同制約も合わせて確認する。
+- [ ] 砲台の `Coverage { covered, own_city, value }` は「敵数同数なら都市優先」というユーザーが否定した暫定順位をまだ保持。都市の守りやすさ・侵攻阻止・場所の重要度・直接部隊の回復機会を含めた比較へ作り直す。恣意的な評価係数や固定閾値で代用しない。
+- [ ] V4以外・小規模・map_47先手への影響は今回の20Tでは未検証。map_47後手はユーザー指定で対象外。
+
+## Current State / Files to Know
+
+- 未コミット変更: `engine/src/ai/squad/route_operations.rs`、`engine/src/ai/v4/artillery_ferry.rs`、`engine/src/ai/v4/artillery_ferry/tests.rs`、`engine/src/systems/turn_management.rs`。新規未追跡: `engine/src/ai/squad/route_operations/city_defense.rs`、`city_defense_tests.rs`。後者2つは `git diff --stat` に出ないので見落とさない。
+- 砲台・回復都市の変更は今回の都市防衛試作より前から存在するユーザー作業。**無断で戻さない。** その他多数の未追跡ファイルも既存資産として保持。
+- 既存の履歴では前セッションの変更が「未コミット」と書かれているが、現HEAD `9be87db` にコミット済み。以下の過去の記述は当時の状態。
+- `.tmp/order/res/city-defense-{base,candidate}-map20-p2.json` と `-s2.json` / `-s3.json` は自手番前後の盤面、イベント、DAG指令。`candidate2-map20-p2.json` は現行の封鎖誤認修正後のseed1。対応バイナリは `.tmp/order/city-defense-{base,candidate,candidate2}/mcp-server.exe`。
+- 集計: `.tmp/order/city_defense_compare.py`、`city_defense_support.py`、`scripts/review_regional_execution.py`。`city_defense_support.py` の前方2マス判定は観察用でありゲーム仕様でも盾の成立証明でもない。
+
+## Code Context
+
+```rust
+// engine/src/ai/squad/route_operations/city_defense.rs
+pub(super) fn plan_city_defense(
+    map: &Map, master: &MasterDataRegistry, city: GridPosition,
+    enemies: &[(GridPosition, u32)], direct_unit_count: usize,
+    indirect_ranges: &[(u32, u32)], occupied_by_others: &HashSet<GridPosition>,
+) -> Option<CityDefensePlan>;
+// CityDefensePlan { chokepoints: Vec<GridPosition>, support_city: Option<GridPosition>, is_fully_blocked: bool }
+
+// engine/src/ai/squad/route_operations.rs
+pub(super) fn responsibilities(/* world, player, island, orders, plan, connectivity */)
+    -> (Vec<CampaignResponsibility>, Vec<Vec<Entity>>);
+// 現在は order.defend && targetが自軍都市のときのみ plan_city_defense を呼ぶ。
+```
+
+## Resume Instructions
+
+1. `git status --short` と `git diff` を読み、前からある砲台試作と今回の都市防衛試作を分けて確認する。`HANDOFF.md` の下部は過去記録。
+2. 最初に実盤面で「守備対象の都市、敵の地上接近路、各直接部隊の到達可能性、間接部隊の射程、回復用都市」を同じ時点で再現する。候補線を返すだけでなく、`responsibilities` → Squad/DAG → `tactics` → 実移動・次の敵手番までを追う。上のseed1 `(23,9)/(23,7)` は再現候補だが、該当砲台がどの都市防衛作戦に属するかは未確認。
+3. 未達の原因を一つずつ直し、位置・命令・支援射撃をテストする。敵が通路内／到達不能／直接部隊不足／複数入口／都市占有と回復役の競合／射程の異なる複数砲兵を反例に含める。砲兵の降車に既存の盾を必須にしない。
+4. `cargo test --release -p engine --lib city_defense -- --nocapture`、`cargo test --release --workspace`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check` を実施。期待: 全成功（既存 ignored を除く）。goldenの不一致は内容を審査し自動blessしない。
+5. releaseバイナリを別名で固定して `python -X utf8 scripts/record_fire_follow_snapshots.py --map map_20 --p1 V200 --p2 V4 --seed 1 --max-turns 20 --mcp-server-bin <固定exe> --out <新しいUTF-8 JSON>`。基準と同じseedの比較は可だが**各版各seed1局**。成功は都市上の間接火力・通路の実遮断・敵手番を越えた維持・射撃・周辺拠点/前線を別々に確認し、判定勝敗だけで決めない。
+
+## Warnings
+
+- WindowsのPython既定cp932では日本語CSV/JSONで `UnicodeDecodeError`。記録・集計は `python -X utf8`。
+- `record_fire_follow_snapshots.py` は自軍手番前後と自軍イベントだけ。敵手番の攻撃や途中経路は次の自軍手番前との差分でしか分からず、原因を断定しない。
+- `cargo test --release --workspace` の成功はこの試作の戦術的有効性を保証しない。3シードでも各1局であり、長期通常勝利や他マップへの一般化は未確認。
+
+---
+
+# 過去の記録: 狭い道での攻守更新・経路継承・砲撃後進入（当時未完了）
 
 ## 今回の追記（作業ツリー、未コミット）
 
