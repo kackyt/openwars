@@ -475,7 +475,15 @@ fn painted_regions_partition_land_without_overlap() {
             assert!(seen.insert(*cell), "{cell:?} が複数の地域に属する");
         }
     }
-    assert_eq!(seen.len(), 12 * 7, "同じ陸塊の全セルを塗る");
+    assert!(
+        seen.iter().all(|cell| anchors
+            .iter()
+            .any(|a| map.distance(cell.x, cell.y, a.x, a.y) <= CAPITAL_ROUTE_REGION_RADIUS)),
+        "代表点から半径を超えるセルは塗らない"
+    );
+    // (6,0) はどの代表点からも4マス以上離れている。
+    assert!(seen.contains(&pos(3, 2)));
+    assert!(!seen.contains(&pos(6, 0)), "半径外は塗らない");
     for (index, region) in regions.iter().enumerate() {
         for cell in region {
             let own = map.distance(cell.x, cell.y, anchors[index].x, anchors[index].y);

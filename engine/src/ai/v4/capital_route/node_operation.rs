@@ -21,7 +21,8 @@ pub(in crate::ai::v4) struct RegionSeed<'a> {
 
 /// 同じ陸塊のNode地域を、代表点から同時に塗り広げて重なりなく分割する。
 ///
-/// 各セルは、陸路（隣接マス）で最も近い代表点の地域にだけ属する。距離が同じなら
+/// 各セルは、陸路（隣接マス）で最も近い代表点の地域にだけ属する。代表点・所属拠点から
+/// `CAPITAL_ROUTE_REGION_RADIUS` マスを超えるセルはどの地域にも属さない。距離が同じなら
 /// `seeds` の先に並ぶNodeが取る。これにより、ある地点の敵・味方は必ず一つの地域だけで
 /// 数えられ、隣の地域と同じ敵を二重に「争奪中」と数えたり、橋の向こうの地域が手前の
 /// 岸まで広がったりしない。
@@ -51,14 +52,19 @@ pub(in crate::ai::v4) fn paint_capital_route_regions(
                 for cell in std::iter::once(&seed.anchor).chain(seed.capture_targets) {
                     if !owner.contains_key(cell) {
                         owner.insert(*cell, index);
-                        queue.push_back(*cell);
+                        queue.push_back((*cell, 0_u32));
                     }
                 }
             }
         }
     }
     // 全起点から1マスずつ同時に広げる（幅優先）。先に届いた地域がセルを取る。
-    while let Some(cell) = queue.pop_front() {
+    while let Some((cell, distance)) = queue.pop_front() {
+        // 競合する代表点が無い端の地域が後背地全体へ膨らむと、遠方の敵まで抱えて
+        // 争奪中のまま出口条件を満たせなくなる。起点から一定距離で塗るのを止める。
+        if distance >= CAPITAL_ROUTE_REGION_RADIUS {
+            continue;
+        }
         let index = owner[&cell];
         for (x, y) in map.get_adjacent(cell.x, cell.y) {
             let next = GridPosition { x, y };
@@ -74,7 +80,7 @@ pub(in crate::ai::v4) fn paint_capital_route_regions(
             // 川のマスは岸の地域に含めるが、そこから対岸へは塗り広げない。
             // 川を挟む地域は橋（Point）の通過で分ける。
             if map.get_terrain(x, y) != Some(Terrain::River) {
-                queue.push_back(next);
+                queue.push_back((next, distance + 1));
             }
         }
     }
