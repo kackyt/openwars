@@ -2990,6 +2990,17 @@ fn control_bridge_assigns_both_crossing_lead_and_combat_support() {
     );
 }
 
+fn topology_route_count(
+    world: &World,
+    player: PlayerId,
+    island: crate::ai::islands::IslandId,
+) -> usize {
+    capital_route_topology_for(world, player, island)
+        .unwrap()
+        .routes
+        .len()
+}
+
 /// 砲兵の射撃位置と進軍作戦の最終目的を混同しない。
 #[test]
 fn gun_route_membership_preserves_capital_destination_despite_rear_firing_position() {
@@ -3004,8 +3015,7 @@ fn gun_route_membership_preserves_capital_destination_despite_rear_firing_positi
         .flatten()
         .next()
         .unwrap();
-    let route = topology.property_routes[&property].0;
-    let front = topology.routes[route].front;
+    let front = topology.routes[topology.property_routes[&property].0].front;
     let stats = world
         .resource::<MasterDataRegistry>()
         .create_unit_stats(&crate::resources::master_data::UnitName(
@@ -3038,7 +3048,8 @@ fn gun_route_membership_preserves_capital_destination_despite_rear_firing_positi
     manager.route_operation_members.insert(entity, front);
     super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
     let order = &world.resource::<CapitalRoutePathRegistry>().commitments[&id];
-    assert_eq!(order.route, CapitalRouteId(route));
+    // 枝は割当枠と小隊目標で決まる（出撃位置から最寄りの枝へ固定しない）。
+    assert!(order.route.0 < topology_route_count(&world, player, island));
     assert_eq!(order.target, goal, "前進作戦は首都という終点を失わない");
     assert_ne!(
         order.target_anchor, goal,

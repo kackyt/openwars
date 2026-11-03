@@ -440,8 +440,6 @@ struct RouteSquad {
     ground_member_count: usize,
     capture_member_count: usize,
     frontline_control_value: u64,
-    capital_destination: bool,
-    geographic_route: Option<usize>,
     ground_positions: Vec<GridPosition>,
     ground_members: Vec<Entity>,
     route_operation: bool,
@@ -557,39 +555,10 @@ fn route_squad(
             })
             .max()
             .unwrap_or(0);
-        let topology = capital_route_topology_for(world, player_id, island_id)?;
-        let goal = topology.nodes[topology.goal_node.0].anchor;
-        // 射撃位置から目的を推測しない。進軍作戦への所属は本隊という意図だけを表す。
-        // 作戦の要衝座標は局地戦で更新されるため、固定の方面IDとして再解釈しない。
         let route_operation = squad
             .members
             .iter()
             .any(|entity| route_operation_members.contains_key(entity));
-        let capital_destination = crate::ai::strategy_profile::current_profile(world, player_id)
-            != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
-            && ((route_operation && squad.plan.mission_type == MissionType::Attack)
-                || squad.plan.target.is_some_and(|target| {
-                    route_target_node_anchor(world, player_id, island_id, target) == goal
-                }));
-        let geographic_route = topology
-            .route_distances
-            .iter()
-            .enumerate()
-            .filter_map(|(route, distances)| {
-                let costs = squad
-                    .members
-                    .iter()
-                    .filter_map(|entity| world.get::<GridPosition>(*entity))
-                    .filter_map(|at| distances.get(at))
-                    .copied()
-                    .collect::<Vec<_>>();
-                (!costs.is_empty()).then_some((
-                    costs.iter().map(|cost| u64::from(*cost)).sum::<u64>(),
-                    route,
-                ))
-            })
-            .min()
-            .map(|(_, route)| route);
         return Some((
             island_id,
             RouteSquad {
@@ -601,8 +570,6 @@ fn route_squad(
                 ground_member_count,
                 capture_member_count,
                 frontline_control_value,
-                capital_destination,
-                geographic_route,
                 ground_positions: squad
                     .members
                     .iter()
@@ -831,17 +798,19 @@ pub(in crate::ai::v4) fn squad_target_route(
         .then_some(route)
 }
 
-/// 合流点や更新される射撃座標から方面を推測せず、首都へ向かう本隊は地形経路の近い軸を保つ。
+/// Squadの目標が属する枝を優先する。目標が無い・どの枝にも属さない場合は
+/// 呼び出し側が不足枠の大きい枝へ置く。
+///
+/// 以前は「首都へ向かう本隊」を一律に全メンバー位置から最寄りの枝へ固定していたが、
+/// 出撃地点に近い一本の枝へ全軍が集まり、割当枠と小隊目標を無視して他の枝を空にした
+/// （map_20 で南ルートが無人になり、北の狭い回廊で前進が止まった）ため撤回した。
 fn preferred_squad_route(
     topology: &CapitalRouteTopology,
     map: &Map,
     squad: &RouteSquad,
     targets: &[Option<GridPosition>],
 ) -> Option<usize> {
-    squad
-        .geographic_route
-        .filter(|_| squad.capital_destination)
-        .or_else(|| squad_target_route(topology, map, &squad.mission, squad.target, targets))
+    squad_target_route(topology, map, &squad.mission, squad.target, targets)
 }
 
 /// 未配分Squadを占領目標または不足枠の順で枝へ置く。同点時の枝番号を保つ。
@@ -1058,22 +1027,65 @@ fn squad_route_path(
     let target_anchor = *path.last().expect("区間目標への経路は空でない");
     // pathは移動用の全セル列であり、作戦が存在するのは走査で選んだ中継点だけである。
     // 未選択セルを未達の中継点と見なして一歩ずつ止めない。
+    //
+    // ただしNodeは代表点の1マスではなく周囲の地域を表す。経路が地域（Area）の実セルを
+    // 通るなら、代表点が経路上に無くてもその地域を通過する区間として数える。
+    // 代表点だけで照合すると、首都までの長い経路では途中の地域を全て取りこぼし、
+    // 出発直後から首都の地域を区間にして手前の制圧を飛ばす（map_20で全軍が首都隣の
+    // 地域を目標に狭い回廊へ詰まった）。地域の出口条件は局地優勢か確保なので、
+    // 通過する地域の拠点占領を首都進軍の前提にするわけではない。
     let operation_path = world
         .get_resource::<CapitalRouteNodeOperationRegistry>()
         .map(|registry| {
-            path.iter()
-                .copied()
-                .filter(|anchor| {
-                    registry
-                        .operations
-                        .contains_key(&CapitalRouteNodeOperationId {
-                            topology: CapitalRouteTopologyKey {
-                                player_id,
-                                island_id,
-                            },
-                            anchor: *anchor,
-                        })
+            let topology_key = CapitalRouteTopologyKey {
+                player_id,
+                island_id,
+            };
+            let map = world.get_resource::<Map>();
+            // 小規模拡張は全施設の同時割当を使う専用工程を維持し、代表点の照合だけを使う。
+            let regions_on_path = crate::ai::strategy_profile::current_profile(world, player_id)
+                != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion;
+            // 各作戦を経路上の位置へ射影する。代表点が経路上にあればその位置、
+            // 代表点が経路外のAreaは、地域内の経路セルのうち代表点に最も近いセルの位置。
+            // 「最初に地域へ入ったセル」で並べると、橋の向こうの地域が手前の岸まで
+            // 広がっている場合に橋より先の区間として誤って並ぶ。
+            let mut ordered = registry
+                .operations
+                .values()
+                .filter(|operation| operation.id.topology == topology_key)
+                .filter_map(|operation| {
+                    let index = path
+                        .iter()
+                        .position(|cell| *cell == operation.anchor)
+                        .or_else(|| {
+                            if !regions_on_path || operation.scope != CapitalRouteNodeScope::Area {
+                                return None;
+                            }
+                            let map = map?;
+                            path.iter()
+                                .enumerate()
+                                .filter(|(_, cell)| operation.control_area.contains(cell))
+                                .min_by_key(|(index, cell)| {
+                                    (
+                                        map.distance(
+                                            cell.x,
+                                            cell.y,
+                                            operation.anchor.x,
+                                            operation.anchor.y,
+                                        ),
+                                        *index,
+                                    )
+                                })
+                                .map(|(index, _)| index)
+                        })?;
+                    Some((index, operation.anchor))
                 })
+                .collect::<Vec<_>>();
+            // 同じ位置へ射影した作戦は代表点の座標順にし、HashMapの走査順に依存しない。
+            ordered.sort_unstable_by_key(|(index, anchor)| (*index, anchor.y, anchor.x));
+            ordered
+                .into_iter()
+                .map(|(_, anchor)| anchor)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -2191,8 +2203,6 @@ mod arrival_tests {
             ground_member_count: 1,
             capture_member_count: 1,
             frontline_control_value: 0,
-            capital_destination: true,
-            geographic_route: Some(0),
             ground_positions: vec![at],
             ground_members: vec![entity],
             route_operation: false,
