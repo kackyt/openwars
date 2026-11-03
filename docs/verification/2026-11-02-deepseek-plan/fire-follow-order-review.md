@@ -15,7 +15,7 @@
 | 3-5 | `OPENWARS_FIRE_FOLLOW_TRACE=1` で `ai_fire_follow_order` イベント（order/fire/released/dropped）を出力。`scripts/record_fire_follow_snapshots.py` は `review_regional_execution.py` が読める `snapshots` を出力する |
 | 3-6 | 固定盤面テスト6件（T20再現、進入役なし、撃破担当行動済み、1体で撃破、地域外/Stage、skip対象） |
 
-検査: `cargo test -p engine --lib` 1183成功・除外1、clippy（全target・全feature）・fmt 成功。
+検査: `cargo test -p engine --lib` 1183成功・除外1、clippy（全target・全feature）・fmt 成功。`cargo test --workspace` は行動記録のgolden 2件（`v4_standard_map6` と同save_load）だけが不一致だった。差分は移動先・生産位置のみで、T4の所有拠点は先手16・後手17のまま、攻撃は新旧とも0回（順序段は発火していない）。3-2の差し戻しによる差と判断し、差分を確認したうえでこの2件だけ更新した。更新後は8件すべて成功。
 
 ### 記録器の確認（3-5の前提）
 
