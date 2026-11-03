@@ -879,11 +879,11 @@ impl BoardScan {
                     .iter()
                     .map(|region| (region.anchor, region.holder))
                     .collect::<Vec<_>>();
-                // 地域の保持者が決めたときのままなら、決めた案を遂行する。
+                // 前の決定を渡す。主戦場の保持と攻守のヒステリシスは配分案の側で判断し、
+                // 地域の保持者が一つ変わっただけでは比べ直さない。
                 let decided = world
                     .get_resource::<RoutePostureMemory>()
                     .and_then(|memory| memory.by_player.get(&player_id))
-                    .filter(|decision| decision.regions == region_state)
                     .cloned();
                 let all_own_units = my_units
                     .iter()

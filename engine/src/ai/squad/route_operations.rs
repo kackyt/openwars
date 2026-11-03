@@ -156,6 +156,26 @@ pub(super) fn responsibilities(
     } = plan;
     let mut pool = free;
     let enemies = enemy_units(world, player);
+    let position = |entity: Entity| world.get::<GridPosition>(entity).copied();
+    let distance_to = |entity: Entity, point: GridPosition| {
+        position(entity).map_or(u32::MAX, |at| map.distance(at.x, at.y, point.x, point.y))
+    };
+    // 自軍首都の生産圏にいる部隊（生産直後など）はどの作戦へも送れる。前線へ出た部隊だけ、
+    // 遠い戦線への付け替えを制限する。
+    let capital = world
+        .iter_entities()
+        .find(|entity| {
+            entity.get::<Property>().is_some_and(|property| {
+                property.owner_id == Some(player)
+                    && property.terrain == crate::resources::Terrain::Capital
+            })
+        })
+        .and_then(|entity| entity.get::<GridPosition>().copied());
+    let at_home = |entity: Entity| {
+        capital.is_some_and(|capital| {
+            distance_to(entity, capital) <= crate::systems::production::PRODUCTION_RANGE as u32
+        })
+    };
     // 部隊の周り（作戦が攻撃に向かってよい範囲）に敵がいるか。交戦中の部隊は戦線を
     // 支えているので、余剰として別の進軍路へ回さない。
     let engaged = |entity: Entity| {
@@ -168,10 +188,10 @@ pub(super) fn responsibilities(
     // 防衛の所要戦力を満たした後の余剰まで固定所属に残すと、配分案の集中が
     // 実行されず、主攻勢には火力が届かない。現在の要衝へ近い部隊を所要分だけ残す。
     //
-    // ただし回すのは周りに敵のいない余剰だけにする。攻めの目標を取って配分案が主戦場を
-    // 別の進軍路へ切り替えるたびに、敵地で交戦中の部隊まで丸ごと地図の反対側へ引き抜くと、
-    // 全軍が進軍路の間を往復して前進が積み上がらない（map_20後手で数ターンごとに
-    // 50体以上が南北を入れ替わった）。後方の守備に溜まった余剰は従来どおり攻勢へ回る。
+    // ただし別の作戦へ回すのは、本拠（自軍首都の生産圏）で手の空いている部隊だけにする。
+    // 他の進軍路を進んでいた部隊を、主戦場が変わるたびに地図の反対側へ回すと、移動の間
+    // どちらの戦線にも戦力が無く、元の戦線も押し戻されて前進が積み上がらない（map_20で
+    // 数ターンごとに50体以上が南北を入れ替わった）。交戦中の部隊は本拠でも動かさない。
     for (index, order) in orders.iter().enumerate().filter(|(_, order)| order.defend) {
         members[index].sort_by_key(|entity| {
             let turns = world
@@ -185,7 +205,7 @@ pub(super) fn responsibilities(
         });
         let mut retained = 0_u64;
         members[index].retain(|entity| {
-            if retained < u64::from(order.force) || engaged(*entity) {
+            if retained < u64::from(order.force) || engaged(*entity) || !at_home(*entity) {
                 retained = retained.saturating_add(u64::from(unit_value(world, *entity)));
                 true
             } else {
@@ -205,32 +225,12 @@ pub(super) fn responsibilities(
                     .sum::<i64>()
         })
         .collect::<Vec<_>>();
-    let position = |entity: Entity| world.get::<GridPosition>(entity).copied();
     // 手の空いた部隊を、不足の大きい作戦から順に、その要衝に近い部隊で埋める。ただし最寄りの
     // 作戦より大きく遠い作戦（移動2手番分以上）へは送らず、遠い戦線への逐次投入を避ける。
-    let distance_to = |entity: Entity, point: GridPosition| {
-        position(entity).map_or(u32::MAX, |at| map.distance(at.x, at.y, point.x, point.y))
-    };
     let reach = |entity: Entity| {
         world
             .get::<UnitStats>(entity)
             .map_or(1, |stats| stats.max_movement.max(1))
-    };
-    // 自軍首都の生産圏にいる部隊（生産直後など）はどの作戦へも送れる。前線へ出た部隊だけ、
-    // 遠い戦線への付け替えを制限する。
-    let capital = world
-        .iter_entities()
-        .find(|entity| {
-            entity.get::<Property>().is_some_and(|property| {
-                property.owner_id == Some(player)
-                    && property.terrain == crate::resources::Terrain::Capital
-            })
-        })
-        .and_then(|entity| entity.get::<GridPosition>().copied());
-    let at_home = |entity: Entity| {
-        capital.is_some_and(|capital| {
-            distance_to(entity, capital) <= crate::systems::production::PRODUCTION_RANGE as u32
-        })
     };
     // 充足済みの防衛は、候補にも「最寄り作戦」の比較対象にも戻さない。
     // 近くの満員の守備隊を基準にすると、遠方の唯一の攻勢へ余剰を送れなくなる。
@@ -977,6 +977,79 @@ mod tests {
     }
 
     /// 防衛の余剰と新規部隊が、充足済みの近い守備隊へ再吸収されない。
+    /// 本拠の外（他の進軍路を進んでいた部隊）は、守りの所要戦力を超えていても引き抜かない。
+    #[test]
+    fn defense_surplus_outside_home_stays_on_its_route() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(
+            20,
+            5,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        ));
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let cost = stats.cost;
+        world.insert_resource(data);
+        world.insert_resource(crate::resources::DamageChart::new());
+        world.spawn((
+            GridPosition { x: 19, y: 4 },
+            Property::new(crate::resources::Terrain::Capital, Some(PlayerId(1)), 200),
+        ));
+        let units = (0..3)
+            .map(|_| {
+                world
+                    .spawn((
+                        Faction(PlayerId(1)),
+                        GridPosition { x: 2, y: 2 },
+                        stats.clone(),
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id()
+            })
+            .collect::<Vec<_>>();
+        let orders = [
+            RouteOrder {
+                key_point: GridPosition { x: 3, y: 2 },
+                staging: GridPosition { x: 3, y: 2 },
+                defend: true,
+                force: cost,
+            },
+            RouteOrder {
+                key_point: GridPosition { x: 17, y: 2 },
+                staging: GridPosition { x: 10, y: 2 },
+                defend: false,
+                force: cost * 3,
+            },
+        ];
+        let plan = RouteOperationPlan {
+            members: vec![units.clone(), Vec::new()],
+            free: Vec::new(),
+            launched: vec![false, true],
+        };
+        let (_, members) = responsibilities(
+            &world,
+            PlayerId(1),
+            crate::ai::islands::IslandId(0),
+            &orders,
+            plan,
+            &mut Default::default(),
+        );
+        assert_eq!(
+            members[0].len(),
+            units.len(),
+            "他の進軍路の部隊は所属を保つ"
+        );
+        assert!(members[1].is_empty());
+    }
+
     /// 敵と交戦中の部隊は、守りの所要戦力を超えていても別の進軍路へ引き抜かない。
     #[test]
     fn engaged_defense_surplus_is_not_pulled_to_another_route() {
@@ -1061,6 +1134,11 @@ mod tests {
         let cost = stats.cost;
         world.insert_resource(data);
         world.insert_resource(crate::resources::DamageChart::new());
+        // 守備隊は自軍首都の生産圏（本拠）にいる。本拠の余剰だけが他の作戦へ回る。
+        world.spawn((
+            GridPosition { x: 2, y: 3 },
+            Property::new(crate::resources::Terrain::Capital, Some(PlayerId(1)), 200),
+        ));
         let units = (0..4)
             .map(|_| {
                 world
