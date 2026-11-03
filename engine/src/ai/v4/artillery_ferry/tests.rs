@@ -374,7 +374,6 @@ fn set_route_posture(world: &mut World, attack: GridPosition, defend: GridPositi
         PlayerId(1),
         RoutePostureDecision {
             main: Some(attack),
-            main_properties: Vec::new(),
             regions: Vec::new(),
             orders: vec![order(attack, false), order(defend, true)],
         },

@@ -1399,22 +1399,6 @@ fn seizable_key_point(
     })
 }
 
-/// 進軍路の攻守を切り替える戦力比の幅（ヒステリシス）。
-///
-/// 攻めている進軍路は、敵が自軍をこの倍率以上で上回るまで攻めを続ける。守っている
-/// 進軍路は、自軍が敵をこの倍率以上で上回ってから攻めに転じる。拠点一つの得失や
-/// 見積もりの小さな揺れで攻守が手番ごとに入れ替わらないようにする。
-const ROUTE_POSTURE_HYSTERESIS: f64 = 1.25;
-
-/// 前の手番の攻守を踏まえ、この進軍路で攻めるかを返す。前の決定が無ければ単純な勝敗で決める。
-fn route_attacks_with_hysteresis(was_attacking: Option<bool>, own: f64, enemy: f64) -> bool {
-    match was_attacking {
-        Some(true) => route_battle_outcome(own * ROUTE_POSTURE_HYSTERESIS, enemy) > 0.0,
-        Some(false) => route_battle_outcome(own, enemy * ROUTE_POSTURE_HYSTERESIS) > 0.0,
-        None => route_battle_outcome(own, enemy) > 0.0,
-    }
-}
-
 /// 一つの進軍路で両軍の戦力がぶつかったときの結果。ランチェスターの二次法則で、
 /// 勝つ側には戦力の二乗差の平方根だけ戦力が残る。自軍が勝てば正、負ければ負の残存価値。
 fn route_battle_outcome(own: f64, enemy: f64) -> f64 {
@@ -1457,10 +1441,6 @@ pub(crate) struct RoutePostureMemory {
 pub(crate) struct RoutePostureDecision {
     /// Noneは分散案、Some(目標)はその進軍路への集中案。
     pub(crate) main: Option<GridPosition>,
-    /// 主戦場の進軍路に属する拠点群（決めたときの目標の`objective_properties`）。
-    /// 主戦場の目標は占領のたびに同じ進軍路の次の拠点へ移るため、目標座標ではなく
-    /// この拠点群で「同じ進軍路か」を判定する。
-    pub(crate) main_properties: Vec<GridPosition>,
     /// 決めたときの首都ルートDAGの各地域の保持者（地域の代表点順）。
     pub(crate) regions: Vec<(GridPosition, RegionHolder)>,
     /// 各進軍路で押さえる要衝と、そこへ充てる戦力。
@@ -1540,8 +1520,6 @@ pub(in crate::ai::v4) struct RouteEffortPlan {
     pub(in crate::ai::v4) posture: Option<Option<GridPosition>>,
     /// 各進軍路で押さえる要衝。
     pub(in crate::ai::v4) orders: Vec<RouteOrder>,
-    /// 主戦場の進軍路に属する拠点群。
-    pub(in crate::ai::v4) main_properties: Vec<GridPosition>,
 }
 
 /// 戦力の配分案。`None`は敵のいる進軍路へ生産を等分する分散案、`Some(i)`は進軍路iへ
@@ -1805,57 +1783,28 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
             }
         })
         .collect::<Vec<_>>();
-    // 主戦場（生産と手の空いた部隊を寄せる進軍路）は、その進軍路の攻めが続く限り保つ。
-    // 主戦場の目標が片付いて進軍路から消えた、または主戦場の攻めが押し返されて
-    // 守りに変わる場合だけ決め直す。他の地域の拠点一つの得失では比べ直さない。
+    // 拠点の状況が変わらない間は、決めた配分案のまま攻略・防衛を続ける。主戦場の目標が
+    // 進軍路から消えていれば決め直す。
     let decided_posture = decided.and_then(|decision| match decision.main {
         None => Some(None),
         Some(anchor) => contested
             .iter()
-            .copied()
-            .filter_map(|route| {
-                // 同じ進軍路の拠点を最も多く共有する目標を、主戦場の進軍路とみなす。
-                let shared = objectives[route]
-                    .objective_properties
-                    .iter()
-                    .filter(|property| decision.main_properties.contains(property))
-                    .count();
-                let same_anchor = objectives[route].anchor == anchor;
-                (shared > 0 || same_anchor).then_some((shared, same_anchor, route))
-            })
-            .max_by_key(|(shared, same_anchor, route)| {
-                (*shared, *same_anchor, std::cmp::Reverse(*route))
-            })
-            .map(|(_, _, route)| Some(route)),
+            .find(|&&route| objectives[route].anchor == anchor)
+            .map(|&route| Some(route)),
     });
-    // 前の手番の各進軍路の攻守。攻守のヒステリシスにだけ使い、要衝は今の盤面で決め直す。
-    let previous_orders = decided
+    // 決めた案を遂行する間は、各進軍路の要衝と攻守も決めたときのまま保つ（戦力の配分だけを
+    // 今の盤面で更新する）。見積もりの揺れで攻守が手番ごとに入れ替わると、部隊が要衝へ
+    // 着く前に行き先が変わる。
+    let decided_orders = decided_posture
+        .and(decided)
         .map(|decision| decision.orders.as_slice())
         .filter(|orders| orders.len() == contested.len());
-    let was_attacking = |index: usize| {
-        let route = contested.iter().position(|&route| route == index)?;
-        previous_orders.map(|orders| !orders[route].defend)
-    };
-    let enemy = reinforced_enemy(&prospects, &contested, budgets.enemy);
-    // 主戦場を決め直すのは、攻めていた主戦場が押し返されるときだけ。まだ攻めに転じて
-    // いない（戦力を集めている）主戦場は、攻めの幅に届かないことを理由に手放さない。
-    let main_keeps_attacking = |posture: RoutePosture| {
-        posture.is_none_or(|main| {
-            if was_attacking(main) != Some(true) {
-                return true;
-            }
-            let allocation =
-                posture_allocation(posture, &prospects, &contested, &enemy, budgets.own);
-            let own = u64::from(own_values[main]).saturating_add(allocation[main]);
-            route_attacks_with_hysteresis(Some(true), own as f64, enemy[main] as f64)
-        })
-    };
     let posture = decided_posture
-        .filter(|posture| main_keeps_attacking(*posture))
         .unwrap_or_else(|| choose_route_posture(&prospects, &contested, budgets, values));
-    // 配分案の戦力で各進軍路の要衝を決める。勝てる進軍路は目標を攻め、勝てない進軍路は
-    // 目標に最も近い自軍拠点を守る。主戦場は生産の配分だけを決め、攻守は強制しない。
+    // 配分案の戦力で各進軍路の要衝を決める。勝てる進軍路（分散案の全進軍路、集中案の
+    // 主戦場）は目標を攻め、勝てない進軍路と守りの進軍路は目標に最も近い自軍拠点を守る。
     let main_anchor = posture.map(|main| objectives[main].anchor);
+    let enemy = reinforced_enemy(&prospects, &contested, budgets.enemy);
     let allocation = posture_allocation(posture, &prospects, &contested, &enemy, budgets.own);
     let mut economy_anchors = Vec::new();
     let mut orders = Vec::new();
@@ -1908,15 +1857,19 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
                 return objective;
             };
             let force = u32::try_from(intended(index)).unwrap_or(u32::MAX);
-            // 攻めるか守るかは、この進軍路の戦闘の見積もりだけで決める（主戦場かどうかとは
-            // 分ける）。攻めがうまくいっている進軍路は、主戦場でなくても攻めを続ける。
-            // 敵より先に押さえられる最も前の地点は、守りの要衝、または攻めの集結点にする。
+            // 決めた案を遂行中なら、要衝と攻守を決めたときのまま保つ。
+            if let Some(order) = decided_orders.map(|orders| orders[route]) {
+                orders.push(RouteOrder { force, ..order });
+                return if order.defend {
+                    defense_objective(objective, order.key_point)
+                } else {
+                    objective
+                };
+            }
+            // 攻めるか守るかは戦闘の見積もりで決める。敵より先に押さえられる最も前の地点は、
+            // 守りの要衝、または攻めの集結点にする。
             let committed_force = u64::from(own_values[index]).saturating_add(allocation[index]);
-            let attacks = route_attacks_with_hysteresis(
-                was_attacking(index),
-                committed_force as f64,
-                enemy[index] as f64,
-            );
+            let wins = route_battle_outcome(committed_force as f64, enemy[index] as f64) > 0.0;
             let key_point = seizable_key_point(
                 map,
                 route,
@@ -1927,6 +1880,7 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
                 own_capital,
                 turns,
             );
+            let attacks = wins && posture.is_none_or(|main| main == index);
             if attacks {
                 let staging = key_point
                     .or_else(|| nearest_own_property(map, own_properties, objective.anchor))
@@ -1960,15 +1914,11 @@ pub(in crate::ai::v4) fn concentrate_route_efforts(
             guarded
         })
         .collect::<Vec<_>>();
-    let main_properties = posture
-        .map(|main| objectives[main].objective_properties.clone())
-        .unwrap_or_default();
     RouteEffortPlan {
         posture: Some(main_anchor),
         objectives,
         economy_anchors,
         orders,
-        main_properties,
     }
 }
 
@@ -2096,18 +2046,13 @@ mod posture_tests {
         ];
         let decided = RoutePostureDecision {
             main: Some(targets[0]),
-            main_properties: vec![targets[0]],
             regions: vec![],
             orders: orders.clone(),
         };
         let plan = concentrate_route_efforts(
             &map,
             targets.into_iter().map(objective).collect(),
-            // 主戦場（左）は敵と互角の戦力で攻めを続けられる。右は砲台だけで敵と互角。
-            &[
-                snapshot(targets[0], UnitType::Infantry),
-                snapshot(targets[1], UnitType::Artillery),
-            ],
+            &[snapshot(targets[1], UnitType::Artillery)],
             &[
                 snapshot(targets[0], UnitType::Infantry),
                 snapshot(targets[1], UnitType::Infantry),
@@ -2120,193 +2065,9 @@ mod posture_tests {
             Some(&decided),
             &mut |a, b| Some(map.distance(a.x, a.y, b.x, b.y)),
         );
-        assert_eq!(
-            plan.posture,
-            Some(Some(targets[0])),
-            "攻めが続く主戦場を保つ"
-        );
-        assert!(!plan.orders[0].defend, "主戦場の攻めを続ける");
-        assert!(plan.orders[1].defend, "互角では守りから攻めに転じない");
-    }
-
-    /// 攻守の切り替えにはヒステリシスを持たせ、拠点一つ分の揺れで入れ替えない。
-    #[test]
-    fn route_posture_has_hysteresis() {
-        // 攻めている進軍路は、わずかに劣っても攻めを続ける。
-        assert!(route_attacks_with_hysteresis(Some(true), 1_000.0, 1_100.0));
-        // 敵が幅を超えて上回れば守りに変わる。
-        assert!(!route_attacks_with_hysteresis(Some(true), 1_000.0, 1_300.0));
-        // 守っている進軍路は、わずかに上回っても守りを続ける。
-        assert!(!route_attacks_with_hysteresis(
-            Some(false),
-            1_100.0,
-            1_000.0
-        ));
-        // 幅を超えて上回れば攻めに転じる。
-        assert!(route_attacks_with_hysteresis(Some(false), 1_300.0, 1_000.0));
-        // 前の決定が無ければ単純な勝敗で決める。
-        assert!(route_attacks_with_hysteresis(None, 1_100.0, 1_000.0));
-    }
-
-    /// 主戦場の目標が同じ進軍路の次の拠点へ移っても、主戦場を保つ。
-    #[test]
-    fn main_route_is_kept_when_its_objective_moves_along_the_route() {
-        let map = Map::new(
-            12,
-            12,
-            Terrain::Plains,
-            crate::resources::GridTopology::Square,
-        );
-        let point = |x, y| GridPosition { x, y };
-        let objective = |anchor| CampaignPlanningObjective {
-            island_id: crate::ai::islands::IslandId(0),
-            kind: OperationKind::Capture,
-            anchor,
-            objective_properties: vec![anchor],
-            capture_eta: None,
-            required_capture_survivors: 1,
-            logistics_rank: None,
-            forced_target_enemies: HashSet::default(),
-            protected_capture_entities: HashSet::default(),
-            capture_replacement_pending: false,
-            staging_anchor: anchor,
-            execution_authorized: true,
-        };
-        let snapshot = |pos, unit_type| UnitSnapshot {
-            entity: None,
-            pos,
-            stats: UnitStats {
-                unit_type,
-                cost: 1_000,
-                ..UnitStats::mock()
-            },
-            hp: 100,
-            free_cargo: 0,
-        };
-        // 決めたときの主戦場の目標は(2,2)。占領後、同じ進軍路の次の目標は(3,3)。
-        let decided = RoutePostureDecision {
-            main: Some(point(2, 2)),
-            main_properties: vec![point(2, 2), point(3, 3)],
-            regions: vec![],
-            orders: vec![
-                RouteOrder {
-                    key_point: point(2, 2),
-                    staging: point(2, 2),
-                    defend: false,
-                    force: 0,
-                },
-                RouteOrder {
-                    key_point: point(8, 8),
-                    staging: point(8, 8),
-                    defend: true,
-                    force: 0,
-                },
-            ],
-        };
-        let targets = [point(3, 3), point(9, 9)];
-        let plan = concentrate_route_efforts(
-            &map,
-            targets.into_iter().map(objective).collect(),
-            &[
-                snapshot(targets[0], UnitType::Tank),
-                snapshot(targets[1], UnitType::Infantry),
-            ],
-            &[
-                snapshot(targets[0], UnitType::Infantry),
-                snapshot(targets[1], UnitType::Infantry),
-            ],
-            &[point(7, 7)],
-            &[],
-            (None, None),
-            budgets(0, 0),
-            VALUES,
-            Some(&decided),
-            &mut |a, b| Some(map.distance(a.x, a.y, b.x, b.y)),
-        );
-        assert_eq!(
-            plan.posture,
-            Some(Some(targets[0])),
-            "同じ進軍路の次の目標で主戦場を続ける"
-        );
-    }
-
-    /// 主戦場の攻めが押し返されたら、主戦場を決め直す。
-    #[test]
-    fn failing_main_route_is_reconsidered() {
-        let map = Map::new(
-            12,
-            12,
-            Terrain::Plains,
-            crate::resources::GridTopology::Square,
-        );
-        let point = |x, y| GridPosition { x, y };
-        let objective = |anchor| CampaignPlanningObjective {
-            island_id: crate::ai::islands::IslandId(0),
-            kind: OperationKind::Capture,
-            anchor,
-            objective_properties: vec![anchor],
-            capture_eta: None,
-            required_capture_survivors: 1,
-            logistics_rank: None,
-            forced_target_enemies: HashSet::default(),
-            protected_capture_entities: HashSet::default(),
-            capture_replacement_pending: false,
-            staging_anchor: anchor,
-            execution_authorized: true,
-        };
-        let snapshot = |pos, unit_type, cost| UnitSnapshot {
-            entity: None,
-            pos,
-            stats: UnitStats {
-                unit_type,
-                cost,
-                ..UnitStats::mock()
-            },
-            hp: 100,
-            free_cargo: 0,
-        };
-        let targets = [point(2, 2), point(9, 9)];
-        let decided = RoutePostureDecision {
-            main: Some(targets[0]),
-            main_properties: vec![targets[0]],
-            regions: vec![],
-            orders: vec![
-                RouteOrder {
-                    key_point: targets[0],
-                    staging: targets[0],
-                    defend: false,
-                    force: 0,
-                },
-                RouteOrder {
-                    key_point: point(8, 8),
-                    staging: point(8, 8),
-                    defend: true,
-                    force: 0,
-                },
-            ],
-        };
-        // 主戦場（左）には自軍がいない一方、敵は多い。
-        let plan = concentrate_route_efforts(
-            &map,
-            targets.into_iter().map(objective).collect(),
-            &[snapshot(targets[1], UnitType::Tank, 3_000)],
-            &[
-                snapshot(targets[0], UnitType::Tank, 3_000),
-                snapshot(targets[1], UnitType::Infantry, 1_000),
-            ],
-            &[point(7, 7)],
-            &[],
-            (None, None),
-            budgets(0, 0),
-            VALUES,
-            Some(&decided),
-            &mut |a, b| Some(map.distance(a.x, a.y, b.x, b.y)),
-        );
-        assert_ne!(
-            plan.posture,
-            Some(Some(targets[0])),
-            "押し返された主戦場は保たない"
-        );
+        assert_eq!(plan.posture, Some(Some(targets[0])));
+        assert_eq!(plan.orders[1].key_point, orders[1].key_point);
+        assert!(plan.orders[1].defend);
     }
 
     #[test]
