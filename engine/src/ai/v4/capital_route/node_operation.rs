@@ -12,47 +12,80 @@ use crate::ai::v4::{
     Terrain, UnitStats, VecDeque, World, operation, victory_roadmap,
 };
 
-/// Nodeの戦術地域を、前後Nodeではなくanchor近傍の実セルから構築する。
-pub(in crate::ai::v4) fn capital_route_node_control_area(
+/// 地域を塗り分けるときの1Nodeの起点。
+pub(in crate::ai::v4) struct RegionSeed<'a> {
+    pub(in crate::ai::v4) anchor: GridPosition,
+    pub(in crate::ai::v4) scope: CapitalRouteNodeScope,
+    pub(in crate::ai::v4) capture_targets: &'a [GridPosition],
+}
+
+/// 同じ陸塊のNode地域を、代表点から同時に塗り広げて重なりなく分割する。
+///
+/// 各セルは、陸路（隣接マス）で最も近い代表点の地域にだけ属する。距離が同じなら
+/// `seeds` の先に並ぶNodeが取る。これにより、ある地点の敵・味方は必ず一つの地域だけで
+/// 数えられ、隣の地域と同じ敵を二重に「争奪中」と数えたり、橋の向こうの地域が手前の
+/// 岸まで広がったりしない。
+///
+/// - Area: 代表点と所属拠点を起点に、同じ陸塊の陸地を塗る。橋のマスは塗らず、
+///   川のマスは岸の地域に含めるがそこから先へは広げない。したがって川を挟む対岸へは
+///   広がらない（橋の通過はPoint Nodeが表す）。
+/// - Point（橋）: 代表点の1マスだけを持つ。向こう岸の出口セルは対岸の地域に属し、
+///   通過したかどうかは `crossing_exit` で別に観測する。
+///
+/// 戻り値は `seeds` と同じ順の地域セル列（y・x順）。
+pub(in crate::ai::v4) fn paint_capital_route_regions(
     map: &Map,
     island_map: &crate::ai::islands::IslandMap,
     island_id: crate::ai::islands::IslandId,
-    anchor: GridPosition,
-    scope: CapitalRouteNodeScope,
-    capture_targets: &[GridPosition],
-) -> Vec<GridPosition> {
-    let mut control_area = match scope {
-        CapitalRouteNodeScope::Point => vec![anchor],
-        CapitalRouteNodeScope::Area => {
-            // 同じ陸塊でも川を挟む地域は橋の通過点で分ける。格子上で近いだけの
-            // 対岸を含めると、橋を越える前に地域へ到達したと誤認してしまう。
-            let mut cells = Vec::new();
-            let mut queue = VecDeque::from([(anchor, 0_u32)]);
-            let mut visited = HashSet::from_iter([anchor]);
-            while let Some((cell, distance)) = queue.pop_front() {
-                cells.push(cell);
-                if distance >= CAPITAL_ROUTE_REGION_RADIUS {
-                    continue;
-                }
-                for (x, y) in map.get_adjacent(cell.x, cell.y) {
-                    let next = GridPosition { x, y };
-                    if map.get_terrain(x, y) != Some(Terrain::Bridge)
-                        && island_map
-                            .get_island_at(&next)
-                            .is_some_and(|island| island.id == island_id)
-                        && visited.insert(next)
-                    {
-                        queue.push_back((next, distance + 1));
+    seeds: &[RegionSeed<'_>],
+) -> Vec<Vec<GridPosition>> {
+    let mut owner: HashMap<GridPosition, usize> = HashMap::default();
+    let mut queue = VecDeque::new();
+    // 起点（代表点と所属拠点）を先に確定する。拠点は所属Nodeの地域から外さない。
+    for (index, seed) in seeds.iter().enumerate() {
+        match seed.scope {
+            CapitalRouteNodeScope::Point => {
+                owner.entry(seed.anchor).or_insert(index);
+            }
+            CapitalRouteNodeScope::Area => {
+                for cell in std::iter::once(&seed.anchor).chain(seed.capture_targets) {
+                    if !owner.contains_key(cell) {
+                        owner.insert(*cell, index);
+                        queue.push_back(*cell);
                     }
                 }
             }
-            cells
         }
-    };
-    control_area.extend(capture_targets.iter().copied());
-    control_area.sort_unstable_by_key(|position| (position.y, position.x));
-    control_area.dedup();
-    control_area
+    }
+    // 全起点から1マスずつ同時に広げる（幅優先）。先に届いた地域がセルを取る。
+    while let Some(cell) = queue.pop_front() {
+        let index = owner[&cell];
+        for (x, y) in map.get_adjacent(cell.x, cell.y) {
+            let next = GridPosition { x, y };
+            if owner.contains_key(&next)
+                || map.get_terrain(x, y) == Some(Terrain::Bridge)
+                || island_map
+                    .get_island_at(&next)
+                    .is_none_or(|island| island.id != island_id)
+            {
+                continue;
+            }
+            owner.insert(next, index);
+            // 川のマスは岸の地域に含めるが、そこから対岸へは塗り広げない。
+            // 川を挟む地域は橋（Point）の通過で分ける。
+            if map.get_terrain(x, y) != Some(Terrain::River) {
+                queue.push_back(next);
+            }
+        }
+    }
+    let mut regions = vec![Vec::new(); seeds.len()];
+    for (cell, index) in owner {
+        regions[index].push(cell);
+    }
+    for region in &mut regions {
+        region.sort_unstable_by_key(|position| (position.y, position.x));
+    }
+    regions
 }
 
 /// 拠点を、最も近い回廊セルへ占領目標として結びつける。
@@ -339,34 +372,38 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
         operations
             .operations
             .retain(|id, _| id.topology != key || operation_anchor_set.contains(&id.anchor));
-        for &index in &operation_indices {
+        // 施設数や分岐数で地域を一マスへ縮めない。通常Nodeは周囲の地域を表し、
+        // 橋の通過地点だけを地形上のPointとして扱う。
+        let crossing_exits = operation_indices
+            .iter()
+            .map(|&index| capital_route_crossing_exit(&map, &topology, CapitalRouteNodeId(index)))
+            .collect::<Vec<_>>();
+        let seeds = operation_indices
+            .iter()
+            .zip(&crossing_exits)
+            .map(|(&index, crossing_exit)| RegionSeed {
+                anchor: topology.nodes[index].anchor,
+                scope: if crossing_exit.is_some() {
+                    CapitalRouteNodeScope::Point
+                } else {
+                    CapitalRouteNodeScope::Area
+                },
+                capture_targets: capture_targets_at(index),
+            })
+            .collect::<Vec<_>>();
+        // 全Nodeの地域を同時に塗り分け、各セルを一つの地域だけに属させる。
+        let regions = paint_capital_route_regions(&map, &island_map, key.island_id, &seeds);
+        for ((&index, crossing_exit), (seed, control_area)) in operation_indices
+            .iter()
+            .zip(crossing_exits)
+            .zip(seeds.iter().zip(regions))
+        {
             let node = &topology.nodes[index];
             let id = CapitalRouteNodeOperationId {
                 topology: key,
                 anchor: node.anchor,
             };
-            let crossing_exit =
-                capital_route_crossing_exit(&map, &topology, CapitalRouteNodeId(index));
-            // 施設数や分岐数で地域を一マスへ縮めない。通常Nodeは周囲の地域を表し、
-            // 橋の通過地点だけを地形上のPointとして扱う。
-            let scope = if crossing_exit.is_some() {
-                CapitalRouteNodeScope::Point
-            } else {
-                CapitalRouteNodeScope::Area
-            };
-            let mut control_area = capital_route_node_control_area(
-                &map,
-                &island_map,
-                key.island_id,
-                node.anchor,
-                scope,
-                capture_targets_at(index),
-            );
-            if let Some(exit) = crossing_exit
-                && !control_area.contains(&exit)
-            {
-                control_area.push(exit);
-            }
+            let scope = seed.scope;
             let objective = if capture_targets_at(index).is_empty() {
                 CapitalRouteNodeObjective::Control
             } else {

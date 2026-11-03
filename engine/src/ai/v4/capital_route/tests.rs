@@ -20,11 +20,11 @@ use crate::ai::v4::capital_route::model::{
     RouteForceDemand,
 };
 use crate::ai::v4::capital_route::node_operation::{
-    attach_capture_targets_to_corridor, capital_assault_geometry,
+    RegionSeed, attach_capture_targets_to_corridor, capital_assault_geometry,
     capital_route_assault_authorized_from_dag, capital_route_current_fronts,
-    capital_route_dag_frontier_properties, capital_route_node_control_area,
-    capital_route_node_exit_satisfied, capital_route_node_predecessors_released,
-    consolidate_nearby_capture_target_regions, ensure_capital_route_node_operations,
+    capital_route_dag_frontier_properties, capital_route_node_exit_satisfied,
+    capital_route_node_predecessors_released, consolidate_nearby_capture_target_regions,
+    ensure_capital_route_node_operations, paint_capital_route_regions,
     refresh_capital_route_node_operations,
 };
 use crate::ai::v4::capital_route::prepare_capital_route_topologies;
@@ -411,6 +411,14 @@ fn durable_direct_fire_squad_wins_same_frontline_escort_slot() {
     );
 }
 
+fn area_seed(anchor: GridPosition, capture_targets: &[GridPosition]) -> RegionSeed<'_> {
+    RegionSeed {
+        anchor,
+        scope: CapitalRouteNodeScope::Area,
+        capture_targets,
+    }
+}
+
 #[test]
 fn area_control_region_excludes_remote_milestones() {
     let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
@@ -419,29 +427,66 @@ fn area_control_region_excludes_remote_milestones() {
     let anchor = pos(15, 2);
     let island = island_map.get_island_at(&anchor).unwrap().id;
     let capture_target = pos(14, 2);
+    let rear = pos(8, 2);
+    let forward = pos(22, 2);
 
-    let area = capital_route_node_control_area(
+    let targets = [capture_target];
+    let regions = paint_capital_route_regions(
         &map,
         &island_map,
         island,
-        anchor,
-        CapitalRouteNodeScope::Area,
-        &[capture_target],
+        &[
+            area_seed(rear, &[]),
+            area_seed(anchor, &targets),
+            area_seed(forward, &[]),
+        ],
     );
+    let area = &regions[1];
 
     assert!(area.contains(&anchor));
     assert!(area.contains(&capture_target));
     assert!(
-        !area.contains(&pos(22, 2)),
+        !area.contains(&forward),
         "後方Milestoneを局地優勢へ数えない"
     );
     assert!(
-        !area.contains(&pos(8, 2)),
+        !area.contains(&rear),
         "後続Milestoneの敵を現在Nodeへ数えない"
     );
-    assert!(area.iter().all(|position| {
-        map.distance(anchor.x, anchor.y, position.x, position.y) <= CAPITAL_ROUTE_REGION_RADIUS
-    }));
+    // 中点より相手側のセルは取らない。
+    assert!(
+        area.iter().all(|cell| (12..=18).contains(&cell.x)),
+        "{area:?}"
+    );
+}
+
+/// 塗り分けた地域は重ならず、陸地の各セルは陸路で最も近い代表点の地域に属する。
+#[test]
+fn painted_regions_partition_land_without_overlap() {
+    let map = flat_map(12, 7);
+    let island_map = crate::ai::islands::IslandMap::analyze(&map);
+    let island = island_map.get_island_at(&pos(0, 0)).unwrap().id;
+    let anchors = [pos(1, 1), pos(10, 1), pos(5, 5)];
+    let seeds = anchors.map(|anchor| area_seed(anchor, &[]));
+    let regions = paint_capital_route_regions(&map, &island_map, island, &seeds);
+    let mut seen = HashSet::default();
+    for region in &regions {
+        for cell in region {
+            assert!(seen.insert(*cell), "{cell:?} が複数の地域に属する");
+        }
+    }
+    assert_eq!(seen.len(), 12 * 7, "同じ陸塊の全セルを塗る");
+    for (index, region) in regions.iter().enumerate() {
+        for cell in region {
+            let own = map.distance(cell.x, cell.y, anchors[index].x, anchors[index].y);
+            assert!(
+                anchors
+                    .iter()
+                    .all(|other| own <= map.distance(cell.x, cell.y, other.x, other.y)),
+                "{cell:?} は最寄りの代表点の地域に属する"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2770,14 +2815,8 @@ fn regional_control_area_does_not_include_nearby_ground_across_an_uncrossed_brid
     map.set_terrain(4, 2, Terrain::Bridge).unwrap();
     let islands = crate::ai::islands::IslandMap::analyze(&map);
     let island = islands.get_island_at(&pos(3, 2)).unwrap().id;
-    let area = capital_route_node_control_area(
-        &map,
-        &islands,
-        island,
-        pos(3, 2),
-        CapitalRouteNodeScope::Area,
-        &[],
-    );
+    let regions = paint_capital_route_regions(&map, &islands, island, &[area_seed(pos(3, 2), &[])]);
+    let area = &regions[0];
     assert!(area.contains(&pos(3, 3)));
     assert!(
         !area.contains(&pos(5, 2)),
