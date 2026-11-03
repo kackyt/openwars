@@ -141,3 +141,51 @@ fn route_operation_indirect_and_loaded_gun_report_route_key_point() {
         Some(key_point)
     );
 }
+
+#[test]
+fn deployed_unassigned_gun_is_retained_for_production_planning() {
+    let player = PlayerId(1);
+    let mut world = World::new();
+    let position = crate::components::GridPosition { x: 2, y: 3 };
+    let gun = world
+        .spawn((
+            Faction(player),
+            position,
+            crate::components::UnitStats {
+                unit_type: crate::resources::UnitType::Artillery,
+                min_range: 3,
+                max_range: 6,
+                max_movement: 1,
+                ..crate::components::UnitStats::mock()
+            },
+        ))
+        .id();
+    let defend = crate::components::GridPosition { x: 8, y: 8 };
+    let mut memory = crate::ai::v4::capital_route::force_demand::RoutePostureMemory::default();
+    memory.by_player.insert(
+        player,
+        crate::ai::v4::capital_route::force_demand::RoutePostureDecision {
+            main: None,
+            regions: vec![],
+            orders: vec![crate::ai::v4::capital_route::force_demand::RouteOrder {
+                key_point: defend,
+                staging: defend,
+                defend: true,
+                force: 0,
+            }],
+        },
+    );
+    world.insert_resource(memory);
+    world.insert_resource(crate::resources::Map::new(
+        10,
+        10,
+        crate::resources::Terrain::Plains,
+        crate::resources::GridTopology::Square,
+    ));
+    world.insert_resource(SquadManager::default());
+    world.insert_resource(UnitOperationRegistry::default());
+    assert_eq!(
+        combat_assignments(&world, player)[&gun].objective,
+        Some(position)
+    );
+}

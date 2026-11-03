@@ -280,6 +280,7 @@ impl VictoryRoadmapRegistry {
         player_id: PlayerId,
         capital_island: Option<IslandId>,
         logistics_plan: Option<&crate::ai::v4::logistics_plan::V4LogisticsPlan>,
+        friendly_in_capital_production_range: bool,
     ) {
         let regional_for = |island_id| {
             self.operation_keys
@@ -314,6 +315,11 @@ impl VictoryRoadmapRegistry {
         {
             if let Some(predecessor) = previous
                 && predecessor != capital_operation
+                && !(friendly_in_capital_production_range
+                    && self
+                        .operations
+                        .get(&predecessor)
+                        .is_some_and(|operation| operation.island_id == capital_island))
             {
                 dependencies.insert(RoadmapDependency {
                     predecessor,
@@ -323,6 +329,7 @@ impl VictoryRoadmapRegistry {
             }
             if let Some(predecessor) = regional_for(capital_island)
                 && predecessor != capital_operation
+                && !friendly_in_capital_production_range
             {
                 dependencies.insert(RoadmapDependency {
                     predecessor,

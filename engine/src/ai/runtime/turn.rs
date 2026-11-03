@@ -7,13 +7,14 @@
 //! 2. （手番の最初だけ）Squad編成と目標探索
 //! 3. 生産施設上でFormingする作戦unitの退避
 //! 4. 輸送Squadの1手
-//! 5. 通常行動（戦術による最良の1手）
-//! 6. （V4）Squadを失ったunitを再接続した後の通常行動
-//! 7. （V4）通常行動で進めなかった作戦unitの生産施設からの退避
-//! 8. 生産
-//! 9. 手番終了（遊兵の計上と次フェーズの要求）
+//! 5. （通常経路V4）撃破→進入の順序: DAG前進区間を塞ぐ敵への撃破担当の静止射撃
+//! 6. 通常行動（戦術による最良の1手）
+//! 7. （V4）Squadを失ったunitを再接続した後の通常行動
+//! 8. （V4）通常行動で進めなかった作戦unitの生産施設からの退避
+//! 9. 生産
+//! 10. 手番終了（遊兵の計上と次フェーズの要求）
 //!
-//! 版・経路で異なるのは、通常行動を選ぶ戦術（[`TurnTactics`]）と、3の退避の対象だけである。
+//! 版・経路で異なるのは、通常行動を選ぶ戦術（[`TurnTactics`]）と、3の退避の対象、5の有無である。
 
 use crate::ai::code_path::{self, CodePath};
 use crate::ai::command::AiCommand;
@@ -92,6 +93,9 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     let path = code_path::for_player(world, player_id);
     let _code_path = code_path::enter(path);
     let step = TurnStep::begin(world, player_id, path);
+    if step.is_v4 {
+        crate::ai::v4::capital_route::tactical::prepare_region_tactical_cache(world);
+    }
 
     if has_queued_production(world, &step)
         && let Some(command) = take_next_queued_production_command(world, player_id, step.turn)
@@ -142,7 +146,12 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
         && step.tactics == TurnTactics::Standard
         && crate::ai::v4::artillery_ferry::artillery_ferry_enabled()
         && let Some((entity, command)) =
-            crate::ai::v4::artillery_ferry::decide_artillery_ferry(world, player_id, &step.acted)
+            crate::ai::v4::artillery_ferry::decide_artillery_ferry_phase(
+                world,
+                player_id,
+                &step.acted,
+                false,
+            )
     {
         return Some(issue_transport_command(world, entity, command));
     }
@@ -174,10 +183,43 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     if let Some((entity, command)) = select_transport_step(world, &step) {
         return Some(issue_transport_command(world, entity, command));
     }
-    let decision_skip = decision_skip_entities(world, &step);
+    let mut decision_skip = decision_skip_entities(world, &step);
+    // 標準経路のV4だけ。DAGの前進区間を塞ぐ敵に対し、撃破担当の静止射撃を通常行動より
+    // 先に確定し、別の進入役の行動を撃破まで残す（採点・候補集合は変えない）。
+    // 小規模経路は既存の squad_executor の静止射撃順序を使うため適用しない。
+    if step.is_v4 && step.tactics == TurnTactics::Standard {
+        crate::ai::wait_probe::stage(world, "fire_follow_order");
+        if let Some((entity, command)) = crate::ai::v4::fire_follow_order::decide_fire_follow_action(
+            world,
+            step.player_id,
+            &decision_skip,
+        ) {
+            return Some(issue_unit_command(world, entity, command));
+        }
+        // 有効な注文の進入役は、撃破担当が撃ち終えるまで通常行動の候補から外す。
+        if let Some(registry) =
+            world.get_resource::<crate::ai::v4::fire_follow_order::FireFollowOrderRegistry>()
+        {
+            decision_skip.extend(registry.active_entries(step.player_id));
+        }
+    }
     crate::ai::wait_probe::stage(world, "normal_tactics");
     if let Some((entity, command)) = decide_normal_action(world, &step, &decision_skip) {
         return Some(issue_unit_command(world, entity, command));
+    }
+    // 通常部隊の前進後の盤面で砲台の輸送・展開を判断する。
+    if step.is_v4
+        && step.tactics == TurnTactics::Standard
+        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled()
+        && let Some((entity, command)) =
+            crate::ai::v4::artillery_ferry::decide_artillery_ferry_phase(
+                world,
+                player_id,
+                &step.acted,
+                true,
+            )
+    {
+        return Some(issue_transport_command(world, entity, command));
     }
     if step.is_v4 {
         // Drop/Capture/作戦完了で手番途中にSquadを失ったEntityを、全通常行動が尽きた
@@ -225,6 +267,39 @@ fn has_queued_production(world: &World, step: &TurnStep) -> bool {
         })
 }
 
+/// 同一手番内で拠点の所有者が変わった場合だけルートを再観測する。
+#[derive(Resource)]
+struct RoutePropertySnapshot {
+    player: PlayerId,
+    turn: u32,
+    properties: Vec<(usize, usize, Option<PlayerId>)>,
+}
+
+fn route_properties_changed(world: &mut World, step: &TurnStep) -> bool {
+    let mut properties = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let position = entity.get::<GridPosition>()?;
+            let property = entity.get::<crate::components::Property>()?;
+            Some((position.x, position.y, property.owner_id))
+        })
+        .collect::<Vec<_>>();
+    properties.sort_unstable_by_key(|(x, y, _)| (*y, *x));
+    let changed = world
+        .get_resource::<RoutePropertySnapshot>()
+        .is_some_and(|snapshot| {
+            snapshot.player == step.player_id
+                && snapshot.turn == step.turn
+                && snapshot.properties != properties
+        });
+    world.insert_resource(RoutePropertySnapshot {
+        player: step.player_id,
+        turn: step.turn,
+        properties,
+    });
+    changed
+}
+
 /// 手番の最初の呼び出しだけSquadを編成し、ビーム探索で目標を割り当てる。
 /// V3以降は行動可能unitが無くても同じ手番に再編成しない（V1/V2は従来条件を維持）。
 /// それ以外の呼び出しでは、降車・搭乗が実際に起きた場合だけSquadを更新する。
@@ -239,6 +314,18 @@ fn prepare_squads(world: &mut World, step: &TurnStep) {
         crate::ai::beam_search::run_squad_beam_search(world, step.player_id);
     } else if transport_boarding_changed(world) {
         crate::ai::squad::update_squads(world, step.player_id);
+    }
+    if step.is_v4
+        && route_properties_changed(world, step)
+        && let Some(mut manager) = world.remove_resource::<SquadManager>()
+    {
+        // 占領成立直後にDAGの出口と担当を更新し、残りの未行動部隊へ反映する。
+        crate::ai::v4::strategy_pipeline::refresh_route_commitments(
+            world,
+            step.player_id,
+            &mut manager,
+        );
+        world.insert_resource(manager);
     }
 }
 
@@ -321,8 +408,17 @@ fn select_transport_step(world: &mut World, step: &TurnStep) -> Option<(Entity, 
 /// 通常行動で除外するEntity: 行動済みに加え、輸送Squadの輸送役とcargo。
 /// Forming中は複数の輸送役をmembersへ束ねる。代表transport_entityだけを除外すると
 /// 残りが通常行動へ漏れ、空荷で前線へ進んでしまう。
-fn decision_skip_entities(world: &World, step: &TurnStep) -> HashSet<Entity> {
+fn decision_skip_entities(world: &mut World, step: &TurnStep) -> HashSet<Entity> {
     let mut skip = step.acted.clone();
+    if step.is_v4
+        && step.tactics == TurnTactics::Standard
+        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled()
+    {
+        skip.extend(crate::ai::v4::artillery_ferry::own_ferry_units(
+            world,
+            step.player_id,
+        ));
+    }
     if let Some(manager) = world.get_resource::<SquadManager>() {
         for squad in manager
             .squads
@@ -545,5 +641,39 @@ fn end_turn(world: &mut World, player_id: PlayerId) {
     }
     if let Some(mut events) = world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>() {
         events.send(crate::events::NextPhaseCommand);
+    }
+}
+
+#[cfg(test)]
+mod route_property_tests {
+    use super::*;
+    use crate::components::Property;
+    use crate::resources::Terrain;
+
+    #[test]
+    fn property_capture_is_observed_once_within_the_turn() {
+        let mut world = World::new();
+        let player = PlayerId(1);
+        let property = world
+            .spawn((
+                GridPosition { x: 1, y: 1 },
+                Property::new(Terrain::City, Some(PlayerId(2)), 100),
+            ))
+            .id();
+        let mut step = TurnStep {
+            player_id: player,
+            turn: 3,
+            acted: HashSet::default(),
+            uses_v3_tactics: true,
+            is_v4: true,
+            tactics: TurnTactics::Standard,
+        };
+        assert!(!route_properties_changed(&mut world, &step));
+        world.get_mut::<Property>(property).unwrap().owner_id = Some(player);
+        assert!(route_properties_changed(&mut world, &step));
+        assert!(!route_properties_changed(&mut world, &step));
+        step.turn += 1;
+        world.get_mut::<Property>(property).unwrap().owner_id = Some(PlayerId(2));
+        assert!(!route_properties_changed(&mut world, &step));
     }
 }

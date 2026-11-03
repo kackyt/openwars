@@ -12,32 +12,86 @@ use crate::ai::v4::{
     Terrain, UnitStats, VecDeque, World, operation, victory_roadmap,
 };
 
-/// Nodeの戦術地域を、前後Nodeではなくanchor近傍の実セルから構築する。
-pub(in crate::ai::v4) fn capital_route_node_control_area(
+/// 地域を塗り分けるときの1Nodeの起点。
+pub(in crate::ai::v4) struct RegionSeed<'a> {
+    pub(in crate::ai::v4) anchor: GridPosition,
+    pub(in crate::ai::v4) scope: CapitalRouteNodeScope,
+    pub(in crate::ai::v4) capture_targets: &'a [GridPosition],
+}
+
+/// 同じ陸塊のNode地域を、代表点から同時に塗り広げて重なりなく分割する。
+///
+/// 各セルは、陸路（隣接マス）で最も近い代表点の地域にだけ属する。代表点・所属拠点から
+/// `CAPITAL_ROUTE_REGION_RADIUS` マスを超えるセルはどの地域にも属さない。距離が同じなら
+/// `seeds` の先に並ぶNodeが取る。これにより、ある地点の敵・味方は必ず一つの地域だけで
+/// 数えられ、隣の地域と同じ敵を二重に「争奪中」と数えたり、橋の向こうの地域が手前の
+/// 岸まで広がったりしない。
+///
+/// - Area: 代表点と所属拠点を起点に、同じ陸塊の陸地を塗る。橋のマスは塗らず、
+///   川のマスは岸の地域に含めるがそこから先へは広げない。したがって川を挟む対岸へは
+///   広がらない（橋の通過はPoint Nodeが表す）。
+/// - Point（橋）: 代表点の1マスだけを持つ。向こう岸の出口セルは対岸の地域に属し、
+///   通過したかどうかは `crossing_exit` で別に観測する。
+///
+/// 戻り値は `seeds` と同じ順の地域セル列（y・x順）。
+pub(in crate::ai::v4) fn paint_capital_route_regions(
     map: &Map,
     island_map: &crate::ai::islands::IslandMap,
     island_id: crate::ai::islands::IslandId,
-    anchor: GridPosition,
-    scope: CapitalRouteNodeScope,
-    capture_targets: &[GridPosition],
-) -> Vec<GridPosition> {
-    let mut control_area = match scope {
-        CapitalRouteNodeScope::Point => vec![anchor],
-        CapitalRouteNodeScope::Area => (0..map.height)
-            .flat_map(|y| (0..map.width).map(move |x| GridPosition { x, y }))
-            .filter(|position| {
-                map.distance(anchor.x, anchor.y, position.x, position.y)
-                    <= CAPITAL_ROUTE_REGION_RADIUS
-                    && island_map
-                        .get_island_at(position)
-                        .is_some_and(|island| island.id == island_id)
-            })
-            .collect::<Vec<_>>(),
-    };
-    control_area.extend(capture_targets.iter().copied());
-    control_area.sort_unstable_by_key(|position| (position.y, position.x));
-    control_area.dedup();
-    control_area
+    seeds: &[RegionSeed<'_>],
+) -> Vec<Vec<GridPosition>> {
+    let mut owner: HashMap<GridPosition, usize> = HashMap::default();
+    let mut queue = VecDeque::new();
+    // 起点（代表点と所属拠点）を先に確定する。拠点は所属Nodeの地域から外さない。
+    for (index, seed) in seeds.iter().enumerate() {
+        match seed.scope {
+            CapitalRouteNodeScope::Point => {
+                owner.entry(seed.anchor).or_insert(index);
+            }
+            CapitalRouteNodeScope::Area => {
+                for cell in std::iter::once(&seed.anchor).chain(seed.capture_targets) {
+                    if !owner.contains_key(cell) {
+                        owner.insert(*cell, index);
+                        queue.push_back((*cell, 0_u32));
+                    }
+                }
+            }
+        }
+    }
+    // 全起点から1マスずつ同時に広げる（幅優先）。先に届いた地域がセルを取る。
+    while let Some((cell, distance)) = queue.pop_front() {
+        // 競合する代表点が無い端の地域が後背地全体へ膨らむと、遠方の敵まで抱えて
+        // 争奪中のまま出口条件を満たせなくなる。起点から一定距離で塗るのを止める。
+        if distance >= CAPITAL_ROUTE_REGION_RADIUS {
+            continue;
+        }
+        let index = owner[&cell];
+        for (x, y) in map.get_adjacent(cell.x, cell.y) {
+            let next = GridPosition { x, y };
+            if owner.contains_key(&next)
+                || map.get_terrain(x, y) == Some(Terrain::Bridge)
+                || island_map
+                    .get_island_at(&next)
+                    .is_none_or(|island| island.id != island_id)
+            {
+                continue;
+            }
+            owner.insert(next, index);
+            // 川のマスは岸の地域に含めるが、そこから対岸へは塗り広げない。
+            // 川を挟む地域は橋（Point）の通過で分ける。
+            if map.get_terrain(x, y) != Some(Terrain::River) {
+                queue.push_back((next, distance + 1));
+            }
+        }
+    }
+    let mut regions = vec![Vec::new(); seeds.len()];
+    for (cell, index) in owner {
+        regions[index].push(cell);
+    }
+    for region in &mut regions {
+        region.sort_unstable_by_key(|position| (position.y, position.x));
+    }
+    regions
 }
 
 /// 拠点を、最も近い回廊セルへ占領目標として結びつける。
@@ -84,6 +138,7 @@ pub(in crate::ai::v4) fn attach_capture_targets_to_corridor(
 /// Capture Squadによる並行占領と、単一の完了判定を両立する。一直線の回廊は統合せず、
 /// map_25のように前方へ順番に確保する。`capture_regions` は（代表セル, 占領目標）を
 /// 自首都からの進行順に並べたもので、統合で空になった目標も要素として残す。
+#[cfg(test)]
 pub(in crate::ai::v4) fn consolidate_nearby_capture_target_regions(
     map: &Map,
     capture_regions: &mut [(GridPosition, Vec<GridPosition>)],
@@ -183,9 +238,59 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
                             .is_some_and(|island| island.id == key.island_id)
                 }),
         );
-        if topology.routes.len() >= 2 {
-            consolidate_nearby_capture_target_regions(&map, &mut capture_regions);
+        // 地域の代表点を先に選ぶ。終端の首都地域を優先し、地域内の施設は
+        // 同じ作戦の並行目標とする。施設セルごとの前提Nodeは生成しない。
+        let goal = topology.nodes[topology.goal_node.0].anchor;
+        let mut representatives = vec![goal];
+        let mut regional_targets: HashMap<GridPosition, Vec<GridPosition>> = HashMap::default();
+        let belongs_to_region = |anchor: GridPosition, position: GridPosition| {
+            let mut queue = VecDeque::from([(anchor, 0_u32)]);
+            let mut visited = HashSet::from_iter([anchor]);
+            while let Some((cell, distance)) = queue.pop_front() {
+                if cell == position {
+                    return true;
+                }
+                if distance >= CAPITAL_ROUTE_REGION_RADIUS {
+                    continue;
+                }
+                for (x, y) in map.get_adjacent(cell.x, cell.y) {
+                    let next = GridPosition { x, y };
+                    if map.get_terrain(x, y) != Some(Terrain::Bridge)
+                        && island_map
+                            .get_island_at(&next)
+                            .is_some_and(|island| island.id == key.island_id)
+                        && visited.insert(next)
+                    {
+                        queue.push_back((next, distance + 1));
+                    }
+                }
+            }
+            false
+        };
+        for (anchor, targets) in &capture_regions {
+            let representative = representatives
+                .iter()
+                .copied()
+                .find(|region| belongs_to_region(*region, *anchor))
+                .unwrap_or_else(|| {
+                    representatives.push(*anchor);
+                    *anchor
+                });
+            regional_targets
+                .entry(representative)
+                .or_default()
+                .extend(targets.iter().copied());
         }
+        capture_regions = representatives
+            .iter()
+            .filter_map(|anchor| {
+                regional_targets.remove(anchor).map(|mut targets| {
+                    targets.sort_unstable_by_key(|position| (position.y, position.x));
+                    targets.dedup();
+                    (*anchor, targets)
+                })
+            })
+            .collect();
         let capture_targets = capture_regions
             .into_iter()
             .filter(|(_, targets)| !targets.is_empty())
@@ -211,6 +316,11 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
             topology
                 .routes
                 .iter()
+                .filter(|route| {
+                    !representatives
+                        .iter()
+                        .any(|region| belongs_to_region(*region, route.front))
+                })
                 .filter_map(|route| topology.node_at(route.front))
                 .map(|node| node.0),
         );
@@ -268,39 +378,38 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
         operations
             .operations
             .retain(|id, _| id.topology != key || operation_anchor_set.contains(&id.anchor));
-        for &index in &operation_indices {
+        // 施設数や分岐数で地域を一マスへ縮めない。通常Nodeは周囲の地域を表し、
+        // 橋の通過地点だけを地形上のPointとして扱う。
+        let crossing_exits = operation_indices
+            .iter()
+            .map(|&index| capital_route_crossing_exit(&map, &topology, CapitalRouteNodeId(index)))
+            .collect::<Vec<_>>();
+        let seeds = operation_indices
+            .iter()
+            .zip(&crossing_exits)
+            .map(|(&index, crossing_exit)| RegionSeed {
+                anchor: topology.nodes[index].anchor,
+                scope: if crossing_exit.is_some() {
+                    CapitalRouteNodeScope::Point
+                } else {
+                    CapitalRouteNodeScope::Area
+                },
+                capture_targets: capture_targets_at(index),
+            })
+            .collect::<Vec<_>>();
+        // 全Nodeの地域を同時に塗り分け、各セルを一つの地域だけに属させる。
+        let regions = paint_capital_route_regions(&map, &island_map, key.island_id, &seeds);
+        for ((&index, crossing_exit), (seed, control_area)) in operation_indices
+            .iter()
+            .zip(crossing_exits)
+            .zip(seeds.iter().zip(regions))
+        {
             let node = &topology.nodes[index];
             let id = CapitalRouteNodeOperationId {
                 topology: key,
                 anchor: node.anchor,
             };
-            let crossing_exit =
-                capital_route_crossing_exit(&map, &topology, CapitalRouteNodeId(index));
-            // Nodeの形は毎手番の戦力状況でなく、DAG構築時に地形・拠点・分岐を走査して
-            // 決める。単一の通過点/拠点をAreaへ膨らませず、複数目標や合流点だけを
-            // 局地戦のAreaとしてSquadへ渡す。
-            let scope = if crossing_exit.is_some()
-                || (operation_predecessors[index].len() <= 1
-                    && operation_successors[index].len() <= 1
-                    && capture_targets_at(index).len() <= 1)
-            {
-                CapitalRouteNodeScope::Point
-            } else {
-                CapitalRouteNodeScope::Area
-            };
-            let mut control_area = capital_route_node_control_area(
-                &map,
-                &island_map,
-                key.island_id,
-                node.anchor,
-                scope,
-                capture_targets_at(index),
-            );
-            if let Some(exit) = crossing_exit
-                && !control_area.contains(&exit)
-            {
-                control_area.push(exit);
-            }
+            let scope = seed.scope;
             let objective = if capture_targets_at(index).is_empty() {
                 CapitalRouteNodeObjective::Control
             } else {
@@ -332,6 +441,7 @@ pub(in crate::ai::v4) fn ensure_capital_route_node_operations(
                     capture_targets: capture_targets_at(index).clone(),
                     crossing_exit,
                     crossed: false,
+                    local_control: false,
                     state: victory_roadmap::RoadmapNodeState::Locked,
                     assigned_squads: HashSet::default(),
                 });
@@ -370,8 +480,8 @@ pub(in crate::ai::v4) fn capital_route_crossing_exit(
 
 /// Nodeの出口条件が満たされ、後続Nodeを解放してよいかを返す。
 ///
-/// CaptureはPoint/Areaとも、Nodeに対応付けた全対象を所有した`Secured`だけが出口である。
-/// `Dominant`は局地戦況の観測値であって占領完了ではなく、後続Nodeの解放には使わない。
+/// 地域Captureは局地優勢でも前衛を次地域へ送れる。施設の占領完了は別工程として
+/// 残し、護衛・占領担当と施設予約はSecuredまで維持する。Pointは従来の出口を使う。
 pub(in crate::ai::v4) fn capital_route_node_exit_satisfied(
     operation: &CapitalRouteNodeOperation,
 ) -> bool {
@@ -383,6 +493,7 @@ pub(in crate::ai::v4) fn capital_route_node_exit_satisfied(
         ),
         CapitalRouteNodeObjective::Capture => {
             operation.state == victory_roadmap::RoadmapNodeState::Secured
+                || (operation.scope == CapitalRouteNodeScope::Area && operation.local_control)
         }
     }
 }
@@ -423,6 +534,7 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
         .get_resource::<CapitalRoutePathRegistry>()
         .map(|registry| registry.commitments.clone())
         .unwrap_or_default();
+
     let properties = world
         .iter_entities()
         .filter_map(|entity| {
@@ -439,6 +551,13 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             let position = *entity.get::<GridPosition>()?;
             let stats = entity.get::<UnitStats>()?;
             let health = entity.get::<Health>()?;
+            if entity.get::<crate::components::Transporting>().is_some() {
+                return None;
+            }
+            // 非武装車両の価格は局地優勢や橋の通過戦力に加算しない。
+            if stats.max_range == 0 && !stats.can_capture {
+                return None;
+            }
             Some((
                 faction.0,
                 position,
@@ -466,7 +585,7 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             .copied()
             .filter(|id| id.topology == key)
             .collect::<Vec<_>>();
-        operation_ids.sort_unstable_by_key(|id| progress_order(&topology.from_home, id.anchor));
+        operation_ids.sort_unstable_by_key(|id| topology.node_at(id.anchor).map(|node| node.0));
         // まず担当情報だけを毎手番リセットする。`crossed`は橋を越えた盤面事実なので
         // 消さず、Node状態は下の観測・dependency計算で再構築する。
         for id in &operation_ids {
@@ -480,7 +599,7 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
                 victory_roadmap::RoadmapNodeState::Locked
             };
         }
-        // DAGのedgeは進捗を必ず増やすため、前方への線形走査で前提Nodeの出口条件を
+        // DAGのNode番号は依存順なので、前方への線形走査で前提Nodeの出口条件を
         // 評価できる。地形DAGの合流edgeは「複数経路のいずれから来てもよい」という
         // 代替関係であり、全経路の同時制圧を要求する依存辺ではない。
         for &id in &operation_ids {
@@ -492,18 +611,16 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             };
             let predecessors_ready =
                 capital_route_node_predecessors_released(&operations.operations, &operation);
-            if !predecessors_ready {
-                continue;
-            }
-
             let mut friendly_power = 0_u64;
             let mut enemy_power = 0_u64;
             let mut friendly_ground_on_exit = false;
             let mut capturer_on_target = false;
+            let mut friendly_ground_in_area = false;
             for (owner, position, power, can_capture, is_ground) in &unit_observations {
                 if operation.control_area.contains(position) {
                     if *owner == player_id {
                         friendly_power = friendly_power.saturating_add(*power);
+                        friendly_ground_in_area |= *is_ground;
                     } else {
                         enemy_power = enemy_power.saturating_add(*power);
                     }
@@ -518,6 +635,15 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
                 {
                     capturer_on_target = true;
                 }
+            }
+
+            // 依存辺は未到着の後続の進行条件。実際に別経路で地域へ入った
+            // 前衛まで未観測のLockedへ戻さず、現地の争奪・占領状態を記録する。
+            if !predecessors_ready && !friendly_ground_in_area && !friendly_ground_on_exit {
+                if let Some(op) = operations.operations.get_mut(&id) {
+                    op.local_control = false;
+                }
+                continue;
             }
 
             let owned_capture_targets = operation
@@ -564,8 +690,14 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
             } else {
                 victory_roadmap::RoadmapNodeState::Ready
             };
+            // 地域の通過許可は局地戦力から独立に観測する。占領中という状態名や
+            // 未所有施設の割合で、優勢な前衛の前進を止めない。
+            let dominant = friendly_power > 0
+                && (enemy_power == 0
+                    || friendly_power.saturating_mul(4) >= enemy_power.saturating_mul(5));
             if let Some(operation) = operations.operations.get_mut(&id) {
                 operation.crossed |= friendly_ground_on_exit;
+                operation.local_control = dominant;
                 operation.state = state;
             }
         }
@@ -629,8 +761,8 @@ pub(in crate::ai::v4) fn refresh_capital_route_node_operations(
 
 /// 構築済みDAGを現在の拠点所有へ投影し、到達済みの区間から次に止まる未確保拠点を返す。
 ///
-/// 分岐では複数の候補が同時に現れ、合流後は一つのノードに戻る。橋を通った事実ではなく、
-/// その前方にある拠点を確保済みかどうかだけで次区間への遷移を決める。
+/// 分岐では複数の候補が同時に現れ、合流後は一つのノードに戻る。施設の所属地域が
+/// 前衛の通過を許可していれば、施設の占領完了を待たず次地域の目標を探索する。
 pub(in crate::ai::v4) fn capital_route_dag_frontier_properties(
     world: &World,
     player_id: PlayerId,
@@ -654,7 +786,7 @@ pub(in crate::ai::v4) fn capital_route_dag_frontier_properties(
             .successor_nodes
             .is_empty()
     );
-    // DAGは自首都からの距離順に構築済みであり、successorは必ず次の距離帯にある。
+    // DAGはトポロジカル順に構築済みであり、successorのNode番号は必ず大きい。
     for (index, node) in topology.nodes.iter().enumerate() {
         if !reachable[index] {
             continue;
@@ -662,8 +794,29 @@ pub(in crate::ai::v4) fn capital_route_dag_frontier_properties(
         if property_owners.get(&node.anchor).copied() != Some(Some(player_id))
             && let Some(route) = topology.property_routes.get(&node.anchor)
         {
-            route_properties[route.0].push(node.anchor);
-            continue;
+            let owner_anchor = super::commitment::route_target_node_anchor(
+                world,
+                player_id,
+                island_id,
+                node.anchor,
+            );
+            let region_released = world
+                .get_resource::<CapitalRouteNodeOperationRegistry>()
+                .and_then(|registry| {
+                    registry.operations.get(&CapitalRouteNodeOperationId {
+                        topology: super::model::CapitalRouteTopologyKey {
+                            player_id,
+                            island_id,
+                        },
+                        anchor: owner_anchor,
+                    })
+                })
+                .is_some_and(capital_route_node_exit_satisfied);
+            // 地域の局地制圧と施設の占領完了は別工程。制圧済み地域で前衛を止めない。
+            if !region_released {
+                route_properties[route.0].push(node.anchor);
+                continue;
+            }
         }
         for successor in &node.successor_nodes {
             reachable[successor.0] = true;
@@ -801,8 +954,10 @@ pub(crate) fn capital_assault_geometry(
     let map = world.get_resource::<Map>()?;
     let capital = topology.nodes[topology.goal_node.0].anchor;
     let front_properties = capital_route_front_properties(world, player_id, island_id)?;
-    if !front_properties.iter().flatten().all(|front| {
-        map.distance(front.x, front.y, capital.x, capital.y) <= CAPITAL_ROUTE_REGION_RADIUS
+    if !front_properties.iter().any(|properties| {
+        properties.iter().all(|front| {
+            map.distance(front.x, front.y, capital.x, capital.y) <= CAPITAL_ROUTE_REGION_RADIUS
+        })
     }) {
         return None;
     }

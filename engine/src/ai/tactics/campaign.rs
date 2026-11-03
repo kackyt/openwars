@@ -57,18 +57,21 @@ pub(crate) fn campaign_action_context(
     // 首都攻略DAGの外側では地域への入口へ進むが、地域内ではControl/Captureの
     // 指令に従う。`Some(None)`はanchor直行を止めて局地戦術へ任せる明示値であり、
     // その場合に古いSquad目標へフォールバックしてはならない。
-    let target = if crate::ai::code_path::is_extended() {
-        crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
-            world, player_id, entity,
-        )
-        .unwrap_or(squad.plan.target)
-    } else {
-        squad.plan.target
-    };
+    // 確定済み地域指示は通常V4でも実行の正本。プロファイルだけを理由に
+    // 同じSquadの古い目標へ戻すと、計画と移動の方向が食い違う。
+    let target = crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+        world, player_id, entity,
+    )
+    .unwrap_or(squad.plan.target);
     Ok(Some(CampaignActionContext {
         owner: assignment.owner,
         island_id,
-        mission_type: squad.plan.mission_type.clone(),
+        mission_type: crate::ai::v4::capital_route::tactical::capital_route_tactical_mission(
+            world,
+            player_id,
+            entity,
+            &squad.plan.mission_type,
+        ),
         target,
         departure_authorized: squad.plan.departure_authorized,
     }))

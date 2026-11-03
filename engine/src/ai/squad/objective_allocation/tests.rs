@@ -292,7 +292,7 @@ fn single_route_island_keeps_surplus_combat_for_capture_advance() {
     assert_eq!(remaining, members, "配らなかった戦闘役は次の前進責務へ残す");
 }
 
-/// 進軍路が2本の島では、余った戦闘役を両方の前線へDefenseとして配り切る。
+/// 未制圧地域を攻める余った戦闘役を、両方面のAttackへ配る。
 #[test]
 fn two_route_island_sends_surplus_combat_to_each_route_front() {
     let (mut world, island) = real_map("map_6", ENEMY);
@@ -314,7 +314,7 @@ fn two_route_island_sends_surplus_combat_to_each_route_front() {
     let targets = responsibilities
         .iter()
         .map(|responsibility| {
-            assert_eq!(responsibility.mission_type, MissionType::Defense);
+            assert_eq!(responsibility.mission_type, MissionType::Attack);
             responsibility.target
         })
         .collect::<HashSet<_>>();
@@ -411,4 +411,92 @@ fn capital_assault_attacks_with_effective_units_and_stages_the_rest() {
     let for_missiles = responsibility_of(&responsibilities, missiles);
     assert_eq!(for_missiles.mission_type, MissionType::Defense);
     assert_eq!(for_missiles.target, geometry.staging);
+}
+
+#[test]
+fn defended_route_uses_land_path_around_an_inlet() {
+    use crate::ai::v4::capital_route::force_demand::RouteOrder;
+    let mut world = World::new();
+    world.insert_resource(MasterDataRegistry::load().unwrap());
+    let mut map = Map::new(10, 8, Terrain::Plains, GridTopology::Square);
+    let target = pos(6, 1);
+    let defend = pos(2, 1);
+    let attack = pos(9, 3);
+    let orders = [
+        RouteOrder {
+            key_point: defend,
+            staging: defend,
+            defend: true,
+            force: 0,
+        },
+        RouteOrder {
+            key_point: attack,
+            staging: attack,
+            defend: false,
+            force: 0,
+        },
+    ];
+    assert!(
+        beyond_defended_route(&world, &map, target, &orders),
+        "平地では近い防衛路を優先する"
+    );
+    for y in 0..7 {
+        map.set_terrain(4, y, Terrain::Sea).unwrap();
+    }
+    assert!(
+        !beyond_defended_route(&world, &map, target, &orders),
+        "入り江を迂回する防衛路より陸路が短い攻撃路を優先する"
+    );
+}
+
+/// 一方の方面の地域処理が終われば、他方の未処理拠点と並行して首都を攻める。
+#[test]
+fn cleared_axis_attacks_capital_while_other_axis_keeps_regional_mission() {
+    let (mut world, island) = real_map("map_6", ENEMY);
+    crate::ai::v4::capital_route::prepare_capital_route_topologies(&mut world, ENEMY);
+    let initial = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
+        &world, ENEMY, island,
+    )
+    .unwrap();
+    let gates =
+        crate::ai::v4::capital_route::topology::same_land_route_fronts(&world, ENEMY, island);
+    let capital = world
+        .iter_entities()
+        .find_map(|entity| {
+            let at = *entity.get::<GridPosition>()?;
+            let property = entity.get::<Property>()?;
+            (property.terrain == Terrain::Capital && property.owner_id == Some(ME)).then_some(at)
+        })
+        .unwrap();
+    let map = world.resource::<Map>().clone();
+    let properties = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let at = *entity.get::<GridPosition>()?;
+            entity.get::<Property>()?;
+            (map.distance(at.x, at.y, capital.x, capital.y) > 3).then_some((entity.id(), at))
+        })
+        .collect::<Vec<_>>();
+    for (entity, at) in properties {
+        world.get_mut::<Property>(entity).unwrap().owner_id =
+            Some(if at == initial[1] { ME } else { ENEMY });
+    }
+    let fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
+        &world, ENEMY, island,
+    )
+    .unwrap();
+    assert!(map.distance(fronts[0].x, fronts[0].y, capital.x, capital.y) <= 3);
+    assert!(map.distance(fronts[1].x, fronts[1].y, capital.x, capital.y) > 3);
+    let forward = unit(&mut world, ENEMY, UnitType::Tank, gates[0], 100);
+    let regional = unit(&mut world, ENEMY, UnitType::Tank, gates[1], 100);
+    let mut remaining = vec![forward, regional];
+    let responsibilities =
+        route_front_responsibilities(&world, &map, ENEMY, island, &mut remaining);
+    assert!(remaining.is_empty());
+    let capital_order = responsibility_of(&responsibilities, forward);
+    assert_eq!(capital_order.mission_type, MissionType::Attack);
+    assert_eq!(capital_order.target, capital);
+    let regional_order = responsibility_of(&responsibilities, regional);
+    assert_eq!(regional_order.mission_type, MissionType::Attack);
+    assert_eq!(regional_order.target, fronts[1]);
 }

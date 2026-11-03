@@ -126,6 +126,13 @@ pub enum InvasionEvent {
         step: usize,
         probe: serde_json::Value,
     },
+    /// 明示的に有効化した撃破→進入の順序診断（OPENWARS_FIRE_FOLLOW_TRACE）。
+    AiFireFollowOrder {
+        turn: u32,
+        player_id: u32,
+        step: usize,
+        trace: serde_json::Value,
+    },
     PropertyCaptureProgressed {
         turn: u32,
         player_id: u32,
@@ -790,6 +797,14 @@ impl InvasionTraceCollector {
                 player_id,
                 step,
                 probe,
+            });
+        }
+        for trace in engine::ai::v4::fire_follow_order::take_trace(world) {
+            result.push(InvasionEvent::AiFireFollowOrder {
+                turn,
+                player_id,
+                step,
+                trace,
             });
         }
         let island_map = world.resource::<IslandMap>();

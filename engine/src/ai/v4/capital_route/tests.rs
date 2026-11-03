@@ -20,11 +20,11 @@ use crate::ai::v4::capital_route::model::{
     RouteForceDemand,
 };
 use crate::ai::v4::capital_route::node_operation::{
-    attach_capture_targets_to_corridor, capital_assault_geometry,
+    RegionSeed, attach_capture_targets_to_corridor, capital_assault_geometry,
     capital_route_assault_authorized_from_dag, capital_route_current_fronts,
-    capital_route_dag_frontier_properties, capital_route_node_control_area,
-    capital_route_node_exit_satisfied, capital_route_node_predecessors_released,
-    consolidate_nearby_capture_target_regions, ensure_capital_route_node_operations,
+    capital_route_dag_frontier_properties, capital_route_node_exit_satisfied,
+    capital_route_node_predecessors_released, consolidate_nearby_capture_target_regions,
+    ensure_capital_route_node_operations, paint_capital_route_regions,
     refresh_capital_route_node_operations,
 };
 use crate::ai::v4::capital_route::prepare_capital_route_topologies;
@@ -68,6 +68,7 @@ fn frontline_capacity_follows_scanned_node_geometry() {
         capture_targets,
         crossing_exit: None,
         crossed: false,
+        local_control: false,
         state: victory_roadmap::RoadmapNodeState::Ready,
         assigned_squads: HashSet::default(),
     };
@@ -182,7 +183,7 @@ fn capture_target_tie_prefers_home_side_corridor_cell() {
 }
 
 #[test]
-fn capture_node_requires_secured_for_both_area_and_point() {
+fn area_forward_release_is_independent_of_capture_completion() {
     let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
     let player = PlayerId(1);
     let topology = CapitalRouteTopologyKey {
@@ -203,22 +204,35 @@ fn capture_node_requires_secured_for_both_area_and_point() {
         capture_targets: vec![pos(2, 2)],
         crossing_exit: None,
         crossed: false,
+        local_control: true,
         state: victory_roadmap::RoadmapNodeState::Dominant,
         assigned_squads: HashSet::default(),
     };
 
     assert!(
-        !capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Area)),
-        "Areaの局地優勢も全対象の所有権確保までは後続を開けない"
+        capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Area)),
+        "地域を制圧した前衛は、施設の占領担当を残して次地域へ進める"
     );
     assert!(
         !capital_route_node_exit_satisfied(&operation(CapitalRouteNodeScope::Point)),
         "単一Capture拠点は所有権確保まで後続を開けない"
     );
+    let mut sustained = operation(CapitalRouteNodeScope::Area);
+    sustained.state = victory_roadmap::RoadmapNodeState::Capturing;
+    sustained.local_control = true;
+    assert!(
+        capital_route_node_exit_satisfied(&sustained),
+        "占領継続中も局地優勢なら前衛を解放する"
+    );
+    sustained.local_control = false;
+    assert!(
+        !capital_route_node_exit_satisfied(&sustained),
+        "優勢を失えば通過許可も撤回する"
+    );
 }
 
 #[test]
-fn dominant_area_capture_retains_one_escort_until_secured() {
+fn controlled_capture_area_retains_one_escort_until_secured() {
     let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
     let player = PlayerId(1);
     let topology = CapitalRouteTopologyKey {
@@ -242,13 +256,14 @@ fn dominant_area_capture_retains_one_escort_until_secured() {
         capture_targets: vec![id.anchor],
         crossing_exit: None,
         crossed: false,
+        local_control: true,
         state,
         assigned_squads: HashSet::default(),
     };
     let mut registry = CapitalRouteNodeOperationRegistry::default();
     registry.operations.insert(
         rear_id,
-        operation(rear_id, victory_roadmap::RoadmapNodeState::Dominant),
+        operation(rear_id, victory_roadmap::RoadmapNodeState::Capturing),
     );
 
     assert_eq!(
@@ -301,6 +316,7 @@ fn capture_frontline_reserves_both_capturer_and_control_lanes() {
         capture_targets,
         crossing_exit: None,
         crossed: false,
+        local_control: false,
         state: victory_roadmap::RoadmapNodeState::Ready,
         assigned_squads: HashSet::default(),
     };
@@ -348,6 +364,7 @@ fn nearest_capture_capable_combat_squad_can_take_the_capture_lane() {
         capture_targets: vec![pos(3, 2)],
         crossing_exit: None,
         crossed: false,
+        local_control: false,
         state: victory_roadmap::RoadmapNodeState::Ready,
         assigned_squads: HashSet::default(),
     };
@@ -394,6 +411,14 @@ fn durable_direct_fire_squad_wins_same_frontline_escort_slot() {
     );
 }
 
+fn area_seed(anchor: GridPosition, capture_targets: &[GridPosition]) -> RegionSeed<'_> {
+    RegionSeed {
+        anchor,
+        scope: CapitalRouteNodeScope::Area,
+        capture_targets,
+    }
+}
+
 #[test]
 fn area_control_region_excludes_remote_milestones() {
     let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
@@ -402,29 +427,74 @@ fn area_control_region_excludes_remote_milestones() {
     let anchor = pos(15, 2);
     let island = island_map.get_island_at(&anchor).unwrap().id;
     let capture_target = pos(14, 2);
+    let rear = pos(8, 2);
+    let forward = pos(22, 2);
 
-    let area = capital_route_node_control_area(
+    let targets = [capture_target];
+    let regions = paint_capital_route_regions(
         &map,
         &island_map,
         island,
-        anchor,
-        CapitalRouteNodeScope::Area,
-        &[capture_target],
+        &[
+            area_seed(rear, &[]),
+            area_seed(anchor, &targets),
+            area_seed(forward, &[]),
+        ],
     );
+    let area = &regions[1];
 
     assert!(area.contains(&anchor));
     assert!(area.contains(&capture_target));
     assert!(
-        !area.contains(&pos(22, 2)),
+        !area.contains(&forward),
         "後方Milestoneを局地優勢へ数えない"
     );
     assert!(
-        !area.contains(&pos(8, 2)),
+        !area.contains(&rear),
         "後続Milestoneの敵を現在Nodeへ数えない"
     );
-    assert!(area.iter().all(|position| {
-        map.distance(anchor.x, anchor.y, position.x, position.y) <= CAPITAL_ROUTE_REGION_RADIUS
-    }));
+    // 中点より相手側のセルは取らない。
+    assert!(
+        area.iter().all(|cell| (12..=18).contains(&cell.x)),
+        "{area:?}"
+    );
+}
+
+/// 塗り分けた地域は重ならず、陸地の各セルは陸路で最も近い代表点の地域に属する。
+#[test]
+fn painted_regions_partition_land_without_overlap() {
+    let map = flat_map(12, 7);
+    let island_map = crate::ai::islands::IslandMap::analyze(&map);
+    let island = island_map.get_island_at(&pos(0, 0)).unwrap().id;
+    let anchors = [pos(1, 1), pos(10, 1), pos(5, 5)];
+    let seeds = anchors.map(|anchor| area_seed(anchor, &[]));
+    let regions = paint_capital_route_regions(&map, &island_map, island, &seeds);
+    let mut seen = HashSet::default();
+    for region in &regions {
+        for cell in region {
+            assert!(seen.insert(*cell), "{cell:?} が複数の地域に属する");
+        }
+    }
+    assert!(
+        seen.iter().all(|cell| anchors
+            .iter()
+            .any(|a| map.distance(cell.x, cell.y, a.x, a.y) <= CAPITAL_ROUTE_REGION_RADIUS)),
+        "代表点から半径を超えるセルは塗らない"
+    );
+    // (6,0) はどの代表点からも4マス以上離れている。
+    assert!(seen.contains(&pos(3, 2)));
+    assert!(!seen.contains(&pos(6, 0)), "半径外は塗らない");
+    for (index, region) in regions.iter().enumerate() {
+        for cell in region {
+            let own = map.distance(cell.x, cell.y, anchors[index].x, anchors[index].y);
+            assert!(
+                anchors
+                    .iter()
+                    .all(|other| own <= map.distance(cell.x, cell.y, other.x, other.y)),
+                "{cell:?} は最寄りの代表点の地域に属する"
+            );
+        }
+    }
 }
 
 #[test]
@@ -761,6 +831,7 @@ fn unfinished_capture_node_reserves_property_cells_for_capturers() {
             capture_targets: vec![target],
             crossing_exit: None,
             crossed: false,
+            local_control: false,
             state: victory_roadmap::RoadmapNodeState::Capturing,
             assigned_squads: HashSet::default(),
         },
@@ -1187,11 +1258,10 @@ fn map26_builds_a_forward_dag_independently_for_each_player() {
     assert_eq!(second.nodes[second.start_node.0].anchor, player_two_capital);
     for topology in [first, second] {
         assert!(topology.routes.len() >= 2, "橋の北・南を別の入口として持つ");
-        assert!(topology.nodes.iter().all(|node| {
-            node.successor_nodes.iter().all(|successor| {
-                topology.from_home[&topology.nodes[successor.0].anchor]
-                    > topology.from_home[&node.anchor]
-            })
+        assert!(topology.nodes.iter().enumerate().all(|(index, node)| {
+            node.successor_nodes
+                .iter()
+                .all(|successor| successor.0 > index)
         }));
         let mut inbound = vec![0_u32; topology.nodes.len()];
         for node in &topology.nodes {
@@ -1339,6 +1409,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
             UnitStats {
                 cost: 100_000,
                 movement_type: MovementType::Tank,
+                max_range: 1,
                 ..UnitStats::mock()
             },
         ));
@@ -1368,6 +1439,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
         UnitStats {
             cost: 100_000,
             movement_type: MovementType::Tank,
+            max_range: 1,
             ..UnitStats::mock()
         },
     ));
@@ -1394,6 +1466,7 @@ fn map26_bridge_node_requires_a_ground_unit_to_reach_its_exit() {
         UnitStats {
             cost: 100_000,
             movement_type: MovementType::Tank,
+            max_range: 1,
             ..UnitStats::mock()
         },
     ));
@@ -1681,6 +1754,7 @@ fn advancing_route_registry_exposes_the_current_segment_roster() {
         ]),
         squads_by_operation: HashMap::default(),
         assignment_diagnostics: HashMap::default(),
+        carried_routes: HashMap::default(),
     };
 
     let advancing_entities = registry.advancing_combat_entities(player, &manager);
@@ -1870,9 +1944,9 @@ fn own_properties_outside_capital_region(
     }
 }
 
-/// 序盤は前線拠点が敵首都の地域の外にも残るので、首都攻略の段階に入らない。
+/// どちらの進軍路も首都地域へ達していない序盤は、首都攻略段階に入らない。
 #[test]
-fn capital_assault_waits_until_every_front_property_is_near_the_capital() {
+fn capital_assault_waits_until_one_route_reaches_the_capital_region() {
     let player = PlayerId(2);
     let (world, island) = map6_route_world(player);
 
@@ -2004,5 +2078,1275 @@ fn squad_route_follows_the_branch_of_its_own_target() {
     assert_eq!(
         squad_target_route(topology, map, &MissionType::Defense, Some(south), &closed),
         None
+    );
+}
+
+/// 首都周辺の施設は首都地域の並行目標であり、首都への中継Nodeにはしない。
+#[test]
+fn capital_region_owns_adjacent_factories_without_internal_dependencies() {
+    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+    let master = MasterDataRegistry::load().unwrap();
+    for player in [PlayerId(1), PlayerId(2)] {
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master,
+            "map_20",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        prepare_capital_route_topologies(&mut world, player);
+        ensure_capital_route_node_operations(&mut world, player);
+        let registry = world.resource::<CapitalRouteNodeOperationRegistry>();
+        let topologies = world.resource::<CapitalRouteTopologyRegistry>();
+        for (key, topology) in &topologies.topologies {
+            if key.player_id != player {
+                continue;
+            }
+            let goal = topology.nodes[topology.goal_node.0].anchor;
+            let goal_id = CapitalRouteNodeOperationId {
+                topology: *key,
+                anchor: goal,
+            };
+            let region = &registry.operations[&goal_id];
+            assert_eq!(region.scope, CapitalRouteNodeScope::Area);
+            let map = world.resource::<Map>();
+            for entity in world.iter_entities() {
+                let (Some(position), Some(property)) =
+                    (entity.get::<GridPosition>(), entity.get::<Property>())
+                else {
+                    continue;
+                };
+                if property.terrain != Terrain::Factory
+                    || map.distance(position.x, position.y, goal.x, goal.y) > 1
+                {
+                    continue;
+                }
+                assert!(
+                    region.capture_targets.contains(position),
+                    "首都隣接工場 {position:?} は同じ地域の目標"
+                );
+                assert!(
+                    !registry
+                        .operations
+                        .keys()
+                        .any(|id| id.topology == *key && id.anchor == *position),
+                    "地域内部に施設Nodeを作らない"
+                );
+            }
+            for target in &region.capture_targets {
+                assert_eq!(
+                    registry
+                        .operations
+                        .values()
+                        .filter(|operation| operation.id.topology == *key
+                            && operation.capture_targets.contains(target))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+}
+
+fn standard_region_world() -> (World, Entity, SquadId) {
+    use crate::ai::operation_assignment::{
+        OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
+    };
+    use crate::components::{ActionCompleted, Ammo, Fuel, HasMoved};
+    let (mut world, _) = crate::setup::create_world();
+    let map = flat_map(25, 5);
+    world.insert_resource(crate::ai::islands::IslandMap::analyze(&map));
+    world.insert_resource(map);
+    let master = MasterDataRegistry::load().unwrap();
+    let stats = master
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Tank.as_str().to_owned(),
+        ))
+        .unwrap();
+    let entity = world
+        .spawn((
+            Faction(PlayerId(1)),
+            pos(10, 2),
+            Health {
+                current: 100,
+                max: 100,
+            },
+            Ammo {
+                ammo1: stats.max_ammo1,
+                max_ammo1: stats.max_ammo1,
+                ammo2: stats.max_ammo2,
+                max_ammo2: stats.max_ammo2,
+            },
+            Fuel {
+                current: stats.max_fuel,
+                max: stats.max_fuel,
+            },
+            HasMoved(false),
+            ActionCompleted(false),
+            stats,
+        ))
+        .id();
+    world.insert_resource(master);
+    world.insert_resource(crate::resources::DamageChart::new());
+    let mut settings = crate::ai::PlayerAiSettings::new();
+    settings.set_version(PlayerId(1), crate::ai::AiVersion::V4);
+    world.insert_resource(settings);
+    let squad = assign_route_squad(&mut world, PlayerId(1), MissionType::Defense, &[entity]);
+    world
+        .resource_mut::<crate::ai::squad::SquadManager>()
+        .squads[0]
+        .plan
+        .target = Some(pos(20, 2));
+    world.resource_mut::<UnitOperationRegistry>().assign(
+        entity,
+        UnitOperationAssignment {
+            owner: OperationOwner::Campaign {
+                player_id: PlayerId(1),
+                island_id: crate::ai::islands::IslandId(0),
+            },
+            squad_id: Some(squad),
+            role: OperationUnitRole::Member,
+            assigned_turn: 1,
+        },
+    );
+    world.insert_resource(CapitalRoutePathRegistry {
+        commitments: HashMap::from_iter([(
+            squad,
+            CapitalRouteCommitment {
+                player_id: PlayerId(1),
+                island_id: crate::ai::islands::IslandId(0),
+                route: CapitalRouteId(0),
+                target: pos(2, 2),
+                target_anchor: pos(2, 2),
+                objective: CapitalRouteNodeObjective::Control,
+                scope: CapitalRouteNodeScope::Area,
+                control_area: vec![pos(2, 2)],
+                capture_targets: Vec::new(),
+                crossing_exit: None,
+                crossed: false,
+                execution_target: pos(2, 2),
+                frontline_capacity: 1,
+                path: vec![pos(10, 2), pos(2, 2)],
+                phase: CapitalRouteExecutionPhase::Hold,
+            },
+        )]),
+        ..Default::default()
+    });
+    (world, entity, squad)
+}
+
+#[test]
+fn standard_v4_uses_committed_region_goal() {
+    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+    let (mut world, entity, _) = standard_region_world();
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision,Some((actor,crate::ai::command::AiCommand::Wait{target_pos})) if actor==entity && target_pos.x<10),
+        "地域の保持地点へ西進する: {decision:?}"
+    );
+}
+
+/// 地域入口を代表座標へ固定せず、占有された入口を避ける。
+#[test]
+fn standard_region_entry_uses_free_perimeter() {
+    let (mut world, entity, squad) = standard_region_world();
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.target_anchor = pos(15, 2);
+    order.execution_target = pos(15, 2);
+    order.control_area = vec![pos(14, 2), pos(14, 3), pos(15, 2), pos(15, 3)];
+    super::tactical::prepare_region_tactical_cache(&mut world);
+    let first = super::tactical::capital_route_tactical_target(&world, PlayerId(1), entity)
+        .flatten()
+        .unwrap();
+    assert_eq!(first, pos(14, 2));
+    let stats = world.get::<UnitStats>(entity).unwrap().clone();
+    world.spawn((Faction(PlayerId(1)), first, stats));
+    let next = super::tactical::capital_route_tactical_target(&world, PlayerId(1), entity)
+        .flatten()
+        .unwrap();
+    assert_ne!(next, first);
+    assert!([pos(14, 3), pos(15, 2), pos(15, 3)].contains(&next));
+    // 占有変化は距離の再計算なしで反映し、地形変化時だけ共有距離を破棄する。
+    for y in 0..5 {
+        world
+            .resource_mut::<Map>()
+            .set_terrain(12, y, Terrain::Sea)
+            .unwrap();
+    }
+    super::tactical::prepare_region_tactical_cache(&mut world);
+    assert_eq!(
+        super::tactical::capital_route_tactical_target(&world, PlayerId(1), entity),
+        Some(None)
+    );
+}
+
+/// 地域内の占領役は同じ施設へ集中させない。
+#[test]
+fn standard_region_capturers_claim_distinct_properties() {
+    use crate::ai::operation_assignment::{
+        OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
+    };
+    let (mut world, entity, squad) = standard_region_world();
+    world
+        .resource_mut::<crate::ai::squad::SquadManager>()
+        .squads[0]
+        .plan
+        .mission_type = MissionType::Capture;
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Infantry.as_str().to_owned(),
+        ))
+        .unwrap();
+    *world.get_mut::<UnitStats>(entity).unwrap() = stats.clone();
+    let second = world
+        .spawn((
+            Faction(PlayerId(1)),
+            pos(10, 3),
+            stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    world
+        .resource_mut::<crate::ai::squad::SquadManager>()
+        .squads[0]
+        .members
+        .insert(second);
+    world.resource_mut::<UnitOperationRegistry>().assign(
+        second,
+        UnitOperationAssignment {
+            owner: OperationOwner::Campaign {
+                player_id: PlayerId(1),
+                island_id: crate::ai::islands::IslandId(0),
+            },
+            squad_id: Some(squad),
+            role: OperationUnitRole::Member,
+            assigned_turn: 1,
+        },
+    );
+    for cell in [pos(12, 2), pos(12, 3)] {
+        world.spawn((cell, Property::new(Terrain::City, Some(PlayerId(2)), 200)));
+    }
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.objective = CapitalRouteNodeObjective::Capture;
+    order.control_area = vec![
+        pos(10, 2),
+        pos(10, 3),
+        pos(11, 2),
+        pos(11, 3),
+        pos(12, 2),
+        pos(12, 3),
+    ];
+    order.capture_targets = vec![pos(12, 2), pos(12, 3)];
+    let target = |unit| {
+        super::tactical::capital_route_tactical_target(&world, PlayerId(1), unit)
+            .flatten()
+            .unwrap()
+    };
+    assert_eq!(target(entity), pos(12, 2));
+    assert_eq!(target(second), pos(12, 3));
+}
+
+/// 前方の敵は排除すべき対象であり、進入口がある地域の目標を消さない。
+#[test]
+fn standard_region_entry_keeps_goal_beyond_enemy_screen() {
+    let (mut world, entity, squad) = standard_region_world();
+    let stats = world.get::<UnitStats>(entity).unwrap().clone();
+    for y in 0..5 {
+        world.spawn((Faction(PlayerId(2)), pos(12, y), stats.clone()));
+    }
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.execution_target = pos(15, 2);
+    order.control_area = vec![pos(14, 2), pos(14, 3), pos(15, 2), pos(15, 3)];
+    let target = super::tactical::capital_route_tactical_target(&world, PlayerId(1), entity);
+    assert_eq!(
+        target,
+        Some(Some(pos(14, 2))),
+        "敵に遮られても地域への進軍目標を維持する"
+    );
+    // 地域内の進入可能マスを全て敵が占めた場合も、攻撃目標を残す。
+    for cell in [pos(14, 2), pos(14, 3), pos(15, 2), pos(15, 3)] {
+        world.spawn((Faction(PlayerId(2)), cell, stats.clone()));
+    }
+    assert_eq!(
+        super::tactical::capital_route_tactical_target(&world, PlayerId(1), entity),
+        Some(Some(pos(14, 2)))
+    );
+}
+
+/// 回廊外の防衛・射撃位置を、全員共通の後方拠点へ置き換えない。
+#[test]
+fn route_hold_preserves_concrete_defense_position_outside_corridor() {
+    let player = PlayerId(1);
+    let (mut world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).unwrap();
+    let frontier_progress = capital_route_dag_frontier_properties(&world, player, island)
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .filter_map(|target| topology.from_home.get(&target).copied())
+        .min()
+        .unwrap();
+    let destination = *topology
+        .from_home
+        .iter()
+        .filter(|(cell, progress)| {
+            **progress > 0 && **progress < frontier_progress && !topology.corridor.contains(cell)
+        })
+        .min_by_key(|(cell, progress)| (**progress, cell.y, cell.x))
+        .unwrap()
+        .0;
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Tank.as_str().to_owned(),
+        ))
+        .unwrap();
+    let entity = world
+        .spawn((
+            Faction(player),
+            destination,
+            stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    let squad = assign_route_squad(&mut world, player, MissionType::Defense, &[entity]);
+    let mut manager = world
+        .remove_resource::<crate::ai::squad::SquadManager>()
+        .unwrap();
+    manager.squads[0].plan.target = Some(destination);
+    manager.squads[0].plan.target_island = Some(island);
+    super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+    let order = &world.resource::<CapitalRoutePathRegistry>().commitments[&squad];
+    assert_eq!(order.phase, CapitalRouteExecutionPhase::Hold);
+    assert_eq!(
+        order.execution_target, destination,
+        "防衛位置を後方の代表地点へ集約しない"
+    );
+}
+
+/// 地域指示を一時解除した負傷部隊は、修理地点までの途中にも移動できる。
+#[test]
+fn standard_region_recovery_can_approach_distant_repair_site() {
+    let (mut world, entity, _) = standard_region_world();
+    world.get_mut::<Health>(entity).unwrap().current = 60;
+    world
+        .resource_mut::<Map>()
+        .set_terrain(2, 2, Terrain::Factory)
+        .unwrap();
+    world.spawn((
+        pos(2, 2),
+        Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+    ));
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision,Some((actor,crate::ai::command::AiCommand::Wait{target_pos})) if actor==entity && target_pos.x<10 && target_pos.x>2),
+        "一手で工場へ着けなくても西へ修理移動する: {decision:?}"
+    );
+}
+
+#[test]
+fn every_capital_route_gate_reaches_goal_without_changing_corridor() {
+    let master = MasterDataRegistry::load().unwrap();
+    for map_name in ["map_20", "map_26", "map_47", "map_6"] {
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master,
+            map_name,
+            GridTopology::Hex,
+        )
+        .unwrap();
+        for player in [PlayerId(1), PlayerId(2)] {
+            prepare_capital_route_topologies(&mut world, player);
+        }
+        let registry = world.resource::<CapitalRouteTopologyRegistry>();
+        for topology in registry.topologies.values() {
+            let mut reaches_goal = vec![false; topology.nodes.len()];
+            reaches_goal[topology.goal_node.0] = true;
+            for index in (0..topology.nodes.len()).rev() {
+                reaches_goal[index] |= topology.nodes[index]
+                    .successor_nodes
+                    .iter()
+                    .any(|next| reaches_goal[next.0]);
+            }
+            let mut from_start = vec![false; topology.nodes.len()];
+            from_start[topology.start_node.0] = true;
+            for index in 0..topology.nodes.len() {
+                if from_start[index] {
+                    for next in &topology.nodes[index].successor_nodes {
+                        from_start[next.0] = true;
+                    }
+                }
+            }
+            for route in &topology.routes {
+                let node = topology.node_at(route.front).unwrap();
+                assert!(
+                    from_start[node.0],
+                    "{map_name}: 入口 {:?} に出発点から到達できる",
+                    route.front
+                );
+                assert!(
+                    reaches_goal[node.0],
+                    "{map_name}: 入口 {:?} から首都へ進める",
+                    route.front
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_capital_orders_keep_destination_and_traverse_their_assigned_gate() {
+    let master = MasterDataRegistry::load().unwrap();
+    for player in [PlayerId(1), PlayerId(2)] {
+        let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+            &master,
+            "map_20",
+            GridTopology::Hex,
+        )
+        .unwrap();
+        prepare_capital_route_topologies(&mut world, player);
+        ensure_capital_route_node_operations(&mut world, player);
+        let topology = world
+            .resource::<CapitalRouteTopologyRegistry>()
+            .topologies
+            .iter()
+            .find(|(key, _)| key.player_id == player)
+            .map(|(_, topology)| topology)
+            .unwrap();
+        let home = topology.nodes[topology.start_node.0].anchor;
+        let goal = topology.nodes[topology.goal_node.0].anchor;
+        let island = world
+            .resource::<crate::ai::islands::IslandMap>()
+            .get_island_at(&home)
+            .unwrap()
+            .id;
+        let stats = master
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                UnitType::Mech.as_str().to_owned(),
+            ))
+            .unwrap();
+        let mut ids = Vec::new();
+        for mission in [
+            MissionType::Attack,
+            MissionType::Capture,
+            MissionType::Defense,
+        ] {
+            let entity = world
+                .spawn((
+                    Faction(player),
+                    home,
+                    stats.clone(),
+                    Health {
+                        current: 100,
+                        max: 100,
+                    },
+                ))
+                .id();
+            ids.push(assign_route_squad(&mut world, player, mission, &[entity]));
+        }
+        let mut manager = world
+            .remove_resource::<crate::ai::squad::SquadManager>()
+            .unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            let squad = manager
+                .squads
+                .iter_mut()
+                .find(|squad| squad.id == *id)
+                .unwrap();
+            squad.plan.target = Some(if index == 2 { home } else { goal });
+            squad.plan.target_island = Some(island);
+        }
+        super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+        let orders = world.resource::<CapitalRoutePathRegistry>();
+        let topology = capital_route_topology_for(&world, player, island).unwrap();
+        for id in &ids[..2] {
+            let order = &orders.commitments[id];
+            assert_eq!(order.target, goal, "首都命令を側方拠点で上書きしない");
+            assert!(
+                order.path.contains(&topology.routes[order.route.0].front),
+                "担当回廊を通る"
+            );
+        }
+        let defense = &orders.commitments[&ids[2]];
+        assert_eq!(defense.phase, CapitalRouteExecutionPhase::Hold);
+        assert_eq!(
+            defense.execution_target, home,
+            "別の防衛任務を首都へ集中させない"
+        );
+    }
+}
+
+#[test]
+fn regional_entry_moves_onto_position_instead_of_stopping_at_weapon_range() {
+    use crate::components::{Ammo, Fuel};
+    for unit_type in [UnitType::Tank, UnitType::Mech, UnitType::HeavySpGun] {
+        let (mut world, entity, squad) = standard_region_world();
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                unit_type.as_str().to_owned(),
+            ))
+            .unwrap();
+        world.entity_mut(entity).insert((
+            pos(13, 2),
+            Ammo {
+                ammo1: stats.max_ammo1,
+                max_ammo1: stats.max_ammo1,
+                ammo2: stats.max_ammo2,
+                max_ammo2: stats.max_ammo2,
+            },
+            Fuel {
+                current: stats.max_fuel,
+                max: stats.max_fuel,
+            },
+            stats,
+        ));
+        let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+        let order = paths.commitments.get_mut(&squad).unwrap();
+        order.phase = CapitalRouteExecutionPhase::Advance;
+        order.scope = CapitalRouteNodeScope::Area;
+        order.objective = CapitalRouteNodeObjective::Control;
+        order.control_area = vec![pos(14, 2)];
+        order.execution_target = pos(14, 2);
+        let decision =
+            crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+        assert!(
+            matches!(decision, Some((actor, crate::ai::command::AiCommand::Wait { target_pos }))
+            if actor == entity && target_pos == pos(14, 2)),
+            "{unit_type:?}: 射程内の手前で止まらず指定地域へ入る: {decision:?}"
+        );
+    }
+}
+
+#[test]
+fn regional_suppression_aims_at_enemy_from_outside_then_advances_to_open_ground() {
+    let (mut world, entity, squad) = standard_region_world();
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::HeavySpGun.as_str().to_owned(),
+        ))
+        .unwrap();
+    world.entity_mut(entity).insert((pos(12, 2), stats));
+    let enemy_stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Infantry.as_str().to_owned(),
+        ))
+        .unwrap();
+    let enemy = world
+        .spawn((
+            Faction(PlayerId(2)),
+            pos(15, 2),
+            enemy_stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    world
+        .resource_mut::<crate::resources::DamageChart>()
+        .insert_damage(UnitType::HeavySpGun, UnitType::Infantry, 70);
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.scope = CapitalRouteNodeScope::Area;
+    order.objective = CapitalRouteNodeObjective::Control;
+    order.control_area = vec![pos(14, 2), pos(15, 2)];
+    order.execution_target = pos(14, 2);
+    assert_eq!(
+        super::tactical::capital_route_tactical_target(&world, PlayerId(1), entity),
+        Some(Some(pos(15, 2))),
+        "地域外の火力へ排除対象を渡す"
+    );
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((actor, crate::ai::command::AiCommand::Attack { target_entity, .. })) if actor==entity && target_entity==enemy),
+        "射撃位置から地域内の敵を攻撃する: {decision:?}"
+    );
+    world.despawn(enemy);
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((actor, crate::ai::command::AiCommand::Wait { target_pos })) if actor==entity && target_pos==pos(14, 2)),
+        "敵排除後に入口手前で止まらず空いた地域へ進む: {decision:?}"
+    );
+}
+
+/// 前提地域が未制圧でも、現地へ実到達した部隊をLockedとして無視・後退指示しない。
+#[test]
+fn actual_arrival_observes_contested_region_and_keeps_forward_squad_there() {
+    let master = MasterDataRegistry::load().unwrap();
+    let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+        &master,
+        "map_20",
+        GridTopology::Hex,
+    )
+    .unwrap();
+    let player = PlayerId(1);
+    prepare_capital_route_topologies(&mut world, player);
+    ensure_capital_route_node_operations(&mut world, player);
+    let (key, topology) = world
+        .resource::<CapitalRouteTopologyRegistry>()
+        .topologies
+        .iter()
+        .find(|(key, _)| key.player_id == player)
+        .unwrap();
+    let key = *key;
+    let goal = topology.nodes[topology.goal_node.0].anchor;
+    let id = CapitalRouteNodeOperationId {
+        topology: key,
+        anchor: goal,
+    };
+    let area = world
+        .resource::<CapitalRouteNodeOperationRegistry>()
+        .operations[&id]
+        .control_area
+        .clone();
+    let operations = &world
+        .resource::<CapitalRouteNodeOperationRegistry>()
+        .operations;
+    let predecessors = &operations[&id].predecessors;
+    let arrival = area
+        .iter()
+        .copied()
+        .filter(|at| {
+            *at != goal
+                && predecessors
+                    .iter()
+                    .all(|id| !operations[id].control_area.contains(at))
+                && world
+                    .resource::<Map>()
+                    .get_terrain(at.x, at.y)
+                    .is_some_and(|terrain| {
+                        crate::systems::movement::get_valid_movement_cost(
+                            &master,
+                            MovementType::Tank,
+                            terrain,
+                        )
+                        .is_some()
+                    })
+        })
+        .min_by_key(|at| progress_order(&topology.from_home, *at))
+        .unwrap();
+    let stats = master
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Tank.as_str().to_owned(),
+        ))
+        .unwrap();
+    let forward = world
+        .spawn((
+            Faction(player),
+            arrival,
+            stats.clone(),
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    for at in area.into_iter().filter(|at| *at != arrival).take(2) {
+        world.spawn((
+            Faction(PlayerId(2)),
+            at,
+            stats.clone(),
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+    }
+    let squad_id = assign_route_squad(&mut world, player, MissionType::Attack, &[forward]);
+    let mut manager = world
+        .remove_resource::<crate::ai::squad::SquadManager>()
+        .unwrap();
+    let squad = manager
+        .squads
+        .iter_mut()
+        .find(|squad| squad.id == squad_id)
+        .unwrap();
+    squad.plan.target = Some(goal);
+    squad.plan.target_island = Some(key.island_id);
+    let carrier = world.spawn_empty().id();
+    world
+        .entity_mut(forward)
+        .insert(crate::components::Transporting(carrier));
+    refresh_capital_route_node_operations(&mut world, player, &manager);
+    assert_eq!(
+        world
+            .resource::<CapitalRouteNodeOperationRegistry>()
+            .operations[&id]
+            .state,
+        victory_roadmap::RoadmapNodeState::Locked,
+        "輸送中の荷物を到達済み戦力へ数えない"
+    );
+    world
+        .entity_mut(forward)
+        .remove::<crate::components::Transporting>();
+    refresh_capital_route_node_operations(&mut world, player, &manager);
+    let registry = world.resource::<CapitalRouteNodeOperationRegistry>();
+    assert!(!capital_route_node_predecessors_released(
+        &registry.operations,
+        &registry.operations[&id]
+    ));
+    assert_eq!(
+        registry.operations[&id].state,
+        victory_roadmap::RoadmapNodeState::Contested,
+        "現地の戦闘をLockedで隠さない"
+    );
+    super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+    let order = &world.resource::<CapitalRoutePathRegistry>().commitments[&squad_id];
+    assert_eq!(order.target_anchor, goal, "前衛を前提地域へ呼び戻さない");
+    assert_eq!(order.phase, CapitalRouteExecutionPhase::Advance);
+}
+
+#[test]
+fn regional_control_area_does_not_include_nearby_ground_across_an_uncrossed_bridge() {
+    let mut map = flat_map(9, 5);
+    for y in 0..5 {
+        map.set_terrain(4, y, Terrain::River).unwrap();
+    }
+    map.set_terrain(4, 2, Terrain::Bridge).unwrap();
+    let islands = crate::ai::islands::IslandMap::analyze(&map);
+    let island = islands.get_island_at(&pos(3, 2)).unwrap().id;
+    let regions = paint_capital_route_regions(&map, &islands, island, &[area_seed(pos(3, 2), &[])]);
+    let area = &regions[0];
+    assert!(area.contains(&pos(3, 3)));
+    assert!(
+        !area.contains(&pos(5, 2)),
+        "橋の対岸を同じ局地制圧地域へ数えない"
+    );
+}
+
+/// 首都という終点と、目の前の地域の制圧工程を同じ座標へ潰さない。
+#[test]
+fn regional_offensive_has_capital_destination_and_a_separate_current_region() {
+    let player = PlayerId(1);
+    let (mut world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).unwrap();
+    let home = topology.nodes[topology.start_node.0].anchor;
+    let goal = topology.nodes[topology.goal_node.0].anchor;
+    let front = capital_route_dag_frontier_properties(&world, player, island)
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .next()
+        .unwrap();
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Tank.as_str().to_owned(),
+        ))
+        .unwrap();
+    let entity = world
+        .spawn((
+            Faction(player),
+            home,
+            stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    let id = assign_route_squad(&mut world, player, MissionType::Attack, &[entity]);
+    let mut manager = world
+        .remove_resource::<crate::ai::squad::SquadManager>()
+        .unwrap();
+    let squad = manager
+        .squads
+        .iter_mut()
+        .find(|squad| squad.id == id)
+        .unwrap();
+    squad.plan.target = Some(front);
+    squad.plan.target_island = Some(island);
+    super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+    let order = &world.resource::<CapitalRoutePathRegistry>().commitments[&id];
+    assert_eq!(order.target, goal, "前進作戦は首都という終点を失わない");
+    assert_ne!(
+        order.target_anchor, goal,
+        "手前の未制圧地域の処理を飛ばさない"
+    );
+    assert_eq!(order.phase, CapitalRouteExecutionPhase::Advance);
+}
+
+/// DAGの制圧役を指示台帳だけに留めず、実際の攻撃可否まで渡す。
+#[test]
+fn advancing_control_accepts_required_attack_but_holding_defense_does_not() {
+    use crate::components::Ammo;
+    let (mut world, entity, squad) = standard_region_world();
+    world.entity_mut(entity).insert(pos(13, 2));
+    let enemy_stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::TankZ.as_str().to_owned(),
+        ))
+        .unwrap();
+    let enemy = world
+        .spawn((
+            Faction(PlayerId(2)),
+            pos(14, 2),
+            Health {
+                current: 100,
+                max: 100,
+            },
+            Ammo {
+                ammo1: enemy_stats.max_ammo1,
+                max_ammo1: enemy_stats.max_ammo1,
+                ammo2: enemy_stats.max_ammo2,
+                max_ammo2: enemy_stats.max_ammo2,
+            },
+            enemy_stats,
+        ))
+        .id();
+    let mut chart = world.resource_mut::<crate::resources::DamageChart>();
+    chart.insert_damage(UnitType::Tank, UnitType::TankZ, 5);
+    chart.insert_damage(UnitType::TankZ, UnitType::Tank, 90);
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.scope = CapitalRouteNodeScope::Area;
+    order.control_area = vec![pos(14, 2)];
+    order.execution_target = pos(14, 2);
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((actor, crate::ai::command::AiCommand::Attack { target_entity, .. })) if actor == entity && target_entity == enemy),
+        "前進Controlの必要攻撃をDefenseとして拒否しない: {decision:?}"
+    );
+    world
+        .resource_mut::<CapitalRoutePathRegistry>()
+        .commitments
+        .get_mut(&squad)
+        .unwrap()
+        .phase = CapitalRouteExecutionPhase::Hold;
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        !matches!(decision, Some((_, crate::ai::command::AiCommand::Attack { target_entity, .. })) if target_entity == enemy),
+        "Holdの守備隊まで不利交換へ転用しない: {decision:?}"
+    );
+}
+
+/// まだ誰も渡っていない橋では、直接部隊（先遣の歩兵と戦車）を優先して前進させ、
+/// 間接火力は橋の手前の待機線で控えさせる。
+#[test]
+fn control_bridge_advances_direct_units_first_and_stages_indirect_fire() {
+    let master = MasterDataRegistry::load().unwrap();
+    let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+        &master,
+        "map_26",
+        GridTopology::Square,
+    )
+    .unwrap();
+    let player = PlayerId(1);
+    let ids = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let property = entity.get::<Property>()?;
+            (property.terrain != Terrain::Capital || property.owner_id == Some(player))
+                .then_some(entity.id())
+        })
+        .collect::<Vec<_>>();
+    for id in ids {
+        world.get_mut::<Property>(id).unwrap().owner_id = Some(player);
+    }
+    prepare_capital_route_topologies(&mut world, player);
+    ensure_capital_route_node_operations(&mut world, player);
+    let (key, topology) = world
+        .resource::<CapitalRouteTopologyRegistry>()
+        .topologies
+        .iter()
+        .find(|(key, _)| key.player_id == player)
+        .unwrap();
+    let island = key.island_id;
+    let gate = topology.routes[0].front;
+    let map = world.resource::<Map>();
+    let bank = map
+        .get_adjacent(gate.x, gate.y)
+        .into_iter()
+        .map(|(x, y)| pos(x, y))
+        .find(|at| {
+            topology
+                .from_home
+                .get(at)
+                .is_some_and(|progress| *progress < topology.from_home[&gate])
+                && map.get_terrain(at.x, at.y) != Some(Terrain::Bridge)
+        })
+        .unwrap();
+    let mut squads = Vec::new();
+    for (unit_type, mission) in [
+        (UnitType::Infantry, MissionType::Capture),
+        (UnitType::Tank, MissionType::Attack),
+        (UnitType::Artillery, MissionType::Attack),
+        (UnitType::HeavySpGun, MissionType::Attack),
+    ] {
+        let stats = master
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                unit_type.as_str().to_owned(),
+            ))
+            .unwrap();
+        let entity = world
+            .spawn((
+                Faction(player),
+                bank,
+                stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        squads.push(assign_route_squad(&mut world, player, mission, &[entity]));
+    }
+    let mut manager = world
+        .remove_resource::<crate::ai::squad::SquadManager>()
+        .unwrap();
+    for squad in &mut manager.squads {
+        // この検査は同じ橋に配属された直接役・間接役の枠配分を扱う。
+        // 全方面の合流点である首都ではなく、検査対象の橋を明示する。
+        squad.plan.target = Some(gate);
+        squad.plan.target_island = Some(island);
+    }
+    super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+    let paths = world.resource::<CapitalRoutePathRegistry>();
+    for id in &squads {
+        assert_eq!(paths.commitments[id].scope, CapitalRouteNodeScope::Point);
+    }
+    for id in &squads[..2] {
+        assert_eq!(
+            paths.commitments[id].phase,
+            CapitalRouteExecutionPhase::Advance,
+            "歩兵と戦車は続けて橋を渡る"
+        );
+    }
+    for id in &squads[2..] {
+        assert_eq!(
+            paths.commitments[id].phase,
+            CapitalRouteExecutionPhase::Stage,
+            "間接火力は直接部隊が渡るまで橋へ出ない"
+        );
+    }
+    assert_eq!(
+        paths.commitments[&squads[0]].target_anchor,
+        paths.commitments[&squads[1]].target_anchor
+    );
+}
+
+fn topology_route_count(
+    world: &World,
+    player: PlayerId,
+    island: crate::ai::islands::IslandId,
+) -> usize {
+    capital_route_topology_for(world, player, island)
+        .unwrap()
+        .routes
+        .len()
+}
+
+/// 砲兵の射撃位置と進軍作戦の最終目的を混同しない。
+#[test]
+fn gun_route_membership_preserves_capital_destination_despite_rear_firing_position() {
+    let player = PlayerId(1);
+    let (mut world, island) = map6_route_world(player);
+    let topology = capital_route_topology_for(&world, player, island).unwrap();
+    let home = topology.nodes[topology.start_node.0].anchor;
+    let goal = topology.nodes[topology.goal_node.0].anchor;
+    let property = capital_route_dag_frontier_properties(&world, player, island)
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .next()
+        .unwrap();
+    let front = topology.routes[topology.property_routes[&property].0].front;
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Artillery.as_str().to_owned(),
+        ))
+        .unwrap();
+    let entity = world
+        .spawn((
+            Faction(player),
+            home,
+            stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    let id = assign_route_squad(&mut world, player, MissionType::Attack, &[entity]);
+    let mut manager = world
+        .remove_resource::<crate::ai::squad::SquadManager>()
+        .unwrap();
+    let squad = manager
+        .squads
+        .iter_mut()
+        .find(|squad| squad.id == id)
+        .unwrap();
+    // 射撃位置は自領後方でも、本隊の進軍路と最終目的は失わない。
+    squad.plan.target = Some(home);
+    squad.plan.target_island = Some(island);
+    manager.route_operation_members.insert(entity, front);
+    super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
+    let order = &world.resource::<CapitalRoutePathRegistry>().commitments[&id];
+    // 枝は割当枠と小隊目標で決まる（出撃位置から最寄りの枝へ固定しない）。
+    assert!(order.route.0 < topology_route_count(&world, player, island));
+    assert_eq!(order.target, goal, "前進作戦は首都という終点を失わない");
+    assert_ne!(
+        order.target_anchor, goal,
+        "手前の未制圧地域の処理を飛ばさない"
+    );
+    assert_eq!(order.phase, CapitalRouteExecutionPhase::Advance);
+}
+
+/// 橋の出口を踏む役と、その外から撃つ役の完了条件を混同しない。
+#[test]
+fn point_fire_support_does_not_require_occupancy_while_assault_units_advance() {
+    use crate::ai::operation_assignment::{
+        OperationOwner, OperationUnitRole, UnitOperationAssignment, UnitOperationRegistry,
+    };
+    let (mut world, gun, squad) = standard_region_world();
+    let gun_stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Artillery.as_str().to_owned(),
+        ))
+        .unwrap();
+    world.entity_mut(gun).insert(gun_stats);
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.scope = CapitalRouteNodeScope::Point;
+    order.objective = CapitalRouteNodeObjective::Control;
+    order.control_area = vec![pos(14, 2)];
+    order.execution_target = pos(14, 2);
+    order.target_anchor = pos(14, 2);
+    let direct_order = order.clone();
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Tank.as_str().to_owned(),
+        ))
+        .unwrap();
+    let tank = world
+        .spawn((
+            Faction(PlayerId(1)),
+            pos(5, 2),
+            stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    let tank_squad = assign_route_squad(&mut world, PlayerId(1), MissionType::Attack, &[tank]);
+    world.resource_mut::<UnitOperationRegistry>().assign(
+        tank,
+        UnitOperationAssignment {
+            owner: OperationOwner::Campaign {
+                player_id: PlayerId(1),
+                island_id: crate::ai::islands::IslandId(0),
+            },
+            squad_id: Some(tank_squad),
+            role: OperationUnitRole::Member,
+            assigned_turn: 1,
+        },
+    );
+    world
+        .resource_mut::<CapitalRoutePathRegistry>()
+        .commitments
+        .insert(tank_squad, direct_order);
+    assert!(
+        !super::tactical::capital_route_target_requires_occupancy(
+            &world,
+            PlayerId(1),
+            gun,
+            pos(14, 2)
+        ),
+        "間接火力は出口へ乗らず射程内から支える"
+    );
+    assert!(
+        super::tactical::capital_route_target_requires_occupancy(
+            &world,
+            PlayerId(1),
+            tank,
+            pos(14, 2)
+        ),
+        "戦車は射程内の手前で接近完了とせず、空いた出口へ進む"
+    );
+    world.despawn(tank);
+    assert!(
+        super::tactical::capital_route_target_requires_occupancy(
+            &world,
+            PlayerId(1),
+            gun,
+            pos(14, 2)
+        ),
+        "通過役がいなくなれば砲兵自身でも出口へ進める"
+    );
+}
+
+/// 通常戦術（tactics/v2）は攻撃対象を地域内外で絞り込まず、既存の採点だけで選ぶ。
+/// 地域の障害を先に撃つ順序付けは、手番ループの撃破→進入の段（fire_follow_order）が担う。
+/// （試作の「地域外の有利交換を戦略標的から外す」制約は計画3-2で差し戻した。）
+#[test]
+fn standard_tactics_do_not_filter_attack_targets_by_region() {
+    let (mut world, gun, squad) = standard_region_world();
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Artillery.as_str().to_owned(),
+        ))
+        .unwrap();
+    world.entity_mut(gun).insert(stats);
+    let make_enemy = |world: &mut World, kind: UnitType, at, hp| {
+        let stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                kind.as_str().to_owned(),
+            ))
+            .unwrap();
+        world
+            .spawn((
+                Faction(PlayerId(2)),
+                at,
+                stats,
+                Health {
+                    current: hp,
+                    max: 100,
+                },
+            ))
+            .id()
+    };
+    let blocker = make_enemy(&mut world, UnitType::Infantry, pos(14, 2), 100);
+    let unrelated = make_enemy(&mut world, UnitType::HeavySpGun, pos(5, 2), 20);
+    let mut chart = world.resource_mut::<crate::resources::DamageChart>();
+    chart.insert_damage(UnitType::Artillery, UnitType::Infantry, 95);
+    chart.insert_damage(UnitType::Artillery, UnitType::HeavySpGun, 88);
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.scope = CapitalRouteNodeScope::Point;
+    order.objective = CapitalRouteNodeObjective::Control;
+    order.control_area = vec![pos(14, 2)];
+    order.target_anchor = pos(14, 2);
+    order.execution_target = pos(14, 2);
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((actor, crate::ai::command::AiCommand::Attack { target_entity, .. }))
+        if actor==gun && target_entity==unrelated),
+        "地域外の有利な射撃を禁止しない（採点どおり高価な敵を撃つ）: {decision:?}"
+    );
+    world.despawn(unrelated);
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((actor, crate::ai::command::AiCommand::Attack { target_entity, .. }))
+        if actor==gun && target_entity==blocker),
+        "地域内の障害も通常の攻撃候補に残る: {decision:?}"
+    );
+}
+
+/// 工場からの退避だけ古いSquad目標へ進むと、最初の一歩で別の進軍路へ逸れる。
+#[test]
+fn standard_factory_relief_uses_each_units_committed_region() {
+    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::MainCompatible);
+    let (mut world, entity, squad) = standard_region_world();
+    let player = PlayerId(1);
+    for (at, terrain) in [
+        (pos(10, 2), Terrain::Factory),
+        (pos(10, 3), Terrain::Capital),
+    ] {
+        world
+            .resource_mut::<Map>()
+            .set_terrain(at.x, at.y, terrain)
+            .unwrap();
+        world.spawn((at, Property::new(terrain, Some(player), 100)));
+    }
+    world
+        .resource_mut::<CapitalRoutePathRegistry>()
+        .commitments
+        .get_mut(&squad)
+        .unwrap()
+        .phase = CapitalRouteExecutionPhase::Advance;
+    let decision = crate::ai::tactics::relief::decide_early_campaign_site_relief(
+        &mut world,
+        player,
+        &HashSet::default(),
+        true,
+    );
+    assert!(
+        matches!(decision, Some((actor, crate::ai::command::AiCommand::Wait { target_pos }))
+        if actor==entity && target_pos.x < 10),
+        "旧Squadの東側目標でなく確定済み西側地域へ工場を空ける: {decision:?}"
+    );
+}
+
+/// 敵が残る地域への進入と射撃支援を同じ「射程内への接近」で終わらせない。
+#[test]
+fn direct_assault_keeps_physical_entry_while_regional_enemy_remains() {
+    let (mut world, entity, squad) = standard_region_world();
+    world.entity_mut(entity).insert(pos(13, 2));
+    let stats = world
+        .resource::<MasterDataRegistry>()
+        .create_unit_stats(&crate::resources::master_data::UnitName(
+            UnitType::Infantry.as_str().to_owned(),
+        ))
+        .unwrap();
+    let enemy = world
+        .spawn((
+            Faction(PlayerId(2)),
+            pos(15, 2),
+            stats,
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ))
+        .id();
+    world
+        .resource_mut::<crate::resources::DamageChart>()
+        .insert_damage(UnitType::Tank, UnitType::Infantry, 70);
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.phase = CapitalRouteExecutionPhase::Advance;
+    order.scope = CapitalRouteNodeScope::Area;
+    order.objective = CapitalRouteNodeObjective::Control;
+    order.control_area = vec![pos(14, 2), pos(15, 2)];
+    order.execution_target = pos(14, 2);
+    assert_eq!(
+        super::tactical::capital_route_tactical_target(&world, PlayerId(1), entity),
+        Some(Some(pos(14, 2))),
+        "敵への射程ではなく空き入口への実進入を要求する"
+    );
+    assert!(super::tactical::capital_route_target_requires_occupancy(
+        &world,
+        PlayerId(1),
+        entity,
+        pos(14, 2)
+    ));
+    let decision =
+        crate::ai::tactics::v2::decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((actor, crate::ai::command::AiCommand::Attack { target_entity, target_pos })) if actor == entity && target_entity == enemy && target_pos == pos(14, 2)),
+        "地域内に進入し、残敵への攻撃を継続する: {decision:?}"
     );
 }

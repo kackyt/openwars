@@ -2330,6 +2330,8 @@ fn assign_campaign_responsibilities_scoped(
     managed_missions: &[MissionType],
     scope: CampaignAssignmentScope<'_>,
 ) {
+    // 作戦目標を更新しても、異なる入口を実通過した部隊を一つの小隊へ合流させない。
+    responsibilities = route_partition::partition(world, player_id, responsibilities);
     // 生産目的が続くSquadはcampaign再編の受入先に転用せず、空になっても解散しない。
     // 後段の配備接続が同じidentityへ差分を戻すため、新しい孤立Entityを生まない。
     let deployment_ids = world
@@ -3776,11 +3778,8 @@ fn reconnect_current_v4_operations(
             );
         }
         let mut local = assignment.clone();
-        for entities in [
-            &mut local.transport_entities,
-            &mut local.capture_entities,
-            &mut local.combat_entities,
-        ] {
+        // 既存の戦闘員は作戦の充足度を測る文脈として残す。再編入はscopeが制限する。
+        for entities in [&mut local.transport_entities, &mut local.capture_entities] {
             entities.retain(|entity| repair_entities.contains(entity));
         }
         // 現在のCapture担当がいる施設へ修復要員を重ねず、未担当施設を優先する。
@@ -3832,6 +3831,12 @@ fn reconnect_current_v4_operations(
                 .capture_target_positions
                 .sort_by_key(|target| (target.y, target.x));
         }
+        let existing_routes = manager
+            .route_operation_members
+            .iter()
+            .filter(|(entity, _)| !repair_entities.contains(entity))
+            .map(|(entity, target)| (*entity, *target))
+            .collect::<HashMap<_, _>>();
         prepare_campaign_local_assignment_scoped(
             world,
             manager,
@@ -3840,6 +3845,11 @@ fn reconnect_current_v4_operations(
             &mut connectivity,
             CampaignAssignmentScope::Reconnect(&repair_entities),
         );
+        // 再接続は既存部隊のルート所属を変更しない。
+        manager
+            .route_operation_members
+            .retain(|entity, _| repair_entities.contains(entity));
+        manager.route_operation_members.extend(existing_routes);
     }
     let pending_deployment = world
         .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
@@ -5612,6 +5622,7 @@ mod tests {
                 unit_type: UnitType::Tank,
                 movement_type: MovementType::Tank,
                 max_movement: 6,
+                max_range: 1,
                 cost: 7000,
                 ..UnitStats::mock()
             },
@@ -5627,6 +5638,7 @@ mod tests {
                     unit_type: UnitType::Tank,
                     movement_type: MovementType::Tank,
                     max_movement: 6,
+                    max_range: 1,
                     cost: 7000,
                     ..UnitStats::mock()
                 },
@@ -5646,12 +5658,26 @@ mod tests {
                     unit_type: UnitType::Tank,
                     movement_type: MovementType::Tank,
                     max_movement: 6,
+                    max_range: 1,
                     cost: 7000,
                     ..UnitStats::mock()
                 },
                 Health {
                     current: 100,
                     max: 100,
+                },
+            ))
+            .id();
+
+        // 非武装の補給車は戦闘小隊に混入しない。
+        let support = world
+            .spawn((
+                p1,
+                Faction(p1),
+                GridPosition { x: 2, y: 4 },
+                UnitStats {
+                    unit_type: UnitType::SupplyTruck,
+                    ..UnitStats::mock()
                 },
             ))
             .id();
@@ -5673,6 +5699,16 @@ mod tests {
         );
         assert!(attack_squads[0].members.contains(&u1));
         assert!(attack_squads[0].members.contains(&u2));
+        assert!(
+            manager
+                .squads
+                .iter()
+                .filter(|s| matches!(
+                    s.plan.mission_type,
+                    MissionType::Attack | MissionType::Defense
+                ))
+                .all(|s| !s.members.contains(&support))
+        );
         assert_eq!(
             attack_squads[0].plan.target,
             Some(GridPosition { x: 8, y: 8 })
@@ -11266,6 +11302,7 @@ mod local_assignment;
 mod objective_allocation;
 mod planning_policy;
 mod route_operations;
+mod route_partition;
 
 // 再編本体と通常／拡張hookの差分契約。
 // 未追跡のテスト資産のため、ファイルが存在する場合だけ build.rs がcfgを立てる。

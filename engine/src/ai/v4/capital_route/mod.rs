@@ -8,6 +8,8 @@ pub(crate) mod tactical;
 pub(crate) mod topology;
 
 #[cfg(test)]
+pub(crate) mod carried_tests;
+#[cfg(test)]
 mod tests;
 
 /// 静的DAGを準備してから、そのトポロジーに対応するNode作戦を用意する。

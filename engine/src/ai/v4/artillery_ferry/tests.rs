@@ -109,13 +109,6 @@ fn empty_truck_goes_next_to_an_idle_gun() {
 }
 
 #[test]
-fn full_fuel_does_not_make_a_gun_need_refueling() {
-    assert!(!needs_refueling(Some(1), 1));
-    assert!(needs_refueling(Some(0), 1));
-    assert!(!needs_refueling(None, 1));
-}
-
-#[test]
 fn landers_are_not_artillery_carriers() {
     let registry = MasterDataRegistry::load().unwrap();
     let stats = |unit_type: UnitType| {
@@ -164,27 +157,64 @@ fn truck_next_to_an_engaged_gun_stays_instead_of_fetching_another() {
     ));
 }
 
+/// 敵を射程に収める陣地へ運べるなら、手前の自軍都市で降ろさずに前へ運ぶ。
+/// 砲台は射程に多くの敵を収めて初めて役に立つので、撃てない都市に据えて待たない。
 #[test]
-fn truck_emplaces_the_gun_on_the_frontline_city_before_enemies_arrive() {
+fn truck_carries_the_gun_past_an_idle_city_toward_a_covering_site() {
     let mut world = line_world();
-    // x=9 が自軍の都市。敵の重自走砲(x=1)はまだ遠く、どこからも撃てない。
+    // x=9 が自軍の都市。そこからは敵の重自走砲(x=1)を射程に捉えられない。
     world
         .resource_mut::<Map>()
         .set_terrain(9, 0, Terrain::City)
         .unwrap();
     property(&mut world, 1, 9, 0);
-    // 輸送車(x=14)の届く範囲からは、どこへ降ろしても重自走砲を射程に捉えられない。
     let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 14, 0);
-    let gun = load(&mut world, truck, UnitType::Artillery, 1);
+    load(&mut world, truck, UnitType::Artillery, 1);
     spawn(&mut world, 2, UnitType::HeavySpGun, 1, 0);
 
     let (entity, command) = decide(&mut world).unwrap();
     assert_eq!(entity, truck);
-    assert!(matches!(
-        command,
-        AiCommand::Drop { cargo_drop_pos, cargo_entity, .. }
-            if cargo_drop_pos == GridPosition { x: 9, y: 0 } && cargo_entity == gun
-    ));
+    match command {
+        AiCommand::Wait { target_pos } => assert!(target_pos.x < 14, "前へ運ぶ: {target_pos:?}"),
+        other => panic!("撃てない都市で降ろさず前へ運ぶはず: {other:?}"),
+    }
+}
+
+/// 射程に収める敵が多い陣地を、手前の少ない陣地より優先する。
+#[test]
+fn truck_drops_where_more_enemies_are_in_range() {
+    let mut world = naval_world(&["H..............H"]);
+    property(&mut world, 2, 0, 0);
+    property(&mut world, 1, 15, 0);
+    let mut chart = DamageChart::new();
+    chart.insert_damage(UnitType::Artillery, UnitType::Infantry, 95);
+    world.insert_resource(chart);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 13, 0);
+    let gun = load(&mut world, truck, UnitType::Artillery, 1);
+    // x=1 と x=4 に敵歩兵。輸送車に近い x=8〜9 からは x=4 の1体しか射程（3〜6）に入らない。
+    spawn(&mut world, 2, UnitType::Infantry, 1, 0);
+    spawn(&mut world, 2, UnitType::Infantry, 4, 0);
+    let (entity, command) = decide(&mut world).unwrap();
+    assert_eq!(entity, truck);
+    let AiCommand::Drop {
+        cargo_drop_pos,
+        cargo_entity,
+        ..
+    } = command
+    else {
+        panic!("降ろすはず: {command:?}");
+    };
+    assert_eq!(cargo_entity, gun);
+    // 砲台の射程は3〜6。x=7 なら x=1(距離6) と x=4(距離3) の両方を収める。
+    let map = world.resource::<Map>();
+    let covered = [1, 4]
+        .iter()
+        .filter(|x| (3..=6).contains(&map.distance(cargo_drop_pos.x, 0, **x, 0)))
+        .count();
+    assert_eq!(
+        covered, 2,
+        "2体とも射程に収める位置へ降ろす: {cargo_drop_pos:?}"
+    );
 }
 
 #[test]
@@ -387,6 +417,7 @@ fn set_previous_guns(world: &mut World, seen: &[Entity]) {
     memory.by_player.insert(
         PlayerId(1),
         GunRoutes {
+            regions: HashMap::default(),
             turn: u32::MAX,
             routes: HashMap::default(),
             seen: seen.iter().copied().collect(),
@@ -396,7 +427,7 @@ fn set_previous_guns(world: &mut World, seen: &[Entity]) {
 }
 
 #[test]
-fn gun_away_from_its_attack_route_boards_even_with_a_target_in_range() {
+fn gun_away_from_its_attack_route_fires_at_a_target_in_range() {
     let mut world = naval_world(&["H.............................H"]);
     property(&mut world, 2, 0, 0);
     property(&mut world, 1, 30, 0);
@@ -404,7 +435,7 @@ fn gun_away_from_its_attack_route_boards_even_with_a_target_in_range() {
     chart.insert_damage(UnitType::Artillery, UnitType::HeavySpGun, 88);
     world.insert_resource(chart);
     // 攻めの進軍路の要衝は x=3、守りの進軍路の要衝は x=29。新しく作った砲台(x=16)は
-    // 攻めの進軍路へ割り当てられ、目の前の重自走砲(x=21)を撃てても、積んで攻めの側へ運ぶ。
+    // 攻めの進軍路へ割り当てられていても、目の前の重自走砲(x=21)を先に撃つ。
     set_route_posture(
         &mut world,
         GridPosition { x: 3, y: 0 },
@@ -412,18 +443,15 @@ fn gun_away_from_its_attack_route_boards_even_with_a_target_in_range() {
     );
     set_previous_guns(&mut world, &[]);
     let gun = spawn(&mut world, 1, UnitType::Artillery, 16, 0);
-    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 15, 0);
+    let _truck = spawn(&mut world, 1, UnitType::SupplyTruck, 15, 0);
     spawn(&mut world, 2, UnitType::HeavySpGun, 21, 0);
     spawn(&mut world, 2, UnitType::HeavySpGun, 0, 0);
 
     let (entity, command) = decide(&mut world).unwrap();
     assert_eq!(entity, gun);
     assert!(
-        matches!(
-            command,
-            AiCommand::Load { transport_entity, .. } if transport_entity == truck
-        ),
-        "攻めの進軍路へ運ぶために輸送車へ乗るはず: {command:?}"
+        matches!(command, AiCommand::Attack { .. }),
+        "射程内の敵へ先に射撃する: {command:?}"
     );
 }
 
@@ -542,6 +570,7 @@ fn gun_assigned_to_a_route_that_turned_defensive_keeps_its_post() {
     memory.by_player.insert(
         PlayerId(1),
         GunRoutes {
+            regions: HashMap::default(),
             turn: u32::MAX,
             routes: [(gun, GridPosition { x: 12, y: 0 })].into_iter().collect(),
             seen: [gun].into_iter().collect(),
@@ -559,33 +588,29 @@ fn gun_assigned_to_a_route_that_turned_defensive_keeps_its_post() {
 }
 
 #[test]
-fn defending_gun_beyond_range_of_its_post_returns() {
+fn defending_gun_beyond_range_of_its_post_fires_before_returning() {
     let mut world = naval_world(&["H.............................H"]);
     property(&mut world, 2, 0, 0);
     property(&mut world, 1, 30, 0);
     let mut chart = DamageChart::new();
     chart.insert_damage(UnitType::Artillery, UnitType::HeavySpGun, 88);
     world.insert_resource(chart);
-    // 守りの要衝(x=25)から射程(6)より前(x=17)へ出た守りの砲台は、撃てる敵(x=12)が居ても
-    // 追わずに積んで守り場所へ戻す。
+    // 守りの要衝(x=25)から離れた砲台も、射程内の敵(x=12)を先に撃つ。
     set_route_posture(
         &mut world,
         GridPosition { x: 3, y: 0 },
         GridPosition { x: 25, y: 0 },
     );
     let gun = spawn(&mut world, 1, UnitType::Artillery, 17, 0);
-    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 18, 0);
+    let _truck = spawn(&mut world, 1, UnitType::SupplyTruck, 18, 0);
     spawn(&mut world, 2, UnitType::HeavySpGun, 12, 0);
     set_previous_guns(&mut world, &[gun]);
 
     let (entity, command) = decide(&mut world).unwrap();
     assert_eq!(entity, gun);
     assert!(
-        matches!(
-            command,
-            AiCommand::Load { transport_entity, .. } if transport_entity == truck
-        ),
-        "守り場所へ戻るために輸送車へ乗るはず: {command:?}"
+        matches!(command, AiCommand::Attack { .. }),
+        "守備位置へ戻る前に射撃する: {command:?}"
     );
 }
 
@@ -643,4 +668,297 @@ fn defending_gun_near_its_post_waits_without_a_target() {
         ),
         "その場で待つはず: {command:?}"
     );
+}
+
+#[test]
+fn ferry_defers_boarding_until_after_normal_actions() {
+    let mut world = line_world();
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 11, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 10, 0);
+    spawn(&mut world, 2, UnitType::HeavySpGun, 2, 0);
+    let skip = HashSet::default();
+    assert!(decide_artillery_ferry_phase(&mut world, PlayerId(1), &skip, false).is_none());
+    assert!(
+        matches!(decide_artillery_ferry_phase(&mut world, PlayerId(1), &skip, true),
+        Some((entity, AiCommand::Load { transport_entity, .. })) if entity == gun && transport_entity == truck)
+    );
+}
+
+#[test]
+fn unassigned_deployed_gun_without_a_destination_does_not_board() {
+    let mut world = naval_world(&["........."]);
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 4, 0);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 5, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let action = decide(&mut world);
+    assert!(
+        !matches!(action, Some((entity, AiCommand::Load { .. })) if entity == gun),
+        "目標も展開先もない砲台を積み直さない: {action:?}"
+    );
+}
+
+/// 砲台も、小隊へ確定したDAG地域を運搬先の正本として使う。
+#[test]
+fn forward_gun_transport_uses_committed_region_including_cached_and_loaded_steps() {
+    use crate::ai::v4::capital_route::model::{
+        CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteId,
+        CapitalRouteNodeObjective, CapitalRouteNodeScope, CapitalRoutePathRegistry,
+    };
+    let mut world = line_world();
+    let player = PlayerId(1);
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 12, 0);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 13, 0);
+    spawn(&mut world, 2, UnitType::HeavySpGun, 0, 0);
+    let squad = crate::ai::v4::test_support::assign_route_squad(
+        &mut world,
+        player,
+        crate::ai::squad::MissionType::Attack,
+        &[gun],
+    );
+    let goal = GridPosition { x: 1, y: 0 };
+    world.insert_resource(CapitalRoutePathRegistry {
+        commitments: HashMap::from_iter([(
+            squad,
+            CapitalRouteCommitment {
+                player_id: player,
+                island_id: crate::ai::islands::IslandId(0),
+                route: CapitalRouteId(0),
+                target: goal,
+                target_anchor: goal,
+                objective: CapitalRouteNodeObjective::Control,
+                scope: CapitalRouteNodeScope::Area,
+                control_area: vec![goal],
+                capture_targets: Vec::new(),
+                crossing_exit: None,
+                crossed: false,
+                execution_target: goal,
+                frontline_capacity: 1,
+                path: vec![GridPosition { x: 12, y: 0 }, goal],
+                phase: CapitalRouteExecutionPhase::Advance,
+            },
+        )]),
+        ..Default::default()
+    });
+    set_previous_guns(&mut world, &[gun]);
+    let previous = world
+        .resource_mut::<GunRouteAssignment>()
+        .into_inner()
+        .by_player
+        .get_mut(&player)
+        .unwrap();
+    previous.turn = 1;
+    previous.routes.insert(gun, GridPosition { x: 12, y: 0 });
+    assert_eq!(
+        update_gun_routes(&mut world, player, 1)[&gun],
+        goal,
+        "キャッシュした後方要衝で地域指示を上書きしない"
+    );
+    assert_eq!(assigned_attack_route(&world, player, gun), Some(goal));
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision,Some((actor,AiCommand::Load{transport_entity,..})) if actor==gun && transport_entity==truck),
+        "前進先の敵を撃つために実際に搭載する: {decision:?}"
+    );
+    let next = GridPosition { x: 2, y: 0 };
+    world
+        .resource_mut::<CapitalRoutePathRegistry>()
+        .commitments
+        .get_mut(&squad)
+        .unwrap()
+        .execution_target = next;
+    assert_eq!(
+        update_gun_routes(&mut world, player, 1)[&gun],
+        next,
+        "同手番の新しい確定指示も配送へ渡す"
+    );
+    world.entity_mut(gun).insert(Transporting(truck));
+    world
+        .resource_mut::<CapitalRoutePathRegistry>()
+        .commitments
+        .clear();
+    set_route_posture(
+        &mut world,
+        GridPosition { x: 12, y: 0 },
+        GridPosition { x: 14, y: 0 },
+    );
+    assert_eq!(
+        update_gun_routes(&mut world, player, 2)[&gun],
+        next,
+        "輸送中に地上DAGから外れても配送先を巻き戻さない"
+    );
+    assert_eq!(
+        world.resource::<GunRouteAssignment>().by_player[&player].regions[&gun],
+        vec![goal],
+        "搭載中の据え付け先・射撃対象も同じ制圧地域を使う"
+    );
+}
+
+/// 専用射撃が通常戦術を横取りしても、地域の障害より別地域の価格を優先しない。
+#[test]
+fn ferry_fire_and_transport_keep_the_committed_regional_objective() {
+    use crate::ai::v4::capital_route::model::{
+        CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteId,
+        CapitalRouteNodeObjective, CapitalRouteNodeScope, CapitalRoutePathRegistry,
+    };
+    let mut world = line_world();
+    let player = PlayerId(1);
+    let gun = spawn(&mut world, 1, UnitType::Artillery, 8, 0);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 9, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let blocker = spawn(&mut world, 2, UnitType::Infantry, 12, 0);
+    let unrelated = spawn(&mut world, 2, UnitType::HeavySpGun, 2, 0);
+    world
+        .resource_mut::<DamageChart>()
+        .insert_damage(UnitType::Artillery, UnitType::Infantry, 95);
+    let squad = crate::ai::v4::test_support::assign_route_squad(
+        &mut world,
+        player,
+        crate::ai::squad::MissionType::Attack,
+        &[gun],
+    );
+    let goal = GridPosition { x: 12, y: 0 };
+    world.insert_resource(CapitalRoutePathRegistry {
+        commitments: HashMap::from_iter([(
+            squad,
+            CapitalRouteCommitment {
+                player_id: player,
+                island_id: crate::ai::islands::IslandId(0),
+                route: CapitalRouteId(0),
+                target: goal,
+                target_anchor: goal,
+                objective: CapitalRouteNodeObjective::Control,
+                scope: CapitalRouteNodeScope::Area,
+                control_area: vec![goal],
+                capture_targets: Vec::new(),
+                crossing_exit: None,
+                crossed: false,
+                execution_target: goal,
+                frontline_capacity: 1,
+                path: vec![GridPosition { x: 8, y: 0 }, goal],
+                phase: CapitalRouteExecutionPhase::Advance,
+            },
+        )]),
+        ..Default::default()
+    });
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Attack { target_entity, .. })) if actor==gun && target_entity==blocker),
+        "専用の射撃も価格の高い別地域の敵より制圧対象を撃つ: {decision:?}"
+    );
+    // 同手番の地域変更も射撃・配送へ渡す。射程外なら無関係な敵を撃って搭載不能にしない。
+    let next = GridPosition { x: 15, y: 0 };
+    world.entity_mut(blocker).insert(next);
+    let mut paths = world.resource_mut::<CapitalRoutePathRegistry>();
+    let order = paths.commitments.get_mut(&squad).unwrap();
+    order.control_area = vec![next];
+    order.target_anchor = next;
+    order.execution_target = next;
+    world.despawn(truck);
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Attack { target_entity, .. })) if actor==gun && target_entity==unrelated),
+        "まだ搭載できない手番は地域外の射撃も継続する: {decision:?}"
+    );
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 9, 0);
+    world.get_mut::<ActionCompleted>(truck).unwrap().0 = true;
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Load { transport_entity, .. })) if actor==gun && transport_entity==truck),
+        "地域内の敵へ届くため、周辺射撃で輸送を止めず実際に搭載する: {decision:?}"
+    );
+    world.despawn(blocker);
+    let decision = decide(&mut world);
+    assert!(
+        matches!(decision, Some((actor, AiCommand::Attack { target_entity, .. })) if actor==gun && target_entity==unrelated),
+        "地域を掃討した後は周囲の有利な射撃も残す: {decision:?}"
+    );
+}
+
+fn injured_tank(world: &mut World, x: usize, hp: u32) -> Entity {
+    let tank = spawn(world, 1, UnitType::Tank, x, 0);
+    world
+        .get_mut::<crate::components::Health>(tank)
+        .unwrap()
+        .current = hp;
+    tank
+}
+
+fn board_with_cities(world: &mut World, cities: &[usize]) {
+    for x in cities {
+        world
+            .resource_mut::<Map>()
+            .set_terrain(*x, 0, Terrain::City)
+            .unwrap();
+        property(world, 1, *x, 0);
+    }
+}
+
+/// 都市が1つだけなら、傷んだ直接部隊がいても砲台のために空けない。
+#[test]
+fn a_single_city_is_not_reserved_for_repair() {
+    let mut world = line_world();
+    board_with_cities(&mut world, &[9]);
+    injured_tank(&mut world, 10, 40);
+    let board = PlayerBoard::observe(&mut world, PlayerId(1));
+    assert!(repair_cities(&board).is_empty());
+}
+
+/// 都市が複数あるときは、傷んだ直接部隊に近い都市を回復場所として空け、砲台の分は残す。
+#[test]
+fn damaged_direct_units_keep_nearby_cities_open_but_one_city_is_left_for_guns() {
+    let mut world = line_world();
+    board_with_cities(&mut world, &[6, 9, 12]);
+    injured_tank(&mut world, 10, 40);
+    injured_tank(&mut world, 5, 30);
+    injured_tank(&mut world, 13, 20);
+    let board = PlayerBoard::observe(&mut world, PlayerId(1));
+    let reserved = repair_cities(&board);
+    assert_eq!(
+        reserved.len(),
+        2,
+        "都市3つのうち、砲台用に1つ残す: {reserved:?}"
+    );
+    // 損傷の大きい順（x=13のHP20、x=5のHP30）に、近い都市（x=12、x=6）を空ける。
+    assert!(reserved.contains(&(12, 0)) && reserved.contains(&(6, 0)));
+}
+
+/// 回復の効果が1手番の回復量に満たない損傷では、都市を空けない。
+#[test]
+fn light_damage_does_not_reserve_a_city() {
+    let mut world = line_world();
+    board_with_cities(&mut world, &[6, 9]);
+    injured_tank(
+        &mut world,
+        10,
+        100 - crate::systems::turn_management::PROPERTY_REPAIR_HP + 1,
+    );
+    let board = PlayerBoard::observe(&mut world, PlayerId(1));
+    assert!(repair_cities(&board).is_empty());
+}
+
+/// 回復場所として空けた都市には砲台を降ろさず、別の都市へ降ろす。
+#[test]
+fn guns_are_not_dropped_on_a_city_kept_open_for_repair() {
+    let mut world = line_world();
+    board_with_cities(&mut world, &[7, 9]);
+    injured_tank(&mut world, 6, 40);
+    let truck = spawn(&mut world, 1, UnitType::SupplyTruck, 8, 0);
+    let gun = load(&mut world, truck, UnitType::Artillery, 1);
+    spawn(&mut world, 2, UnitType::HeavySpGun, 3, 0);
+    let (entity, command) = decide(&mut world).unwrap();
+    assert_eq!(entity, truck);
+    if let AiCommand::Drop {
+        cargo_drop_pos,
+        cargo_entity,
+        ..
+    } = command
+    {
+        assert_eq!(cargo_entity, gun);
+        assert_ne!(
+            cargo_drop_pos,
+            GridPosition { x: 7, y: 0 },
+            "傷んだ戦車に近い都市は空ける"
+        );
+    }
 }

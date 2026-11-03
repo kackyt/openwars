@@ -527,7 +527,8 @@ pub(super) fn capture_target_allowed(
     target: GridPosition,
     orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
 ) -> bool {
-    !beyond_defended_route(map, target, orders) && capture_is_holdable(world, map, player, target)
+    !beyond_defended_route(world, map, target, orders)
+        && capture_is_holdable(world, map, player, target)
 }
 
 /// 進軍路作戦へ回す占領役（released）のうち、まだ誰も占領に向かっていない攻勢進軍路上の
@@ -627,11 +628,55 @@ const CAPTURE_OWN_RADIUS: u32 = 6;
 /// （[`KEY_POINT_CAPTURE_RADIUS`]）の外にある。守りの進軍路には前へ出るゴーサインを出していない
 /// ので、そこへ占領役を送らない（工場付近で守る）。
 pub(super) fn beyond_defended_route(
+    world: &World,
     map: &Map,
     target: GridPosition,
     orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
 ) -> bool {
-    let distance = |point: GridPosition| map.distance(point.x, point.y, target.x, target.y);
+    let Some(data) = world.get_resource::<MasterDataRegistry>() else {
+        return false;
+    };
+    // 目標から逆向きに地形コストを積み、入り江や迂回路を含む到達距離で比較する。
+    let mut costs = HashMap::default();
+    let mut queue = std::collections::BinaryHeap::new();
+    costs.insert((target.x, target.y), 0_u32);
+    queue.push(Reverse((0_u32, target.y, target.x)));
+    while let Some(Reverse((cost, y, x))) = queue.pop() {
+        if costs.get(&(x, y)).is_some_and(|best| cost > *best) {
+            continue;
+        }
+        let Some(terrain) = map.get_terrain(x, y) else {
+            continue;
+        };
+        let Some(step) = crate::systems::movement::get_valid_movement_cost(
+            data,
+            crate::resources::MovementType::Infantry,
+            terrain,
+        ) else {
+            continue;
+        };
+        for (nx, ny) in map.get_adjacent(x, y) {
+            if map
+                .get_terrain(nx, ny)
+                .and_then(|t| {
+                    crate::systems::movement::get_valid_movement_cost(
+                        data,
+                        crate::resources::MovementType::Infantry,
+                        t,
+                    )
+                })
+                .is_none()
+            {
+                continue;
+            }
+            let next = cost.saturating_add(step);
+            if costs.get(&(nx, ny)).is_none_or(|old| next < *old) {
+                costs.insert((nx, ny), next);
+                queue.push(Reverse((next, ny, nx)));
+            }
+        }
+    }
+    let distance = |point: GridPosition| costs.get(&(point.x, point.y)).copied();
     let nearest = orders
         .iter()
         .flat_map(|order| {
@@ -640,10 +685,14 @@ pub(super) fn beyond_defended_route(
             } else {
                 vec![order.key_point, order.staging]
             };
-            points.into_iter().map(move |point| (point, order.defend))
+            points
+                .into_iter()
+                .filter_map(|point| distance(point).map(|cost| (point, order.defend, cost)))
         })
-        .min_by_key(|(point, defend)| (distance(*point), !*defend, point.y, point.x));
-    nearest.is_some_and(|(point, defend)| defend && distance(point) > KEY_POINT_CAPTURE_RADIUS)
+        .min_by_key(|(point, defend, cost)| (*cost, !*defend, point.y, point.x));
+    nearest.is_some_and(|(point, defend, _)| {
+        defend && map.distance(point.x, point.y, target.x, target.y) > KEY_POINT_CAPTURE_RADIUS
+    })
 }
 
 /// 配分案を遂行中に占領へ向かってよい施設か。中立の施設か、要衝の周りの施設。
@@ -688,18 +737,28 @@ fn route_front_responsibilities(
     if fronts.len() < 2 || remaining.is_empty() {
         return Vec::new();
     }
-    // 全進軍路の前線が敵首都の地域に入った終盤は、前線拠点の防衛ではなく首都への攻撃にする。
-    if let Some(geometry) = crate::ai::v4::capital_route::node_operation::capital_assault_geometry(
-        world, player, island,
-    ) {
-        return capital_assault_responsibilities(world, map, player, geometry, remaining);
-    }
-    let demands = crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
+    // 首都へ進める方面だけを切り替える。他方の地域処理を全軍の待機条件にしない。
+    let capital_geometry = crate::ai::v4::capital_route::node_operation::capital_assault_geometry(
         world, player, island,
     );
-    let slots = crate::ai::v4::capital_route::force_demand::apportion_route_force_slots(
-        remaining.len(),
-        &demands,
+    let regional_fronts =
+        crate::ai::v4::capital_route::node_operation::capital_route_front_properties(
+            world, player, island,
+        )
+        .unwrap_or_default();
+    let capital_axes = regional_fronts
+        .iter()
+        .map(|properties| {
+            capital_geometry.is_some_and(|geometry| {
+                properties.iter().all(|front| {
+                    map.distance(front.x, front.y, geometry.capital.x, geometry.capital.y)
+                <= crate::ai::v4::capital_route::node_operation::capital_assault_region_radius()
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let demands = crate::ai::v4::capital_route::force_demand::same_land_route_force_demands(
+        world, player, island,
     );
     // 配る先は進軍路の固定識別点ではなく、DAGで求めた各進軍路の現在の前線にする。
     // まだ橋を突破していない進軍路は、手前の橋のGateを前線目標にして橋の防衛・確保を確実にする。
@@ -708,6 +767,32 @@ fn route_front_responsibilities(
         crate::ai::v4::capital_route::force_demand::same_land_pending_bridgeheads(
             world, player, island,
         );
+    // 地域を処理し終えた方面の既存部隊を、別方面の不足へ引き戻さない。
+    // 首都への射程を持つ方面だけを先へ送り、残りは従来の地域需要で配分する。
+    let mut responsibilities = Vec::new();
+    if let Some(geometry) = capital_geometry {
+        let mut advance = Vec::new();
+        remaining.retain(|entity| {
+            let ready = crate::ai::v4::capital_route::topology::capital_route_nearest_axis(
+                world, player, island, *entity,
+            )
+            .is_some_and(|route| {
+                capital_axes.get(route).copied().unwrap_or(false)
+                    && pending_bridgeheads.get(route).copied().flatten().is_none()
+            });
+            if ready {
+                advance.push(*entity);
+            }
+            !ready
+        });
+        responsibilities.extend(capital_assault_responsibilities(
+            world,
+            map,
+            player,
+            geometry,
+            &mut advance,
+        ));
+    }
     let fronts = crate::ai::v4::capital_route::node_operation::capital_route_current_fronts(
         world, player, island,
     )
@@ -726,20 +811,43 @@ fn route_front_responsibilities(
             .collect::<Vec<_>>()
     })
     .unwrap_or(fronts);
+    let slots = crate::ai::v4::capital_route::force_demand::apportion_route_force_slots(
+        remaining.len(),
+        &demands,
+    );
     let groups = super::combat_responsibilities::distribute_members_across_route_fronts(
         world, map, remaining, &fronts, &slots,
     );
     remaining.clear();
-    fronts
-        .into_iter()
-        .zip(groups)
-        .filter(|(_, members)| !members.is_empty())
-        .map(|(front, members)| CampaignResponsibility {
-            mission_type: MissionType::Defense,
-            target: front,
-            members,
-        })
-        .collect()
+    responsibilities.extend(
+        fronts
+            .into_iter()
+            .zip(groups)
+            .enumerate()
+            .filter(|(_, (_, members))| !members.is_empty())
+            .flat_map(|(route, (front, mut members))| {
+                if let Some(geometry) = capital_geometry
+                    && capital_axes.get(route).copied().unwrap_or(false)
+                    && pending_bridgeheads.get(route).copied().flatten().is_none()
+                {
+                    return capital_assault_responsibilities(
+                        world,
+                        map,
+                        player,
+                        geometry,
+                        &mut members,
+                    );
+                }
+                vec![CampaignResponsibility {
+                    // 未制圧地域への前進は攻勢。Defenseでは必要な不利交換まで
+                    // 戦術側で拒否され、敵を削る役が永久に待つため区別する。
+                    mission_type: MissionType::Attack,
+                    target: front,
+                    members,
+                }]
+            }),
+    );
+    responsibilities
 }
 
 /// 敵首都の攻略で、余った戦闘役を首都への攻撃（Attack）へ回す。首都の地域にいる敵に

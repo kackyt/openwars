@@ -420,6 +420,9 @@ impl FreeUnits {
                 if unit.cargo.is_some_and(|capacity| capacity.max > 0) {
                     free.transports.push((entity, unit.position, stats.clone()));
                 }
+            } else if stats.max_range == 0 && !stats.can_capture {
+                // 非武装の支援車両は戦闘小隊へ編入しない。
+                continue;
             } else if is_infantry {
                 free.infantry.push((entity, unit.position, stats.clone()));
             } else {
@@ -1393,6 +1396,8 @@ fn form_attack_squads(
     free: &mut FreeUnits,
     turn_cache: &mut TurnDistanceCache,
 ) {
+    // 戦闘候補に非武装車両が混ざっても攻撃部隊には渡さない。
+    free.combat.retain(|(_, _, stats)| stats.max_range > 0);
     for cluster in enemy_clusters {
         if free.combat.is_empty() {
             break;
@@ -1428,6 +1433,9 @@ fn absorb_surplus_combat_units(
     turn_cache: &mut TurnDistanceCache,
 ) {
     while let Some((entity, pos, stats)) = free.combat.pop() {
+        if stats.max_range == 0 {
+            continue;
+        }
         if let Some(slot) = nearest_open_squad(proposal, board, pos, &stats, turn_cache) {
             proposal.join(slot, entity);
             continue;

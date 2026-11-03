@@ -82,3 +82,57 @@ fn combat_unit_occupies_an_empty_enemy_factory() {
         "{decision:?}"
     );
 }
+
+/// 出発待ちの攻撃役でも、届く安全な生産口は塞げる。
+#[test]
+fn held_attack_unit_can_block_reachable_production_site() {
+    let mut world = world(false);
+    enemy_property(&mut world, pos(10, 2), Terrain::Capital);
+    enemy_property(&mut world, pos(12, 2), Terrain::Factory);
+    let tank = spawn(&mut world, PlayerId(1), UnitType::Tank, pos(14, 2));
+    assign(&mut world, tank, MissionType::Attack, pos(20, 2));
+    world.resource_mut::<SquadManager>().squads[0]
+        .plan
+        .departure_authorized = false;
+    let decision = decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((entity, AiCommand::Wait { target_pos })) if entity == tank && target_pos == pos(12, 2)),
+        "{decision:?}"
+    );
+}
+
+/// 出発待ちの攻撃役は生産圏外の工場へは持ち場を離れない。
+#[test]
+fn held_attack_unit_does_not_leave_for_factory_outside_production_range() {
+    let mut world = world(false);
+    enemy_property(&mut world, pos(8, 2), Terrain::Capital);
+    enemy_property(&mut world, pos(12, 2), Terrain::Factory);
+    let tank = spawn(&mut world, PlayerId(1), UnitType::Tank, pos(14, 2));
+    assign(&mut world, tank, MissionType::Attack, pos(20, 2));
+    world.resource_mut::<SquadManager>().squads[0]
+        .plan
+        .departure_authorized = false;
+    let decision = decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((entity, AiCommand::Wait { target_pos })) if entity == tank && target_pos == pos(14, 2)),
+        "{decision:?}"
+    );
+}
+
+/// 出発待ちの占領役は、生産口の占位へ転用しない。
+#[test]
+fn held_capture_unit_keeps_its_assignment() {
+    let mut world = world(false);
+    enemy_property(&mut world, pos(10, 2), Terrain::Capital);
+    enemy_property(&mut world, pos(12, 2), Terrain::Factory);
+    let infantry = spawn(&mut world, PlayerId(1), UnitType::Infantry, pos(14, 2));
+    assign(&mut world, infantry, MissionType::Capture, pos(20, 2));
+    world.resource_mut::<SquadManager>().squads[0]
+        .plan
+        .departure_authorized = false;
+    let decision = decide_action(&mut world, PlayerId(1), &HashSet::default());
+    assert!(
+        matches!(decision, Some((entity, AiCommand::Wait { target_pos })) if entity == infantry && target_pos == pos(14, 2)),
+        "{decision:?}"
+    );
+}

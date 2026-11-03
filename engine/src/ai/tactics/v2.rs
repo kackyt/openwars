@@ -69,6 +69,9 @@ pub(crate) fn decide_action(
         .then(|| EnemyProductionBlockade::observe(&board));
     // 占領の実行（敵首都・割当物件）を前面の戦闘より優先する（V4）。
     let executes_capture = ai_version == crate::ai::ai_version::AiVersion::V4;
+    // 橋とその近辺では、間接火力・非戦闘の支援車を止めない（V4）。後続の直接部隊の通路を空ける。
+    let bridge_approach = (ai_version == crate::ai::ai_version::AiVersion::V4)
+        .then(|| crate::ai::tactics::chokepoint::bridge_approach_cells(&board.map));
     let mut probe_call = ProbeCall::start(world, player_id);
     let best = with_turn_distances(world, &board, |world, distances| {
         let mut best = BestUnitAction::default();
@@ -118,6 +121,7 @@ pub(crate) fn decide_action(
                     &unit,
                     blockade.as_ref(),
                     executes_capture,
+                    bridge_approach.as_ref(),
                     distances,
                     probe.as_mut(),
                 ),
@@ -142,6 +146,10 @@ struct UnitTactics {
     /// V4のcampaign所属（作戦島・任務・目標）。
     campaign: Option<CampaignActionContext>,
     squad_target: Option<GridPosition>,
+    /// 一点目標を持たず、現在の地域内で展開する指示。
+    regional_control: bool,
+    /// 地域進入・占領の位置目標。射程に入るだけで接近完了にはしない。
+    regional_position_target: bool,
     has_offensive_mission: bool,
     /// Squad目標を持たない単独行動。
     is_solo: bool,
@@ -157,11 +165,36 @@ impl UnitTactics {
             .and_then(|registry| registry.attack_target(entity));
         let campaign =
             campaign_action_context(world, board.player_id, entity, &board.squads.manager).ok()?;
-        let squad_target = board.squads.target(entity);
-        let has_offensive_mission = board.squads.mission(entity).is_some_and(|mission| {
-            matches!(
-                mission,
-                MissionType::Attack | MissionType::Capture | MissionType::Transport
+        // 接近の採点と後退判定で、同じ確定済み作戦目標を参照する。
+        // Some(context.target=None)は地域内制圧であり旧Squad目標へ戻さない。
+        let squad_target = campaign
+            .as_ref()
+            .map_or_else(|| board.squads.target(entity), |context| context.target);
+        let regional_control = campaign
+            .as_ref()
+            .is_some_and(|context| context.target.is_none())
+            && crate::ai::v4::capital_route::tactical::capital_route_allows_tactical_position(
+                world,
+                board.player_id,
+                entity,
+                state.position,
+            ) == Some(true);
+        let has_offensive_mission = campaign
+            .as_ref()
+            .map(|context| &context.mission_type)
+            .or_else(|| board.squads.mission(entity))
+            .is_some_and(|mission| {
+                matches!(
+                    mission,
+                    MissionType::Attack | MissionType::Capture | MissionType::Transport
+                )
+            });
+        let regional_position_target = squad_target.is_some_and(|target| {
+            crate::ai::v4::capital_route::tactical::capital_route_target_requires_occupancy(
+                world,
+                board.player_id,
+                entity,
+                target,
             )
         });
         let is_solo = board.squads.is_solo_fallback(entity) || squad_target.is_none();
@@ -170,6 +203,8 @@ impl UnitTactics {
             deployment_target,
             campaign,
             squad_target,
+            regional_control,
+            regional_position_target,
             has_offensive_mission,
             is_solo,
         })
@@ -182,14 +217,65 @@ impl UnitTactics {
     }
 
     /// 移動先候補。護衛・集結待ちのSquadは、現在位置での攻撃・占領・待機だけを残す。
-    fn candidate_tiles(&self, board: &TacticalBoard) -> std::collections::BTreeSet<(usize, usize)> {
+    fn candidate_tiles(
+        &self,
+        world: &World,
+        board: &TacticalBoard,
+        blockade: Option<&EnemyProductionBlockade>,
+    ) -> std::collections::BTreeSet<(usize, usize)> {
         let unit = &self.state;
         if self
             .campaign
             .as_ref()
             .is_some_and(|context| context.holds_position())
         {
-            return std::iter::once((unit.position.x, unit.position.y)).collect();
+            let mut tiles = std::collections::BTreeSet::from([(unit.position.x, unit.position.y)]);
+            // 占領役や防衛役の配置は維持し、攻撃役だけが安全に届く生産口を塞ぐ。
+            // 首都そのものは占領役のために空けておく。
+            if !unit.stats.can_capture
+                && unit.stats.max_range > 0
+                && self
+                    .campaign
+                    .as_ref()
+                    .is_some_and(|context| context.mission_type == MissionType::Attack)
+                && let Some(blockade) = blockade
+            {
+                let reachable = calculate_reachable_tiles(
+                    &board.map,
+                    &board.occupancy,
+                    (unit.position.x, unit.position.y),
+                    unit.stats.movement_type,
+                    unit.stats.max_movement,
+                    unit.fuel,
+                    board.player_id,
+                    unit.stats.unit_type,
+                    &board.registry,
+                );
+                for (x, y) in reachable {
+                    let position = GridPosition { x, y };
+                    let is_capital = board.properties.iter().any(|(site, terrain, _)| {
+                        *site == position && *terrain == crate::resources::Terrain::Capital
+                    });
+                    if !is_capital
+                        && !crate::ai::v4::capital_route::tactical::is_capture_target_reserved(
+                            world,
+                            board.player_id,
+                            position,
+                        )
+                        && blockade
+                            .assess(
+                                board,
+                                unit,
+                                position,
+                                terrain_defense_bonus(board, position),
+                            )
+                            .holds_site
+                    {
+                        tiles.insert((x, y));
+                    }
+                }
+            }
+            return tiles;
         }
         calculate_reachable_tiles(
             &board.map,
@@ -226,12 +312,16 @@ fn best_action_for_unit(
     unit: &UnitTactics,
     blockade: Option<&EnemyProductionBlockade>,
     executes_capture: bool,
+    bridge_approach: Option<&HashSet<GridPosition>>,
     distances: &mut ApproachDistances,
     mut probe: Option<&mut UnitProbe>,
 ) -> BestAction {
     let state = &unit.state;
     let mut best = BestAction::default();
-    let mut tiles = unit.candidate_tiles(board);
+    let mut tiles = unit.candidate_tiles(world, board, blockade);
+    // 橋とその近辺で止まらせない兵種だけに区域を適用する。直接部隊は制限しない。
+    let bridge_approach = bridge_approach
+        .filter(|_| crate::ai::tactics::chokepoint::keeps_bridge_approach_clear(&state.stats));
     if unit.treats_target_as_reference() {
         // 敵の生産口は、占領役の予約より占位（補充の遮断）を優先して候補に残す。
         // 予約で外すと、占領役が着くまで敵が空いた生産口で補充を続ける。
@@ -256,14 +346,24 @@ fn best_action_for_unit(
                 state.position,
                 || {
                     json!({
-                "departure_authorized":false,"generated_current_tile_only":true,
+                "departure_authorized":false,"generated_current_tile_only":tiles.len() == 1,
                 "underlying_departure_reason":"not_persisted"})
                 },
             );
         }
     }
+    // 現在地しか候補が無い（保持指示・包囲など）なら、区域内でも従来どおり行動させる。
+    let can_leave_current = tiles.len() > 1;
     for (x, y) in tiles {
         let position = GridPosition { x, y };
+        let in_bridge_approach = bridge_approach.is_some_and(|cells| cells.contains(&position));
+        // 橋とその近辺では待機しない。通過のために移動して区域内で手番を終えるのは許す。
+        if in_bridge_approach && position == state.position && can_leave_current {
+            if let Some(trace) = probe.as_deref_mut() {
+                trace.reject("bridge_approach_no_stop", position, || json!({}));
+            }
+            continue;
+        }
         if !air_move_preserves_return_fuel(
             &board.map,
             &board.properties,
@@ -320,7 +420,12 @@ fn best_action_for_unit(
             &mut best,
             probe.as_deref_mut(),
         );
-        consider_attacks(world, board, unit, &tile, &mut best, probe.as_deref_mut());
+        // 区域内のマスからは撃たない。撃つために橋の口へ居座ると後続が渡れない。
+        if !(in_bridge_approach && can_leave_current) {
+            consider_attacks(world, board, unit, &tile, &mut best, probe.as_deref_mut());
+        } else if let Some(trace) = probe.as_deref_mut() {
+            trace.reject("bridge_approach_no_fire", position, || json!({}));
+        }
         consider_wait(
             board,
             unit,
@@ -401,7 +506,17 @@ fn tile_score(
     {
         squad_approach = if board.approaches_squad_target_by_path {
             // V4は参照点・目標地点のどちらも、射程に捉えるまでの実経路で接近を比べる。
-            squad_target_path_approach_score(state, position, target, distances)
+            squad_target_path_approach_score(
+                state,
+                position,
+                target,
+                if unit.regional_position_target {
+                    0
+                } else {
+                    state.stats.max_range
+                },
+                distances,
+            )
         } else if unit.treats_target_as_reference() {
             reference_point_approach_score(state, position, target, distances)
         } else {
@@ -421,7 +536,9 @@ fn tile_score(
             );
             solo_approach = nearest_approach_bonus(nearest, state.stats.max_movement);
             score += solo_approach;
-        } else if !state.stats.can_capture {
+        } else if !state.stats.can_capture || unit.regional_control {
+            // 地域内で占領担当が余った歩兵も、敵の排除へ参加する。
+            // 占領能力だけを理由に、具体施設を持たない制圧役をその場へ残さない。
             solo_approach = solo_enemy_approach_score(board, state, position, distances);
             score += solo_approach;
         }
@@ -684,9 +801,20 @@ fn consider_wait(
         {
             return false;
         }
-        context.target.is_none_or(|target| {
+        if context.target.is_none() {
+            // 地域Controlの一点目標なしは、その地域内での展開を許可する指示。
+            // 地域内の展開と、地域指示を一時解除した回復移動は通常採点へ委ねる。
+            // 修理地点に一手で届かなくても、中間地点への移動を禁止しない。
+            // （DEEPSEEK計画3-2は`is_none_or`への差し戻しを指示するが、DAG指令の投影を
+            // 残したままそれを行うと地域内・回復中unitの移動Waitを全面禁止することになり、
+            // 計画自身の「禁止を足さない」方針と逆になるため、この分岐は維持する。）
+            return !(unit.regional_control || state.combat_ineffective);
+        }
+        context.target.is_some_and(|target| {
             // 参照点の周囲で働ける範囲までは「離れた」と扱わない。範囲外への後退は従来どおり拒否。
-            let range = if unit.treats_target_as_reference() {
+            let range = if unit.regional_position_target {
+                0
+            } else if unit.treats_target_as_reference() {
                 reference_reach(&state.stats)
             } else {
                 0

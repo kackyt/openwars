@@ -18,5 +18,6 @@ pub(crate) mod v2;
 
 pub(crate) mod campaign;
 pub(crate) mod candidates;
+pub(crate) mod chokepoint;
 pub(crate) mod distance_cache;
 pub(crate) mod relief;

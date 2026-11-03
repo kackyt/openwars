@@ -122,6 +122,7 @@ fn explicit_combat_deployment_is_not_reassigned_to_a_capture_milestone() {
             UnitStats {
                 movement_type: MovementType::Tank,
                 max_movement: 6,
+                max_range: 1,
                 cost: 5000,
                 ..UnitStats::mock()
             },

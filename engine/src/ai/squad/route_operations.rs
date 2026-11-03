@@ -9,6 +9,13 @@
 //! 要衝へ着けるか、所属の戦力が要衝周りの敵を上回るなら直ちに進出し、どちらでもなければ
 //! 集結点（敵より先に押さえられる最も前の地点）へ集まって戦力が揃うのを待つ。
 
+mod city_defense;
+#[cfg(test)]
+mod city_defense_tests;
+mod guard;
+#[cfg(test)]
+mod guard_tests;
+
 use super::{CampaignResponsibility, MissionType, SquadManager};
 use crate::ai::v4::capital_route::force_demand::RouteOrder;
 use crate::components::{Faction, GridPosition, Health, PlayerId, Property, UnitStats};
@@ -31,6 +38,8 @@ pub(super) struct RouteOperationPlan {
     members: Vec<Vec<Entity>>,
     /// どの作戦にも属していない部隊。
     free: Vec<Entity>,
+    /// 同じ進軍路で既に攻勢を開始した部隊が残る。損耗のたびに集結へ巻き戻さない。
+    launched: Vec<bool>,
 }
 
 /// 部隊の戦力価値（価格×HP）。
@@ -56,6 +65,13 @@ pub(super) fn carry_over(
     let map = world.get_resource::<Map>();
     let mut members = vec![Vec::new(); orders.len()];
     let mut free = Vec::new();
+    let mut launched = vec![false; orders.len()];
+    let attacking = manager
+        .squads
+        .iter()
+        .filter(|squad| squad.plan.mission_type == MissionType::Attack)
+        .flat_map(|squad| squad.members.iter().copied())
+        .collect::<crate::collections::HashSet<_>>();
     let mut units = units.to_vec();
     units.sort_by_key(|entity| entity.to_bits());
     units.dedup();
@@ -86,11 +102,18 @@ pub(super) fn carry_over(
                     .map(|(index, _)| index)
             });
         match kept {
-            Some(index) => members[index].push(entity),
+            Some(index) => {
+                launched[index] |= attacking.contains(&entity);
+                members[index].push(entity);
+            }
             None => free.push(entity),
         }
     }
-    RouteOperationPlan { members, free }
+    RouteOperationPlan {
+        members,
+        free,
+        launched,
+    }
 }
 
 /// 今手番の所属を記録する。今手番の候補（`units`）のうち作戦に属さなくなった部隊
@@ -133,8 +156,51 @@ pub(super) fn responsibilities(
     let Some(map) = world.get_resource::<Map>() else {
         return (Vec::new(), Vec::new());
     };
-    let RouteOperationPlan { mut members, free } = plan;
+    let RouteOperationPlan {
+        mut members,
+        free,
+        launched: previous_launch,
+    } = plan;
     let mut pool = free;
+    let enemies = enemy_units(world, player);
+    // 部隊の周り（作戦が攻撃に向かってよい範囲）に敵がいるか。交戦中の部隊は戦線を
+    // 支えているので、余剰として別の進軍路へ回さない。
+    let engaged = |entity: Entity| {
+        world.get::<GridPosition>(entity).is_some_and(|at| {
+            enemies
+                .iter()
+                .any(|(enemy, _)| map.distance(at.x, at.y, enemy.x, enemy.y) <= ENGAGEMENT_RADIUS)
+        })
+    };
+    // 防衛の所要戦力を満たした後の余剰まで固定所属に残すと、配分案の集中が
+    // 実行されず、主攻勢には火力が届かない。現在の要衝へ近い部隊を所要分だけ残す。
+    //
+    // ただし回すのは周りに敵のいない余剰だけにする。攻めの目標を取って配分案が主戦場を
+    // 別の進軍路へ切り替えるたびに、敵地で交戦中の部隊まで丸ごと地図の反対側へ引き抜くと、
+    // 全軍が進軍路の間を往復して前進が積み上がらない（map_20後手で数ターンごとに
+    // 50体以上が南北を入れ替わった）。後方の守備に溜まった余剰は従来どおり攻勢へ回る。
+    for (index, order) in orders.iter().enumerate().filter(|(_, order)| order.defend) {
+        members[index].sort_by_key(|entity| {
+            let turns = world
+                .get::<GridPosition>(*entity)
+                .zip(world.get::<UnitStats>(*entity))
+                .map_or(u32::MAX, |(at, stats)| {
+                    map.distance(at.x, at.y, order.key_point.x, order.key_point.y)
+                        .div_ceil(stats.max_movement.max(1))
+                });
+            (turns, unit_value(world, *entity), entity.to_bits())
+        });
+        let mut retained = 0_u64;
+        members[index].retain(|entity| {
+            if retained < u64::from(order.force) || engaged(*entity) {
+                retained = retained.saturating_add(u64::from(unit_value(world, *entity)));
+                true
+            } else {
+                pool.push(*entity);
+                false
+            }
+        });
+    }
     let mut deficits = orders
         .iter()
         .zip(&members)
@@ -173,26 +239,33 @@ pub(super) fn responsibilities(
             distance_to(entity, capital) <= crate::systems::production::PRODUCTION_RANGE as u32
         })
     };
-    let eligible = |entity: Entity, index: usize| {
+    // 充足済みの防衛は、候補にも「最寄り作戦」の比較対象にも戻さない。
+    // 近くの満員の守備隊を基準にすると、遠方の唯一の攻勢へ余剰を送れなくなる。
+    let accepts = |index: usize, deficits: &[i64]| !orders[index].defend || deficits[index] > 0;
+    let eligible = |entity: Entity, index: usize, deficits: &[i64]| {
         if at_home(entity) {
             return true;
         }
         let nearest = orders
             .iter()
-            .map(|order| distance_to(entity, order.key_point))
+            .enumerate()
+            .filter(|(index, _)| accepts(*index, deficits))
+            .map(|(_, order)| distance_to(entity, order.key_point))
             .min()
             .unwrap_or(u32::MAX);
         distance_to(entity, orders[index].key_point)
             <= nearest.saturating_add(reach(entity).saturating_mul(FAR_FRONT_TURNS))
     };
     while !pool.is_empty() {
-        let mut by_deficit = (0..orders.len()).collect::<Vec<_>>();
+        let mut by_deficit = (0..orders.len())
+            .filter(|index| accepts(*index, &deficits))
+            .collect::<Vec<_>>();
         by_deficit.sort_by_key(|index| (std::cmp::Reverse(deficits[*index]), *index));
         let choice = by_deficit.into_iter().find_map(|index| {
             let key = orders[index].key_point;
             pool.iter()
                 .enumerate()
-                .filter(|(_, entity)| eligible(**entity, index))
+                .filter(|(_, entity)| eligible(**entity, index, &deficits))
                 .min_by_key(|(_, entity)| (distance_to(**entity, key), entity.to_bits()))
                 .map(|(slot, _)| (index, slot))
         });
@@ -205,15 +278,37 @@ pub(super) fn responsibilities(
     }
     // 作戦ごとに、所属部隊だけで目標（守りの要衝、攻めは進出するなら要衝・待つなら集結点）
     // を妨げる敵へ有効な部隊を当て、残りを目標へ前進させる。
-    let enemies = enemy_units(world, player);
     let mut responsibilities = Vec::new();
-    for (order, members) in orders.iter().zip(members.iter().cloned()) {
+    for (index, (order, members)) in orders.iter().zip(members.iter().cloned()).enumerate() {
         if members.is_empty() {
             continue;
         }
         // 進出した攻めの作戦は攻撃任務にし、不利な交換も受け入れて要衝を取りに行く。
         // 守りの作戦と、集結点で待つ攻めの作戦は防衛任務（有利な交換だけ攻撃）にする。
-        let launched = !order.defend && launches(world, map, player, order, &members);
+        let launched = !order.defend
+            && (previous_launch.get(index).copied().unwrap_or(false)
+                || launches(world, map, player, order, &members));
+        let guard_duties = if launched {
+            guard::duties(world, map, player, island, order, &members, connectivity)
+        } else {
+            Vec::new()
+        };
+        let retained = guard_duties
+            .iter()
+            .flat_map(|duty| duty.members.iter().copied())
+            .collect::<crate::collections::HashSet<_>>();
+        responsibilities.extend(guard_duties);
+        let members = members
+            .into_iter()
+            .filter(|entity| !retained.contains(entity))
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
+        }
+        // 守備役を取り分けた後の前進部隊だけで、初回出撃が成立するかを検査する。
+        let launched = launched
+            && (previous_launch.get(index).copied().unwrap_or(false)
+                || launches(world, map, player, order, &members));
         let target = if order.defend {
             order.key_point
         } else if launched {
@@ -233,8 +328,61 @@ pub(super) fn responsibilities(
             .iter()
             .copied()
             .partition(|member| is_indirect(world, *member));
+
+        // 自軍都市の防衛なら、都市防衛計画（通路封鎖・都市からの間接支援）を試みる。
+        let master = world.get_resource::<crate::resources::master_data::MasterDataRegistry>();
+        let is_own_city = world.iter_entities().any(|entity| {
+            entity.get::<GridPosition>() == Some(&target)
+                && entity.get::<Property>().is_some_and(|p| {
+                    p.owner_id == Some(player) && p.terrain == crate::resources::Terrain::City
+                })
+        });
+        let city_plan = if order.defend && is_own_city {
+            master.and_then(|reg| {
+                let indirect_ranges = indirect
+                    .iter()
+                    .filter_map(|e| world.get::<UnitStats>(*e))
+                    .map(|s| (s.min_range, s.max_range))
+                    .collect::<Vec<_>>();
+                let mut occupied = crate::collections::HashSet::default();
+                for entity in world.iter_entities() {
+                    if let Some(pos) = entity.get::<GridPosition>() {
+                        if entity.get::<Faction>().is_some_and(|f| f.0 == player) {
+                            if let Some(health) = entity.get::<Health>() {
+                                if health.current < health.max {
+                                    occupied.insert(*pos);
+                                }
+                            }
+                        }
+                    }
+                }
+                city_defense::plan_city_defense(
+                    map,
+                    reg,
+                    target,
+                    &enemies,
+                    direct.len(),
+                    &indirect_ranges,
+                    &occupied,
+                )
+            })
+        } else {
+            None
+        };
+
         let mut taken = crate::collections::HashSet::default();
-        for gun in indirect {
+        let mut indirect_iter = indirect.into_iter();
+        if let Some(support_city) = city_plan.as_ref().and_then(|p| p.support_city) {
+            if let Some(gun) = indirect_iter.next() {
+                taken.insert(support_city);
+                responsibilities.push(CampaignResponsibility {
+                    mission_type: mission_type.clone(),
+                    target: support_city,
+                    members: vec![gun],
+                });
+            }
+        }
+        for gun in indirect_iter {
             let found = firing_position(world, map, player, &enemies, gun, target, front, &taken);
             if std::env::var_os("OPENWARS_ROUTE_OPS_DEBUG").is_some() {
                 let stats = world.get::<UnitStats>(gun);
@@ -274,13 +422,92 @@ pub(super) fn responsibilities(
                 .unwrap_or(if launched { order.staging } else { target });
             taken.insert(position);
             responsibilities.push(CampaignResponsibility {
-                mission_type: MissionType::Defense,
+                // 射撃位置は参照点であり、防衛任務を意味しない。攻勢を開始した
+                // 作戦の砲兵もAttackとし、地域制圧・輸送へ攻勢の意図を引き継ぐ。
+                mission_type: mission_type.clone(),
                 target: position,
                 members: vec![gun],
             });
         }
         if direct.is_empty() {
             continue;
+        }
+
+        // 都市防衛計画の封鎖地点がある場合、直接部隊を各封鎖地点へ配備する
+        if let Some(ref plan) = city_plan {
+            if !plan.chokepoints.is_empty() {
+                let mut direct_pool = direct;
+                let mut assigned_chokes = Vec::new();
+
+                for &chokepoint in &plan.chokepoints {
+                    if direct_pool.is_empty() {
+                        break;
+                    }
+                    let nearest_idx = direct_pool
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entity)| {
+                            world.get::<GridPosition>(**entity).map_or(u32::MAX, |at| {
+                                map.distance(at.x, at.y, chokepoint.x, chokepoint.y)
+                            })
+                        })
+                        .map(|(idx, _)| idx);
+
+                    if let Some(idx) = nearest_idx {
+                        let chosen = direct_pool.remove(idx);
+                        let local = super::objective_allocation::route_operation_responsibilities(
+                            world,
+                            player,
+                            island,
+                            &[chosen],
+                            chokepoint,
+                            connectivity,
+                        );
+                        if local.is_empty() {
+                            assigned_chokes.push(CampaignResponsibility {
+                                mission_type: MissionType::Defense,
+                                target: chokepoint,
+                                members: vec![chosen],
+                            });
+                        } else {
+                            assigned_chokes.extend(local);
+                        }
+                    }
+                }
+
+                // 余剰部隊があれば最も脅威度の高い封鎖地点へ配備
+                let fallback = plan.chokepoints[0];
+                if !direct_pool.is_empty() {
+                    let rest_assigned =
+                        super::objective_allocation::route_operation_responsibilities(
+                            world,
+                            player,
+                            island,
+                            &direct_pool,
+                            fallback,
+                            connectivity,
+                        );
+                    let covered_rest = rest_assigned
+                        .iter()
+                        .flat_map(|r| r.members.iter().copied())
+                        .collect::<crate::collections::HashSet<_>>();
+                    let really_rest = direct_pool
+                        .into_iter()
+                        .filter(|m| !covered_rest.contains(m))
+                        .collect::<Vec<_>>();
+                    assigned_chokes.extend(rest_assigned);
+                    if !really_rest.is_empty() {
+                        assigned_chokes.push(CampaignResponsibility {
+                            mission_type: MissionType::Defense,
+                            target: fallback,
+                            members: really_rest,
+                        });
+                    }
+                }
+
+                responsibilities.extend(assigned_chokes);
+                continue;
+            }
         }
         // 作戦の目標から離れた敵を追うと、作戦の部隊が要衝から散る。前面の周りの敵への
         // 攻撃だけを残し、それ以外は前面へ向かわせる。
@@ -334,12 +561,31 @@ fn launches(
     members: &[Entity],
 ) -> bool {
     let key = order.key_point;
-    let eta = |entity: Entity| -> Option<u32> {
+    let Some(master) = world.get_resource::<crate::resources::master_data::MasterDataRegistry>()
+    else {
+        return false;
+    };
+    let mut travel = crate::ai::turn_distance::ActionTurnDistanceCache::default();
+    let mut eta = |entity: Entity| -> Option<u32> {
         let at = world.get::<GridPosition>(entity)?;
         let stats = world.get::<UnitStats>(entity)?;
-        Some(
-            map.distance(at.x, at.y, key.x, key.y)
-                .div_ceil(stats.max_movement.max(1)),
+        let fuel = world
+            .get::<crate::components::Fuel>(entity)
+            .map_or(stats.max_fuel, |fuel| fuel.current);
+        // 実燃料ゼロの部隊は現在地以外へ到達できない。距離関数のテスト用センチネルと区別する。
+        if fuel == 0 && world.get::<crate::components::Fuel>(entity).is_some() && *at != key {
+            return None;
+        }
+        crate::ai::v4::property_control::capture_arrival_turns(
+            map,
+            master,
+            (at.x, at.y),
+            (key.x, key.y),
+            stats.movement_type,
+            stats.max_movement,
+            fuel,
+            player,
+            &mut travel,
         )
     };
     let our_arrival = members.iter().filter_map(|member| eta(*member)).min();
@@ -353,13 +599,38 @@ fn launches(
         .map(|entity| entity.id())
         .collect::<Vec<_>>();
     let enemy_arrival = enemies.iter().filter_map(|enemy| eta(*enemy)).min();
+    // 占位の先着競争と、砲兵を含む射撃支援の到着を分ける。
+    let mut fire_cache = crate::ai::turn_distance::ActionTurnDistanceCache::default();
+    let mut fire_eta = |entity: Entity| -> Option<u32> {
+        let at = world.get::<GridPosition>(entity)?;
+        let stats = world.get::<UnitStats>(entity)?;
+        let fuel = world
+            .get::<crate::components::Fuel>(entity)
+            .map_or(stats.max_fuel, |fuel| fuel.current);
+        if fuel == 0 && world.get::<crate::components::Fuel>(entity).is_some() {
+            let distance = map.distance(at.x, at.y, key.x, key.y);
+            return (distance >= stats.min_range && distance <= stats.max_range).then_some(0);
+        }
+        crate::ai::v4::property_control::fire_arrival_turns(
+            map,
+            master,
+            (at.x, at.y),
+            (key.x, key.y),
+            stats,
+            fuel,
+            player,
+            &mut fire_cache,
+        )
+    };
     let enemy_near = enemies
         .iter()
-        .filter(|enemy| eta(**enemy).is_some_and(|turns| turns <= KEY_POINT_ENEMY_TURNS))
+        .filter(|enemy| fire_eta(**enemy).is_some_and(|turns| turns <= KEY_POINT_ENEMY_TURNS))
         .map(|enemy| unit_value(world, *enemy))
         .sum::<u32>();
+    // 後方の大軍を即時の突破戦力として数えず、同じ交戦期間に届く部隊だけを比較する。
     let our_force = members
         .iter()
+        .filter(|member| fire_eta(**member).is_some_and(|turns| turns <= KEY_POINT_ENEMY_TURNS))
         .map(|member| unit_value(world, *member))
         .sum::<u32>();
     let wins_race = match (our_arrival, enemy_arrival) {
@@ -514,7 +785,7 @@ fn advanced_offensive_target(
     // key から離れており、守りの進軍路の先ではない未所有施設
     next_properties.retain(|pos| {
         map.distance(pos.x, pos.y, key.x, key.y) > 0
-            && !super::objective_allocation::beyond_defended_route(map, *pos, orders)
+            && !super::objective_allocation::beyond_defended_route(world, map, *pos, orders)
     });
 
     if let Some(&next) = next_properties
@@ -707,6 +978,8 @@ fn firing_position(
             .max()
             .unwrap_or(0)
     };
+    // 橋とその近辺は射撃陣地にしない。居座ると後続の直接部隊が渡れない。
+    let bridge_approach = crate::ai::tactics::chokepoint::bridge_approach_cells(map);
     let search_radius = stats.max_range.max(ENGAGEMENT_RADIUS);
     let mut candidates = cells_around(map, target, search_radius);
     if front != target {
@@ -718,6 +991,7 @@ fn firing_position(
         .into_iter()
         .filter(|cell| {
             !taken.contains(cell)
+                && !bridge_approach.contains(cell)
                 && !enemy_cells.contains(cell)
                 && !unowned_properties.contains(cell)
                 && map.get_terrain(cell.x, cell.y).is_some_and(|terrain| {
@@ -760,6 +1034,403 @@ fn firing_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indirect_fire_post_preserves_the_launched_operation_mission() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(
+            20,
+            5,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        ));
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Artillery.as_str().to_owned(),
+            ))
+            .unwrap();
+        world.insert_resource(data);
+        world.insert_resource(crate::resources::DamageChart::new());
+        let gun = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 3, y: 2 },
+                stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let mut order = RouteOrder {
+            key_point: GridPosition { x: 15, y: 2 },
+            staging: GridPosition { x: 5, y: 2 },
+            defend: false,
+            force: unit_value(&world, gun),
+        };
+        for expected in [MissionType::Attack, MissionType::Defense] {
+            order.defend = expected == MissionType::Defense;
+            let plan = RouteOperationPlan {
+                members: vec![vec![gun]],
+                free: Vec::new(),
+                // 本テストは開始済み作戦の任務継承を検査する。燃料1の砲台が遠方へ
+                // 自走して初回出撃できる、という地形到達と矛盾する前提にはしない。
+                launched: vec![true],
+            };
+            let (assigned, _) = responsibilities(
+                &world,
+                PlayerId(1),
+                crate::ai::islands::IslandId(0),
+                &[order],
+                plan,
+                &mut Default::default(),
+            );
+            let role = assigned
+                .iter()
+                .find(|role| role.members.contains(&gun))
+                .unwrap();
+            assert_eq!(
+                role.mission_type, expected,
+                "射撃位置と攻勢・防衛の目的を混同しない"
+            );
+            assert_ne!(role.target, order.key_point, "砲台へは射撃位置を渡す");
+        }
+    }
+
+    /// 配分判断の下流にある出撃判定も、実Entityと地形を置いて独立に検査する。
+    #[test]
+    fn launch_scenario_matrix() {
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let mut failures = Vec::new();
+        for (name, ours, enemies, blocked, expected) in [
+            ("unopposed_advance_on_land", vec![2], vec![18], false, true),
+            (
+                "outnumbered_at_enemy_position",
+                vec![2],
+                vec![8, 9, 10],
+                false,
+                false,
+            ),
+            ("reinforcements_at_front", vec![8, 7], vec![9], false, true),
+            (
+                "sea_blocks_the_apparent_first_arrival",
+                vec![2],
+                vec![18],
+                true,
+                false,
+            ),
+        ] {
+            let mut world = World::new();
+            let mut map = Map::new(
+                20,
+                5,
+                crate::resources::Terrain::Plains,
+                crate::resources::GridTopology::Square,
+            );
+            if blocked {
+                for y in 0..map.height {
+                    map.set_terrain(5, y, crate::resources::Terrain::Sea)
+                        .unwrap();
+                }
+                assert!(
+                    crate::systems::movement::get_valid_movement_cost(
+                        &data,
+                        stats.movement_type,
+                        crate::resources::Terrain::Sea,
+                    )
+                    .is_none()
+                );
+            }
+            world.insert_resource(map.clone());
+            world.insert_resource(data.clone());
+            let mut members = Vec::new();
+            for (player, positions) in [(1, ours), (2, enemies)] {
+                for x in positions {
+                    let entity = world
+                        .spawn((
+                            Faction(PlayerId(player)),
+                            GridPosition { x, y: 2 },
+                            stats.clone(),
+                            Health {
+                                current: 100,
+                                max: 100,
+                            },
+                        ))
+                        .id();
+                    if player == 1 {
+                        members.push(entity);
+                    }
+                }
+            }
+            let order = RouteOrder {
+                key_point: GridPosition { x: 8, y: 2 },
+                staging: GridPosition { x: 2, y: 2 },
+                defend: false,
+                force: stats.cost,
+            };
+            let actual = launches(&world, &map, PlayerId(1), &order, &members);
+            println!(
+                "{} {name} expected_launch={expected} actual_launch={actual}",
+                if actual == expected { "PASS" } else { "FAIL" }
+            );
+            if actual != expected {
+                failures.push(name);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "出撃判断が期待に反した局面: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn launched_operation_does_not_restage_after_attrition_without_a_defend_order() {
+        let mut world = World::new();
+        let map = Map::new(
+            20,
+            5,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        world.insert_resource(map.clone());
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Artillery.as_str().to_owned(),
+            ))
+            .unwrap();
+        let enemy_stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::MdTank.as_str().to_owned(),
+            ))
+            .unwrap();
+        world.insert_resource(data);
+        world.insert_resource(crate::resources::DamageChart::new());
+        let gun = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 3, y: 2 },
+                stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        for at in [
+            GridPosition { x: 15, y: 2 },
+            GridPosition { x: 16, y: 2 },
+            GridPosition { x: 15, y: 3 },
+        ] {
+            world.spawn((
+                Faction(PlayerId(2)),
+                at,
+                enemy_stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ));
+        }
+        let mut manager = SquadManager::default();
+        manager
+            .create_owned_squad(MissionType::Attack, PlayerId(1))
+            .members
+            .insert(gun);
+        let mut order = RouteOrder {
+            key_point: GridPosition { x: 15, y: 2 },
+            staging: GridPosition { x: 5, y: 2 },
+            defend: false,
+            force: unit_value(&world, gun),
+        };
+        manager.route_operation_members.insert(gun, order.key_point);
+        assert!(!launches(&world, &map, PlayerId(1), &order, &[gun]));
+        for expected in [MissionType::Attack, MissionType::Defense] {
+            order.defend = expected == MissionType::Defense;
+            let orders = [order];
+            let plan = carry_over(&world, &manager, &orders, &[gun]);
+            let (assigned, _) = responsibilities(
+                &world,
+                PlayerId(1),
+                crate::ai::islands::IslandId(0),
+                &orders,
+                plan,
+                &mut Default::default(),
+            );
+            let role = assigned
+                .iter()
+                .find(|role| role.members.contains(&gun))
+                .unwrap();
+            assert_eq!(
+                role.mission_type, expected,
+                "明示的な防衛変更があるときだけ攻勢を止める"
+            );
+        }
+    }
+
+    /// 防衛の余剰と新規部隊が、充足済みの近い守備隊へ再吸収されない。
+    /// 敵と交戦中の部隊は、守りの所要戦力を超えていても別の進軍路へ引き抜かない。
+    #[test]
+    fn engaged_defense_surplus_is_not_pulled_to_another_route() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(
+            20,
+            5,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        ));
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let cost = stats.cost;
+        world.insert_resource(data);
+        world.insert_resource(crate::resources::DamageChart::new());
+        let mut spawn = |player: u32| {
+            world
+                .spawn((
+                    Faction(PlayerId(player)),
+                    GridPosition { x: 2, y: 2 },
+                    stats.clone(),
+                    Health {
+                        current: 100,
+                        max: 100,
+                    },
+                ))
+                .id()
+        };
+        let units = (0..3).map(|_| spawn(1)).collect::<Vec<_>>();
+        let enemy = spawn(2);
+        world.entity_mut(enemy).insert(GridPosition { x: 4, y: 2 });
+        let orders = [
+            RouteOrder {
+                key_point: GridPosition { x: 3, y: 2 },
+                staging: GridPosition { x: 3, y: 2 },
+                defend: true,
+                force: cost,
+            },
+            RouteOrder {
+                key_point: GridPosition { x: 17, y: 2 },
+                staging: GridPosition { x: 10, y: 2 },
+                defend: false,
+                force: cost * 3,
+            },
+        ];
+        let plan = RouteOperationPlan {
+            members: vec![units.clone(), Vec::new()],
+            free: Vec::new(),
+            launched: vec![false, true],
+        };
+        let (_, members) = responsibilities(
+            &world,
+            PlayerId(1),
+            crate::ai::islands::IslandId(0),
+            &orders,
+            plan,
+            &mut Default::default(),
+        );
+        assert_eq!(members[0].len(), units.len(), "交戦中の部隊は戦線に残す");
+        assert!(members[1].is_empty(), "地図の反対側へ引き抜かない");
+    }
+
+    #[test]
+    fn defense_keeps_required_force_and_releases_surplus_to_the_offensive() {
+        let mut world = World::new();
+        world.insert_resource(Map::new(
+            20,
+            5,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        ));
+        let data = crate::resources::master_data::MasterDataRegistry::load().unwrap();
+        let stats = data
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                crate::resources::UnitType::Tank.as_str().to_owned(),
+            ))
+            .unwrap();
+        let cost = stats.cost;
+        world.insert_resource(data);
+        world.insert_resource(crate::resources::DamageChart::new());
+        let units = (0..4)
+            .map(|_| {
+                world
+                    .spawn((
+                        Faction(PlayerId(1)),
+                        GridPosition { x: 2, y: 2 },
+                        stats.clone(),
+                        Health {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id()
+            })
+            .collect::<Vec<_>>();
+        for kept in [0_usize, 1] {
+            let orders = [
+                RouteOrder {
+                    key_point: GridPosition { x: 3, y: 2 },
+                    staging: GridPosition { x: 3, y: 2 },
+                    defend: true,
+                    force: cost * kept as u32,
+                },
+                RouteOrder {
+                    key_point: GridPosition { x: 17, y: 2 },
+                    staging: GridPosition { x: 10, y: 2 },
+                    defend: false,
+                    force: cost * (units.len() - kept) as u32,
+                },
+            ];
+            let plan = RouteOperationPlan {
+                members: vec![units[..3].to_vec(), Vec::new()],
+                free: vec![units[3]],
+                launched: vec![false, true],
+            };
+            let (roles, members) = responsibilities(
+                &world,
+                PlayerId(1),
+                crate::ai::islands::IslandId(0),
+                &orders,
+                plan,
+                &mut Default::default(),
+            );
+            assert_eq!(members[0].len(), kept, "守備に必要な戦力を残す");
+            assert_eq!(
+                members[1].len(),
+                units.len() - kept,
+                "余剰と新規戦力は主攻勢へ送る"
+            );
+            let unique = members
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<crate::collections::HashSet<_>>();
+            assert_eq!(
+                unique.len(),
+                units.len(),
+                "同じ部隊を二重配属・消失させない"
+            );
+            for member in &members[1] {
+                assert_eq!(
+                    roles
+                        .iter()
+                        .find(|role| role.members.contains(member))
+                        .unwrap()
+                        .mission_type,
+                    MissionType::Attack,
+                    "遠方でも余剰を防衛待機へ戻さない"
+                );
+            }
+        }
+    }
 
     #[test]
     fn membership_removes_despawned_entities_but_keeps_other_players() {

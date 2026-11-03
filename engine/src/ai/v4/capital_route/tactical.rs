@@ -5,12 +5,44 @@ use crate::ai::v4::capital_route::model::{
     CapitalRouteCommitment, CapitalRouteExecutionPhase, CapitalRouteNodeObjective,
     CapitalRouteNodeOperationRegistry, CapitalRouteNodeScope,
 };
-use crate::ai::v4::capital_route::node_operation::capital_route_node_exit_satisfied;
 use crate::ai::v4::capital_route::topology::capital_route_topology_for;
 use crate::ai::v4::{
     BTreeSet, Entity, Faction, GridPosition, HashMap, Health, Map, MasterDataRegistry, PlayerId,
     Property, Terrain, UnitStats, World, get_valid_movement_cost, operation,
 };
+
+/// 占有を含まない地形距離だけを手番内で共有する。進入口の占有は毎回取り直す。
+#[derive(bevy_ecs::prelude::Resource, Default)]
+struct RegionTerrainDistances(
+    std::sync::Mutex<(
+        Option<u64>,
+        crate::ai::turn_distance::SourceTurnDistanceCache,
+    )>,
+);
+
+pub(crate) fn prepare_region_tactical_cache(world: &mut World) {
+    use std::hash::{Hash, Hasher};
+    let Some(map) = world.get_resource::<Map>() else {
+        return;
+    };
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    map.width.hash(&mut hash);
+    map.height.hash(&mut hash);
+    std::mem::discriminant(&map.topology).hash(&mut hash);
+    for terrain in &map.tiles {
+        std::mem::discriminant(terrain).hash(&mut hash);
+    }
+    world
+        .get_resource::<crate::resources::MatchState>()
+        .map(|state| state.current_turn_number.0)
+        .hash(&mut hash);
+    let generation = hash.finish();
+    let cache = world.get_resource_or_insert_with(RegionTerrainDistances::default);
+    let mut cache = cache.0.lock().unwrap_or_else(|poison| poison.into_inner());
+    if cache.0 != Some(generation) {
+        *cache = (Some(generation), Default::default());
+    }
+}
 
 /// 未完了Capture Nodeの施設セルを、占領可能unitのために予約する。
 ///
@@ -25,7 +57,7 @@ pub(in crate::ai::v4) fn capital_route_capture_target_is_reserved(
     operations.operations.values().any(|operation| {
         operation.id.topology.player_id == player_id
             && operation.objective == CapitalRouteNodeObjective::Capture
-            && !capital_route_node_exit_satisfied(operation)
+            && operation.state != crate::ai::v4::victory_roadmap::RoadmapNodeState::Secured
             && operation.capture_targets.contains(&position)
     })
 }
@@ -44,6 +76,24 @@ pub(in crate::ai::v4) fn capital_route_region_reached(
         CapitalRouteNodeScope::Area => commitment.control_area.contains(&position),
     };
     reached_scope && (commitment.crossing_exit.is_none() || commitment.crossed)
+}
+
+/// DAGがDefenseを前進Controlへ再指令した場合、戦術にも同じ攻勢役割を渡す。
+/// 保持・待機中の防衛役を、作戦上必要な不利交換へ巻き込まない。
+pub(crate) fn capital_route_tactical_mission(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    mission: &crate::ai::squad::MissionType,
+) -> crate::ai::squad::MissionType {
+    if *mission == crate::ai::squad::MissionType::Defense
+        && capital_route_commitment_for_entity(world, player_id, entity)
+            .is_some_and(|order| order.phase == CapitalRouteExecutionPhase::Advance)
+    {
+        crate::ai::squad::MissionType::Attack
+    } else {
+        mission.clone()
+    }
 }
 
 /// Areaへ到達した後の移動候補を、Roadmapが指示した局地戦領域へ限定する。
@@ -68,13 +118,112 @@ pub(crate) fn capital_route_allows_tactical_position(
     if !capital_route_region_reached(commitment, current) {
         return None;
     }
-    let inside_control_area = commitment.control_area.contains(&position);
-    let can_capture = world
-        .get::<UnitStats>(entity)
-        .is_some_and(|stats| stats.can_capture);
-    let reserved_for_capturer =
-        !can_capture && is_capture_target_reserved(world, player_id, position);
-    Some(inside_control_area && !reserved_for_capturer)
+    // ここは地域境界だけを判定する。占領予定地の退避・敵生産口の占位は
+    // 各戦術器の既存ルールで判定し、同じ施設を二重の制約で候補から落とさない。
+    Some(commitment.control_area.contains(&position))
+}
+
+/// 橋へ進入する直接戦闘・占領役がいるなら、間接火力は通過枠の外から支える。
+/// 間接火力しか残っていない場合は、自ら出口へ進めるよう物理占位の任務を保つ。
+fn point_has_assault_unit(
+    world: &World,
+    player_id: PlayerId,
+    order: &CapitalRouteCommitment,
+) -> bool {
+    world.iter_entities().any(|unit| {
+        unit.get::<Faction>()
+            .is_some_and(|owner| owner.0 == player_id)
+            && unit.get::<crate::components::Transporting>().is_none()
+            && unit.get::<UnitStats>().is_some_and(|stats| {
+                stats.min_range <= 1 && (stats.max_range > 0 || stats.can_capture)
+            })
+            && !capital_route_is_recovering(world, player_id, unit.id())
+            && capital_route_commitment_for_entity(world, player_id, unit.id()).is_some_and(
+                |other| {
+                    other.island_id == order.island_id
+                        && other.target_anchor == order.target_anchor
+                        && other.phase == CapitalRouteExecutionPhase::Advance
+                },
+            )
+    })
+}
+
+/// 地域への進入先・占領先は実際に踏む位置であり、射程内から支える参照点ではない。
+/// 敵が占有している場合は先に排除するため、通常の攻撃射程を用いる。
+pub(crate) fn capital_route_target_requires_occupancy(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    target: GridPosition,
+) -> bool {
+    capital_route_commitment_for_entity(world, player_id, entity).is_some_and(|order| {
+        order.phase == CapitalRouteExecutionPhase::Advance
+            && !capital_route_is_recovering(world, player_id, entity)
+            && !(order.scope == CapitalRouteNodeScope::Point
+                && world
+                    .get::<UnitStats>(entity)
+                    .is_some_and(|stats| stats.min_range > 1)
+                && point_has_assault_unit(world, player_id, order))
+            && (order.scope == CapitalRouteNodeScope::Point
+                || world
+                    .get::<GridPosition>(entity)
+                    .is_some_and(|at| !capital_route_region_reached(order, *at))
+                || world
+                    .get::<UnitStats>(entity)
+                    .is_some_and(|stats| stats.can_capture))
+    }) && !world.iter_entities().any(|unit| {
+        unit.get::<GridPosition>() == Some(&target)
+            && unit
+                .get::<Faction>()
+                .is_some_and(|owner| owner.0 != player_id)
+            && unit.get::<UnitStats>().is_some()
+            && unit.get::<crate::components::Transporting>().is_none()
+    })
+}
+
+/// 地域の外側にいる火力も、入口ではなく排除すべき地域内の敵へ射程を合わせる。
+fn regional_enemy_target(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    order: &CapitalRouteCommitment,
+) -> Option<GridPosition> {
+    let stats = world.get::<UnitStats>(entity)?;
+    let position = world.get::<GridPosition>(entity)?;
+    let map = world.get_resource::<Map>()?;
+    let chart = world.get_resource::<crate::resources::DamageChart>()?;
+    let ammo = world.get::<crate::components::Ammo>(entity);
+    world
+        .iter_entities()
+        .filter_map(|enemy| {
+            let at = *enemy.get::<GridPosition>()?;
+            let enemy_stats = enemy.get::<UnitStats>()?;
+            if enemy.get::<Faction>()?.0 == player_id
+                || enemy.get::<crate::components::Transporting>().is_some()
+                || !order.control_area.contains(&at)
+            {
+                return None;
+            }
+            let effective = (ammo.is_none_or(|ammo| stats.max_ammo1 == 0 || ammo.ammo1 > 0)
+                && chart
+                    .get_base_damage(stats.unit_type, enemy_stats.unit_type)
+                    .unwrap_or(0)
+                    > 0)
+                || (ammo.is_none_or(|ammo| stats.max_ammo2 == 0 || ammo.ammo2 > 0)
+                    && chart
+                        .get_base_damage_secondary(stats.unit_type, enemy_stats.unit_type)
+                        .unwrap_or(0)
+                        > 0);
+            effective.then_some(at)
+        })
+        .min_by_key(|at| {
+            (
+                map.distance(position.x, position.y, at.x, at.y)
+                    .saturating_sub(stats.max_range),
+                at.y,
+                at.x,
+            )
+        })
 }
 
 /// 非占領ユニットが自軍の占領予定物件を踏んで占領を塞ぐのを防ぐため、
@@ -110,6 +259,164 @@ pub(crate) fn is_capture_target_reserved(
                     && squad.plan.target == Some(position)
             })
         })
+}
+
+/// 地域への進入先は代表点に固定しない。地形経路で近い空きセルを選び、
+/// 先に進入した味方のマスと占領予約を後続の目的地から外す。
+fn region_entry_target(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    commitment: &CapitalRouteCommitment,
+) -> Option<GridPosition> {
+    let position = *world.get::<GridPosition>(entity)?;
+    let stats = world.get::<UnitStats>(entity)?;
+    let map = world.get_resource::<Map>()?;
+    let master = world.get_resource::<MasterDataRegistry>()?;
+    let occupancy = world
+        .iter_entities()
+        .filter_map(|unit| {
+            if unit.get::<crate::components::Transporting>().is_some() {
+                return None;
+            }
+            let at = unit.get::<GridPosition>()?;
+            let faction = unit.get::<Faction>()?;
+            let stats = unit.get::<UnitStats>()?;
+            Some((
+                (at.x, at.y),
+                crate::systems::movement::OccupantInfo {
+                    player_id: faction.0,
+                    is_transport: false,
+                    unit_type: stats.unit_type,
+                    loadable_types: Vec::new(),
+                    free_slots: 0,
+                },
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    // 敵の占有は攻撃で解消する前提の目標選択。合法な実移動は行動候補側で判定する。
+    let distances = if let Some(cache) = world.get_resource::<RegionTerrainDistances>() {
+        let mut cache = cache.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        crate::ai::turn_distance::calculate_source_turn_distances_cached(
+            map,
+            master,
+            &HashMap::default(),
+            (position.x, position.y),
+            stats.movement_type,
+            stats.max_movement,
+            player_id,
+            &mut cache.1,
+        )
+    } else {
+        crate::ai::turn_distance::calculate_source_turn_distances_cached(
+            map,
+            master,
+            &HashMap::default(),
+            (position.x, position.y),
+            stats.movement_type,
+            stats.max_movement,
+            player_id,
+            &mut Default::default(),
+        )
+    };
+    commitment
+        .control_area
+        .iter()
+        .copied()
+        .filter(|cell| !occupancy.contains_key(&(cell.x, cell.y)))
+        .filter_map(|cell| distances.get(&cell).map(|distance| (cell, *distance)))
+        .min_by_key(|(cell, distance)| (*distance, cell.y, cell.x))
+        .map(|(cell, _)| cell)
+        .or_else(|| {
+            // 全進入口を敵が占めていても、排除する敵位置を目標として保つ。
+            // 味方で埋まった地域は待機し、実際の占領予約・占位は戦術側が判断する。
+            commitment
+                .control_area
+                .iter()
+                .copied()
+                .filter(|cell| {
+                    occupancy
+                        .get(&(cell.x, cell.y))
+                        .is_some_and(|unit| unit.player_id != player_id)
+                })
+                .filter_map(|cell| distances.get(&cell).map(|distance| (cell, *distance)))
+                .min_by_key(|(cell, distance)| (*distance, cell.y, cell.x))
+                .map(|(cell, _)| cell)
+        })
+}
+
+/// 地域内の占領担当を未所有施設へ一対一で割り当てる。
+/// 既に対象上にいる担当を距離0で優先し、余剰部隊を同じ施設へ重ねない。
+fn regional_capture_target(
+    world: &World,
+    player_id: PlayerId,
+    entity: Entity,
+    commitment: &CapitalRouteCommitment,
+    targets: &[GridPosition],
+) -> Option<GridPosition> {
+    let map = world.get_resource::<Map>()?;
+    let mut pairs = world
+        .iter_entities()
+        .filter_map(|unit| {
+            let at = *unit.get::<GridPosition>()?;
+            let stats = unit.get::<UnitStats>()?;
+            let faction = unit.get::<Faction>()?;
+            let order = capital_route_commitment_for_entity(world, player_id, unit.id())?;
+            let assignment = world
+                .get_resource::<crate::ai::operation_assignment::UnitOperationRegistry>()?
+                .assignment(unit.id())?;
+            let squad = world
+                .get_resource::<crate::ai::squad::SquadManager>()?
+                .squads
+                .iter()
+                .find(|squad| Some(squad.id) == assignment.squad_id)?;
+            if !crate::ai::tactics::campaign::campaign_mission_allows_capture(
+                &capital_route_tactical_mission(
+                    world,
+                    player_id,
+                    unit.id(),
+                    &squad.plan.mission_type,
+                ),
+            ) {
+                return None;
+            }
+            (faction.0 == player_id
+                && stats.can_capture
+                && unit.get::<crate::components::Transporting>().is_none()
+                && !capital_route_is_recovering(world, player_id, unit.id())
+                && order.island_id == commitment.island_id
+                && order.target_anchor == commitment.target_anchor
+                && order.phase == CapitalRouteExecutionPhase::Advance
+                && commitment.control_area.contains(&at))
+            .then_some((unit.id(), at))
+        })
+        .flat_map(|(unit, at)| {
+            targets.iter().map(move |target| {
+                (
+                    map.distance(at.x, at.y, target.x, target.y),
+                    unit.to_bits(),
+                    target.y,
+                    target.x,
+                    unit,
+                    *target,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_unstable_by_key(|pair| (pair.0, pair.1, pair.2, pair.3));
+    let mut assigned_units = crate::collections::HashSet::default();
+    let mut assigned_targets = crate::collections::HashSet::default();
+    for (_, _, _, _, unit, target) in pairs {
+        if assigned_units.contains(&unit) || assigned_targets.contains(&target) {
+            continue;
+        }
+        assigned_units.insert(unit);
+        assigned_targets.insert(target);
+        if unit == entity {
+            return Some(target);
+        }
+    }
+    None
 }
 
 /// 行動決定側へ、現在の地域作戦の戦術的な目標を返す。
@@ -286,13 +593,29 @@ pub(crate) fn capital_route_tactical_target(
             }
         }
     }
+    // 地域外の直接戦闘役は、敵が残っていても空いた入口へ進む。
+    // 敵座標を移動目標にすると武器射程で接近完了となり、制圧のための実進入が消える。
+    // 射撃対象の優先順位は別窓口で渡し、間接火力だけは地域外から射程を合わせる。
+    let reached = capital_route_region_reached(commitment, position);
+    let indirect = world
+        .get::<UnitStats>(entity)
+        .is_some_and(|stats| stats.min_range > 1);
+    if !can_capture
+        && (reached || indirect)
+        && let Some(enemy) = regional_enemy_target(world, player_id, entity, commitment)
+    {
+        return Some(Some(enemy));
+    }
     if !capital_route_region_reached(commitment, position) {
-        return Some(Some(commitment.execution_target));
+        return Some(if commitment.scope == CapitalRouteNodeScope::Area {
+            region_entry_target(world, player_id, entity, commitment)
+        } else {
+            Some(commitment.execution_target)
+        });
     }
     if commitment.objective != CapitalRouteNodeObjective::Capture {
         return Some(None);
     }
-    let map = world.get_resource::<Map>()?;
     let owners = world
         .iter_entities()
         .filter_map(|property| {
@@ -302,20 +625,19 @@ pub(crate) fn capital_route_tactical_target(
             ))
         })
         .collect::<HashMap<_, _>>();
-    Some(
-        commitment
+    if can_capture {
+        let targets = commitment
             .capture_targets
             .iter()
+            .copied()
             .filter(|target| owners.get(target) != Some(&Some(player_id)))
-            .min_by_key(|target| {
-                (
-                    map.distance(position.x, position.y, target.x, target.y),
-                    target.y,
-                    target.x,
-                )
-            })
-            .copied(),
-    )
+            .collect::<Vec<_>>();
+        return Some(
+            regional_capture_target(world, player_id, entity, commitment, &targets)
+                .or_else(|| regional_enemy_target(world, player_id, entity, commitment)),
+        );
+    }
+    Some(None)
 }
 
 /// 既存の戦術器向けに、地点を持つ場合だけを返す互換窓口。

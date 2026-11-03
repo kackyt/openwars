@@ -4,7 +4,9 @@ use crate::events::*;
 use crate::resources::*;
 use bevy_ecs::prelude::*;
 /// 空母がターン開始時に搭載ユニットへ提供できる内部HP回復量です。
-const MAX_CARRIER_CARGO_REPAIR_HP: u32 = 20;
+/// 自軍の物件（都市・工場・首都・空港・港）の上で、ターン開始時に回復するHPの上限。
+pub(crate) const PROPERTY_REPAIR_HP: u32 = 20;
+const MAX_CARRIER_CARGO_REPAIR_HP: u32 = PROPERTY_REPAIR_HP;
 const REPAIR_COST_DENOMINATOR: u64 = 100;
 
 /// 指定した内部HP回復量に対応する修理費を計算します。
@@ -377,7 +379,7 @@ fn apply_unit_resupply(
             if resupply_tiles.contains(&(pos.x, pos.y)) {
                 // 回復・補充にかかるコストを計算
                 // HP回復（最大20回復）
-                let hp_to_restore = 20.min(hp.max.saturating_sub(hp.current));
+                let hp_to_restore = PROPERTY_REPAIR_HP.min(hp.max.saturating_sub(hp.current));
                 let repair_cost = stats.cost * hp_to_restore / 100;
 
                 let ammo1_diff = stats.max_ammo1.saturating_sub(ammo.ammo1);

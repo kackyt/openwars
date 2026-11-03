@@ -361,6 +361,24 @@ pub(in crate::ai::v4) fn capital_route_topology_for(
         .and_then(|registry| registry.topologies.get(&key))
 }
 
+/// 合流する終点の座標ではなく、現在地から地形経路で近い進軍軸を返す。
+pub(crate) fn capital_route_nearest_axis(
+    world: &World,
+    player_id: PlayerId,
+    island_id: crate::ai::islands::IslandId,
+    entity: crate::ai::v4::Entity,
+) -> Option<usize> {
+    let topology = capital_route_topology_for(world, player_id, island_id)?;
+    let at = world.get::<GridPosition>(entity)?;
+    topology
+        .route_distances
+        .iter()
+        .enumerate()
+        .filter_map(|(route, distances)| distances.get(at).map(|cost| (*cost, route)))
+        .min()
+        .map(|(_, route)| route)
+}
+
 /// 橋と山岳回廊を同じ「進軍軸の前方地点」として返す。
 ///
 /// 実戦では開始時に作ったTopologyを再利用する。unit testなど、まだResourceを
@@ -475,8 +493,8 @@ pub(in crate::ai::v4) fn progress_order(
 
 /// 静的な地形・拠点配置から、勢力ごとの前向き首都攻略DAGを一度だけ構築する。
 ///
-/// ノードは両首都を結ぶ最短装甲回廊のセル、辺は自首都からの距離が一つ増える移動だけで
-/// 構成する。従って回廊の分岐と合流は表せる一方、後退辺による循環は入り込まない。
+/// 装甲回廊の各入口から首都への合流路を確保し、循環を作らない側方辺を補う。
+/// Node番号は辺から求める依存順であり、自首都からの距離とは区別する。
 pub(in crate::ai::v4) fn build_capital_route_topology(
     world: &World,
     player_id: PlayerId,
@@ -560,6 +578,8 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
                 .then_some(*position)
         })
         .collect::<Vec<_>>();
+    // 各進軍軸を通って首都へ至る経路を先に確保する。
+    // 自首都距離の単調増加だけでは、長い回廊の出口から首都への合流路を失う。
     corridor_positions.sort_unstable_by_key(|position| progress_order(&from_home, *position));
     let node_ids = corridor_positions
         .iter()
@@ -575,20 +595,141 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
             successor_nodes: Vec::new(),
         })
         .collect::<Vec<_>>();
-    for (position, node_id) in &node_ids {
-        if *node_id == goal_node {
+    let corridor_set = corridor_positions.iter().copied().collect::<HashSet<_>>();
+    let find_path = |start: GridPosition, goal: GridPosition, forbidden: &HashSet<GridPosition>| {
+        let mut previous = HashMap::from_iter([(start, start)]);
+        let mut pending = VecDeque::from([start]);
+        while let Some(at) = pending.pop_front() {
+            if at == goal {
+                let mut path = vec![at];
+                while *path.last().unwrap() != start {
+                    path.push(previous[path.last().unwrap()]);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for (x, y) in map.get_adjacent(at.x, at.y) {
+                let next = GridPosition { x, y };
+                if corridor_set.contains(&next)
+                    && !forbidden.contains(&next)
+                    && !previous.contains_key(&next)
+                {
+                    previous.insert(next, at);
+                    pending.push_back(next);
+                }
+            }
+        }
+        None
+    };
+    for front in &fronts {
+        let other_fronts = fronts
+            .iter()
+            .copied()
+            .filter(|at| at != front)
+            .collect::<HashSet<_>>();
+        let prefix = find_path(home, *front, &other_fronts)
+            .or_else(|| find_path(home, *front, &HashSet::default()))?;
+        let mut forbidden = prefix
+            .iter()
+            .copied()
+            .filter(|at| at != front)
+            .collect::<HashSet<_>>();
+        forbidden.extend(other_fronts);
+        let suffix = find_path(*front, enemy_capital, &forbidden).or_else(|| {
+            let forbidden = prefix.iter().copied().filter(|at| at != front).collect();
+            find_path(*front, enemy_capital, &forbidden)
+        })?;
+        let mut path = prefix;
+        path.extend(suffix.into_iter().skip(1));
+        for edge in path.windows(2) {
+            let source = node_ids[&edge[0]];
+            let destination = node_ids[&edge[1]];
+            if !nodes[source.0].successor_nodes.contains(&destination) {
+                nodes[source.0].successor_nodes.push(destination);
+            }
+        }
+    }
+    // 側方の地域へも到達できるよう元の前向き辺を補う。
+    // 先に確保した回廊を逆行する循環辺だけを除外する。
+    for (index, position) in corridor_positions.iter().enumerate() {
+        if index == goal_node.0 {
             continue;
         }
-        // 回廊セルは必ず距離表に載っている。辺は距離が一つ増える隣接セルへだけ張る。
-        let progress = from_home[position];
-        nodes[node_id.0].successor_nodes = map
-            .get_adjacent(position.x, position.y)
-            .into_iter()
-            .map(|(x, y)| GridPosition { x, y })
-            .filter(|adjacent| from_home.get(adjacent) == Some(&progress.saturating_add(1)))
-            .filter_map(|adjacent| node_ids.get(&adjacent).copied())
-            .collect();
+        for (x, y) in map.get_adjacent(position.x, position.y) {
+            let at = GridPosition { x, y };
+            let Some(&next) = node_ids.get(&at) else {
+                continue;
+            };
+            if from_home[&at] != from_home[position].saturating_add(1)
+                || nodes[index].successor_nodes.contains(&next)
+            {
+                continue;
+            }
+            let mut pending = vec![next];
+            let mut visited = HashSet::default();
+            let mut cycles = false;
+            while let Some(candidate) = pending.pop() {
+                if candidate.0 == index {
+                    cycles = true;
+                    break;
+                }
+                if visited.insert(candidate) {
+                    pending.extend(nodes[candidate.0].successor_nodes.iter().copied());
+                }
+            }
+            if !cycles {
+                nodes[index].successor_nodes.push(next);
+            }
+        }
     }
+    // 地理的な距離と作戦の依存順は別物。辺からトポロジカル順を確定する。
+    let mut inbound = vec![0_usize; nodes.len()];
+    for node in &nodes {
+        for next in &node.successor_nodes {
+            inbound[next.0] += 1;
+        }
+    }
+    let mut ready = std::collections::BTreeSet::new();
+    for (index, count) in inbound.iter().enumerate() {
+        if *count == 0 {
+            ready.insert(index);
+        }
+    }
+    let mut order = Vec::with_capacity(nodes.len());
+    while let Some(index) = ready.pop_first() {
+        order.push(index);
+        for next in &nodes[index].successor_nodes {
+            inbound[next.0] -= 1;
+            if inbound[next.0] == 0 {
+                ready.insert(next.0);
+            }
+        }
+    }
+    if order.len() != nodes.len() {
+        return None;
+    }
+    let mut remap = vec![CapitalRouteNodeId(0); nodes.len()];
+    for (new, old) in order.iter().enumerate() {
+        remap[*old] = CapitalRouteNodeId(new);
+    }
+    let nodes = order
+        .iter()
+        .map(|old| CapitalRouteNode {
+            anchor: nodes[*old].anchor,
+            successor_nodes: nodes[*old]
+                .successor_nodes
+                .iter()
+                .map(|next| remap[next.0])
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let corridor_positions = nodes.iter().map(|node| node.anchor).collect();
+    let start_node = remap[start_node.0];
+    let goal_node = remap[goal_node.0];
+    let route_distances = fronts
+        .iter()
+        .map(|front| armored_step_distances(map, master_data, *front))
+        .collect();
     let routes = fronts
         .into_iter()
         .map(|front| CapitalRoute { front })
@@ -599,6 +740,7 @@ pub(in crate::ai::v4) fn build_capital_route_topology(
         nodes,
         corridor: corridor_positions,
         routes,
+        route_distances,
         property_routes,
         from_home,
         beachhead,

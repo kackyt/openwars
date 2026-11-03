@@ -48,23 +48,37 @@ pub(super) fn allocate_artillery_carriers(
         .iter()
         .filter(|unit| is_artillery_carrier(&unit.stats))
         .collect::<Vec<_>>();
+    // 射程内に敵または未確保の目標がある砲は現地で任務を果たせる。
+    let needs_transport = |unit: &&UnitSnapshot| {
+        is_ferried_gun(&unit.stats)
+            && !scan
+                .enemy_units
+                .iter()
+                .map(|enemy| enemy.pos)
+                .chain(scan.open_properties.iter().copied())
+                .any(|target| {
+                    let distance = scan
+                        .map
+                        .distance(unit.pos.x, unit.pos.y, target.x, target.y);
+                    (unit.stats.min_range..=unit.stats.max_range).contains(&distance)
+                })
+    };
     let guns = scan
         .my_units
         .iter()
-        .filter(|unit| is_ferried_gun(&unit.stats))
+        .filter(needs_transport)
         .map(|unit| unit.pos)
         .collect::<Vec<_>>();
-    // 近くに補給輸送車が居ない孤立した砲台（護衛を失って前線に取り残された砲台）。
-    let unescorted_guns = scan
-        .my_units
+    let unescorted_guns = guns
         .iter()
-        .filter(|unit| {
-            is_ferried_gun(&unit.stats)
-                && !carriers
-                    .iter()
-                    .any(|c| scan.map.distance(c.pos.x, c.pos.y, unit.pos.x, unit.pos.y) <= 2)
+        .copied()
+        .filter(|gun| {
+            !carriers.iter().any(|carrier| {
+                scan.map
+                    .distance(carrier.pos.x, carrier.pos.y, gun.x, gun.y)
+                    <= 2
+            })
         })
-        .map(|unit| unit.pos)
         .collect::<Vec<_>>();
     place_new_guns_for_fastest_emplacement(
         input,
@@ -86,13 +100,14 @@ pub(super) fn allocate_artillery_carriers(
         .iter()
         .filter(|planned| planned.command.unit_type == carrier_type)
         .count();
-    let gun_count = guns.len()
-        + new_guns.len()
-        + carriers
+    // 積載中の砲台は輸送手段が確保済み。空き車両だけを未輸送砲台に割り当てる。
+    let wanted = (guns.len() + new_guns.len()).saturating_sub(
+        carriers
             .iter()
-            .filter(|carrier| carrier.free_cargo == 0)
-            .count();
-    let wanted = gun_count.saturating_sub(carriers.len() + new_carriers);
+            .filter(|carrier| carrier.free_cargo > 0)
+            .count()
+            + new_carriers,
+    );
     if wanted == 0 {
         return;
     }
