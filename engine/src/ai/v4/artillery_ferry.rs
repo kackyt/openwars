@@ -190,7 +190,9 @@ pub(crate) fn decide_artillery_ferry_phase(
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
+    let bridge_approach = crate::ai::tactics::chokepoint::bridge_approach_cells(&board.map);
     let ferry = ArtilleryFerry {
+        bridge_approach: &bridge_approach,
         board: &board,
         chart: &chart,
         occupancy: &occupancy,
@@ -560,6 +562,8 @@ struct ArtilleryFerry<'a> {
     guards: &'a HashMap<Entity, GridPosition>,
     /// 確定済み地域に有効な敵が残る砲台だけの標的。射撃・輸送・据え付けで共用する。
     regional_targets: &'a HashMap<Entity, HashSet<Entity>>,
+    /// 橋とその近辺。砲台を据えると後続の直接部隊の通路を塞ぐ。
+    bridge_approach: &'a HashSet<GridPosition>,
 }
 
 impl ArtilleryFerry<'_> {
@@ -681,6 +685,13 @@ impl ArtilleryFerry<'_> {
     /// 敵の脅威圏内（threat > 0）にあるマスでは、前方に味方直接部隊の盾（screened）が
     /// 存在することを完全必須化し、無防備な最前線への据え付けを禁止する。
     fn can_safely_emplace(&self, gun: &BoardUnit, cell: Cell) -> bool {
+        // 橋とその近辺に据えると、後続の直接部隊が橋を渡れない。
+        if self.bridge_approach.contains(&GridPosition {
+            x: cell.0,
+            y: cell.1,
+        }) {
+            return false;
+        }
         // 占領役と未確保拠点を結ぶ一本道に据えると、後続の占領を塞ぐ。
         let exits = self
             .board

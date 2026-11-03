@@ -2942,9 +2942,10 @@ fn advancing_control_accepts_required_attack_but_holding_defense_does_not() {
     );
 }
 
-/// 橋を越える先遣だけをAdvanceにして、橋を撃ち開く戦車を後方待機へ落とさない。
+/// まだ誰も渡っていない橋では、直接部隊（先遣の歩兵と戦車）を優先して前進させ、
+/// 間接火力は橋の手前の待機線で控えさせる。
 #[test]
-fn control_bridge_assigns_both_crossing_lead_and_combat_support() {
+fn control_bridge_advances_direct_units_first_and_stages_indirect_fire() {
     let master = MasterDataRegistry::load().unwrap();
     let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
         &master,
@@ -3023,12 +3024,20 @@ fn control_bridge_assigns_both_crossing_lead_and_combat_support() {
     super::commitment::refresh_capital_route_path_commitments(&mut world, player, &mut manager);
     let paths = world.resource::<CapitalRoutePathRegistry>();
     for id in &squads {
-        let order = &paths.commitments[id];
-        assert_eq!(order.scope, CapitalRouteNodeScope::Point);
+        assert_eq!(paths.commitments[id].scope, CapitalRouteNodeScope::Point);
+    }
+    for id in &squads[..2] {
         assert_eq!(
-            order.phase,
+            paths.commitments[id].phase,
             CapitalRouteExecutionPhase::Advance,
-            "通過役の枠を使わず、複数の間接火力を橋の戦闘へ送る"
+            "歩兵と戦車は続けて橋を渡る"
+        );
+    }
+    for id in &squads[2..] {
+        assert_eq!(
+            paths.commitments[id].phase,
+            CapitalRouteExecutionPhase::Stage,
+            "間接火力は直接部隊が渡るまで橋へ出ない"
         );
     }
     assert_eq!(

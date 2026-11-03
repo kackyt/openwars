@@ -1410,8 +1410,10 @@ fn allocate_frontline_phase(
     let staged_squads = &mut state.staged_squads;
     let requested_phase = role.requested_phase;
     let forward_target = role.forward_target;
-    // 間接射撃は橋上の占位枠を使わない。通過役と同じ枠で制限すると、
-    // 一門だけを前へ出して残りの砲兵・戦車を後方へ押し戻し、橋を撃ち開けない。
+    // 橋は直接部隊を優先して渡す。まだ誰も渡っていない橋へ間接火力だけの小隊を
+    // 前進させると、撃つために橋やその口へ居座り、後続の戦車・歩兵が渡れない。
+    // 間接火力は橋の手前の待機線で控え（射程内の敵は橋の区域の外から撃つ）、
+    // 直接部隊が向こう岸へ出た後に渡る。前衛枠は消費しない。
     if requested_phase == CapitalRouteExecutionPhase::Advance
         && node_operation.scope == CapitalRouteNodeScope::Point
         && !squad.ground_members.is_empty()
@@ -1421,7 +1423,14 @@ fn allocate_frontline_phase(
                 .is_some_and(|stats| stats.min_range > 1)
         })
     {
-        return (requested_phase, forward_target, false);
+        if node_operation.crossed {
+            return (requested_phase, forward_target, false);
+        }
+        let stage_index = staged_squads.entry(operation_id).or_default();
+        let target =
+            capital_route_staging_target(world, player_id, path, forward_target, *stage_index);
+        *stage_index = stage_index.saturating_add(1);
+        return (CapitalRouteExecutionPhase::Stage, target, false);
     }
     let assigned_capture_members = frontline_members
         .get(&(operation_id, true))
@@ -1433,7 +1442,15 @@ fn allocate_frontline_phase(
         squad.capture_member_count,
         assigned_capture_members,
     );
-    let role_capacity = capital_route_role_frontline_capacity(node_operation, uses_capture_lane);
+    let role_capacity = if node_operation.scope == CapitalRouteNodeScope::Point {
+        // 橋の前衛枠は、向こう岸までの橋のマス数と出口1マス。橋の上に同時に立てる数
+        // だけ直接部隊を続けて渡し、1体ずつ待機線から呼び出して詰まらせない。
+        world
+            .get_resource::<Map>()
+            .map_or(1, |map| bridge_crossing_capacity(map, node_operation, path))
+    } else {
+        capital_route_role_frontline_capacity(node_operation, uses_capture_lane)
+    };
     let (phase, execution_target) = if requested_phase != CapitalRouteExecutionPhase::Advance {
         (requested_phase, forward_target)
     } else {
@@ -1453,6 +1470,34 @@ fn allocate_frontline_phase(
     };
 
     (phase, execution_target, uses_capture_lane)
+}
+
+/// 橋Nodeから向こう岸の出口までに並ぶ橋のマス数に、出口の1マスを足した前衛枠。
+///
+/// 経路上でNodeの代表点から出口までのセルを数える。出口が経路に無い場合は1。
+pub(in crate::ai::v4) fn bridge_crossing_capacity(
+    map: &Map,
+    node_operation: &CapitalRouteNodeOperation,
+    path: &[GridPosition],
+) -> usize {
+    let Some(exit) = node_operation.crossing_exit else {
+        return 1;
+    };
+    let start = path.iter().position(|cell| *cell == node_operation.anchor);
+    let end = path.iter().position(|cell| *cell == exit);
+    match (start, end) {
+        (Some(start), Some(end)) if start < end => {
+            path[start..end]
+                .iter()
+                .filter(|cell| {
+                    map.get_terrain(cell.x, cell.y) == Some(crate::resources::Terrain::Bridge)
+                })
+                .count()
+                .max(1)
+                + 1
+        }
+        _ => 1,
+    }
 }
 
 /// 同じNodeへ実際にAdvanceする占領役・護衛だけを出発許可の根拠へ記録する。
@@ -2172,10 +2217,21 @@ mod arrival_tests {
             ))
             .unwrap();
         let far_at = pos(25, 1);
+        let farther_at = pos(28, 1);
         let near_at = pos(9, 9);
         let far = world
             .spawn((
                 far_at,
+                stats.clone(),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+            ))
+            .id();
+        let farther = world
+            .spawn((
+                farther_at,
                 stats.clone(),
                 Health {
                     current: 100,
@@ -2209,6 +2265,7 @@ mod arrival_tests {
         };
         // 自首都(0,0)からの距離では遠方が先になる条件を作る。
         let far_squad = make_squad(far, far_at, 26, 1);
+        let farther_squad = make_squad(farther, farther_at, 29, 3);
         let near_squad = make_squad(near, near_at, 18, 2);
         let anchor = pos(10, 10);
         let exit = pos(10, 11);
@@ -2269,7 +2326,11 @@ mod arrival_tests {
         allocate_prepared_route_squads(
             &context,
             island,
-            vec![prepare(&far_squad), prepare(&near_squad)],
+            vec![
+                prepare(&farther_squad),
+                prepare(&far_squad),
+                prepare(&near_squad),
+            ],
             &mut state,
             &mut draft,
         );
@@ -2277,8 +2338,13 @@ mod arrival_tests {
             draft.commitments[&near_squad.id].phase,
             CapitalRouteExecutionPhase::Advance
         );
+        // 橋の前衛枠（橋のマス数＋出口）を出口へ早く着く順に使い、最も遠い小隊が待つ。
         assert_eq!(
             draft.commitments[&far_squad.id].phase,
+            CapitalRouteExecutionPhase::Advance
+        );
+        assert_eq!(
+            draft.commitments[&farther_squad.id].phase,
             CapitalRouteExecutionPhase::Stage
         );
     }

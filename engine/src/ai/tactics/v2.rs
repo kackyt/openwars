@@ -69,6 +69,9 @@ pub(crate) fn decide_action(
         .then(|| EnemyProductionBlockade::observe(&board));
     // 占領の実行（敵首都・割当物件）を前面の戦闘より優先する（V4）。
     let executes_capture = ai_version == crate::ai::ai_version::AiVersion::V4;
+    // 橋とその近辺では、間接火力・非戦闘の支援車を止めない（V4）。後続の直接部隊の通路を空ける。
+    let bridge_approach = (ai_version == crate::ai::ai_version::AiVersion::V4)
+        .then(|| crate::ai::tactics::chokepoint::bridge_approach_cells(&board.map));
     let mut probe_call = ProbeCall::start(world, player_id);
     let best = with_turn_distances(world, &board, |world, distances| {
         let mut best = BestUnitAction::default();
@@ -118,6 +121,7 @@ pub(crate) fn decide_action(
                     &unit,
                     blockade.as_ref(),
                     executes_capture,
+                    bridge_approach.as_ref(),
                     distances,
                     probe.as_mut(),
                 ),
@@ -308,12 +312,16 @@ fn best_action_for_unit(
     unit: &UnitTactics,
     blockade: Option<&EnemyProductionBlockade>,
     executes_capture: bool,
+    bridge_approach: Option<&HashSet<GridPosition>>,
     distances: &mut ApproachDistances,
     mut probe: Option<&mut UnitProbe>,
 ) -> BestAction {
     let state = &unit.state;
     let mut best = BestAction::default();
     let mut tiles = unit.candidate_tiles(world, board, blockade);
+    // 橋とその近辺で止まらせない兵種だけに区域を適用する。直接部隊は制限しない。
+    let bridge_approach = bridge_approach
+        .filter(|_| crate::ai::tactics::chokepoint::keeps_bridge_approach_clear(&state.stats));
     if unit.treats_target_as_reference() {
         // 敵の生産口は、占領役の予約より占位（補充の遮断）を優先して候補に残す。
         // 予約で外すと、占領役が着くまで敵が空いた生産口で補充を続ける。
@@ -344,8 +352,18 @@ fn best_action_for_unit(
             );
         }
     }
+    // 現在地しか候補が無い（保持指示・包囲など）なら、区域内でも従来どおり行動させる。
+    let can_leave_current = tiles.len() > 1;
     for (x, y) in tiles {
         let position = GridPosition { x, y };
+        let in_bridge_approach = bridge_approach.is_some_and(|cells| cells.contains(&position));
+        // 橋とその近辺では待機しない。通過のために移動して区域内で手番を終えるのは許す。
+        if in_bridge_approach && position == state.position && can_leave_current {
+            if let Some(trace) = probe.as_deref_mut() {
+                trace.reject("bridge_approach_no_stop", position, || json!({}));
+            }
+            continue;
+        }
         if !air_move_preserves_return_fuel(
             &board.map,
             &board.properties,
@@ -402,7 +420,12 @@ fn best_action_for_unit(
             &mut best,
             probe.as_deref_mut(),
         );
-        consider_attacks(world, board, unit, &tile, &mut best, probe.as_deref_mut());
+        // 区域内のマスからは撃たない。撃つために橋の口へ居座ると後続が渡れない。
+        if !(in_bridge_approach && can_leave_current) {
+            consider_attacks(world, board, unit, &tile, &mut best, probe.as_deref_mut());
+        } else if let Some(trace) = probe.as_deref_mut() {
+            trace.reject("bridge_approach_no_fire", position, || json!({}));
+        }
         consider_wait(
             board,
             unit,

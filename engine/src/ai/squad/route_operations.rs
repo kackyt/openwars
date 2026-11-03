@@ -776,6 +776,8 @@ fn firing_position(
             .max()
             .unwrap_or(0)
     };
+    // 橋とその近辺は射撃陣地にしない。居座ると後続の直接部隊が渡れない。
+    let bridge_approach = crate::ai::tactics::chokepoint::bridge_approach_cells(map);
     let search_radius = stats.max_range.max(ENGAGEMENT_RADIUS);
     let mut candidates = cells_around(map, target, search_radius);
     if front != target {
@@ -787,6 +789,7 @@ fn firing_position(
         .into_iter()
         .filter(|cell| {
             !taken.contains(cell)
+                && !bridge_approach.contains(cell)
                 && !enemy_cells.contains(cell)
                 && !unowned_properties.contains(cell)
                 && map.get_terrain(cell.x, cell.y).is_some_and(|terrain| {
