@@ -164,6 +164,9 @@ pub(super) fn evaluate_rolling_plan(
             })
             .collect();
     }
+    if input.policy == ProductionPolicy::Standard {
+        super::production_ablation::record(&combat_input, turn, player_id, operation_anchor);
+    }
     let Some(selected) = choose_rolling_plan(
         input,
         &operations[op_index],

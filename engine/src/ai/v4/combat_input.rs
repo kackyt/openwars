@@ -448,6 +448,11 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
                 .map(|(_, stats)| stats.clone())
         })
         .flatten(),
+        spare_artillery_carriers: spare_artillery_carriers(scan),
+        carrier_facilities_now: carrier_facilities(scan, &scan.free_facilities)
+            .filter(|facility| !input.used_facilities.contains(facility))
+            .collect(),
+        carrier_facilities_later: carrier_facilities(scan, &scan.production_facilities).collect(),
         owned_cities: scan.owned_cities.clone(),
         positional: input.policy == ProductionPolicy::Standard
             && crate::ai::features::positional_enabled(),
@@ -469,6 +474,45 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
         exact_property_control: input.policy.uses_joint_capture()
             && !op.property_controls.is_empty(),
     })
+}
+
+/// 補給輸送車を生産できる施設。
+fn carrier_facilities<'a>(
+    scan: &'a BoardScan,
+    facilities: &'a [(GridPosition, Terrain)],
+) -> impl Iterator<Item = GridPosition> + 'a {
+    let carrier = scan
+        .available_types
+        .iter()
+        .find(|(_, stats)| crate::ai::v4::artillery_ferry::is_artillery_carrier(stats))
+        .map(|(unit_type, _)| *unit_type);
+    facilities
+        .iter()
+        .filter(move |(_, terrain)| {
+            carrier.is_some_and(|carrier| scan.can_produce(*terrain, carrier))
+        })
+        .map(|(position, _)| *position)
+}
+
+/// 砲台を積んでいない既存の補給輸送車の数。実際の輸送車の追加生産
+/// （`production_pipeline::artillery_carriers`）と同じく、盤上の砲台と満載の輸送車の数を
+/// 輸送車の総数から引く。これを超えて買う砲台には、新しい輸送車と施設が要る。
+fn spare_artillery_carriers(scan: &BoardScan) -> usize {
+    let carriers = scan
+        .my_units
+        .iter()
+        .filter(|unit| crate::ai::v4::artillery_ferry::is_artillery_carrier(&unit.stats))
+        .collect::<Vec<_>>();
+    let guns = scan
+        .my_units
+        .iter()
+        .filter(|unit| crate::ai::v4::artillery_ferry::is_ferried_gun(&unit.stats))
+        .count();
+    let loaded = carriers
+        .iter()
+        .filter(|carrier| carrier.free_cargo == 0)
+        .count();
+    carriers.len().saturating_sub(guns + loaded)
 }
 
 /// 交戦できるかを測る移動タイプ。自力でほとんど動けない砲台は、運ぶ輸送部隊の足で測る。

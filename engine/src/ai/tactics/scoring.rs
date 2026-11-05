@@ -108,21 +108,33 @@ pub(crate) fn v3_positioning_score(
     defense_bonus: u32,
 ) -> i32 {
     let stats = &unit.stats;
+    v3_positioning_score_accepting_exposure(board, unit, position, defense_bonus)
+        - crate::ai::threat::exposure_penalty(
+            &board.map,
+            (position.x, position.y),
+            stats.unit_type,
+            stats.cost,
+            unit.hp,
+            stats.min_range,
+            defense_bonus,
+            &board.enemies,
+            &board.damage_chart,
+        )
+}
+
+/// [`v3_positioning_score`] から敵の脅威圏への露出の減点（#50）を除いたもの。
+/// 攻勢中（GO）の直接攻撃unitが、被弾を受け入れて前進するときに使う。
+pub(crate) fn v3_positioning_score_accepting_exposure(
+    board: &TacticalBoard,
+    unit: &UnitState,
+    position: GridPosition,
+    defense_bonus: u32,
+) -> i32 {
+    let stats = &unit.stats;
     let mut score = 0;
     if unit.hp < 70 && unit.threat_nearby {
         score += defense_bonus as i32 * (100 - unit.hp as i32) * 2;
     }
-    score -= crate::ai::threat::exposure_penalty(
-        &board.map,
-        (position.x, position.y),
-        stats.unit_type,
-        stats.cost,
-        unit.hp,
-        stats.min_range,
-        defense_bonus,
-        &board.enemies,
-        &board.damage_chart,
-    );
     if stats.min_range > 1 && !unit.combat_ineffective && !board.enemies.is_empty() {
         let nearest_enemy = board
             .enemy_positions()
@@ -649,6 +661,10 @@ pub(crate) enum ActionPriority {
     FavorableLocalTarget,
     /// 作戦対象そのものとの相性もよい攻撃。
     FavorableStrategicTarget,
+    /// GO中の突破対象・敵砲への直接攻撃。通常の局地戦より優先する。
+    AssaultStrike,
+    /// 共有した突破対象への支援射撃。直接部隊より先に敵を削り、進出路を開く。
+    AssaultSupportFire,
     /// 敵の有効な生産可能マスを占位し、敵の戦力補充を物理的に遮断する行動。
     /// 自軍の生産口を開けるProductionSiteReliefの攻勢的鏡像であり、
     /// 敵の補充速度を物理的に削ぐことで全滅勝利を確定させる。

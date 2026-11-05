@@ -28,7 +28,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
 }
 
 /// ログの1ラウンドの盤面を置く。同じ部隊（ログのunit_id）は同じEntityのまま更新する。
-fn place_snapshot(
+pub(crate) fn place_snapshot(
     world: &mut World,
     md: &MasterDataRegistry,
     snapshot: &serde_json::Value,
@@ -158,7 +158,7 @@ fn place_snapshot(
 }
 
 /// ラウンドの終わりの資金（`metrics` の `pN_funds`）を置く。
-fn place_funds(world: &mut World, metrics: &[serde_json::Value], round: u32) {
+pub(crate) fn place_funds(world: &mut World, metrics: &[serde_json::Value], round: u32) {
     let Some(metric) = metrics
         .iter()
         .find(|metric| metric["turn"].as_u64() == Some(u64::from(round)))

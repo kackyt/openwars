@@ -23,6 +23,11 @@ pub fn route_defense_enabled() -> bool {
         || std::env::var("OPENWARS_ROUTE_DEFENSE").is_ok()
 }
 
+/// GO判定後の敵首都への攻勢（OPENWARS_ASSAULT_GO）。検証中のため既定では無効。
+pub fn assault_go_enabled() -> bool {
+    std::env::var("OPENWARS_ASSAULT_GO").is_ok()
+}
+
 /// 補給輸送車による砲台の運搬・陣地展開（OPENWARS_ARTILLERY_FERRY）
 pub fn artillery_ferry_enabled() -> bool {
     cfg!(target_arch = "wasm32")

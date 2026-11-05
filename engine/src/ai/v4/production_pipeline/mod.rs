@@ -329,6 +329,7 @@ pub(in crate::ai::v4) fn plan_production(
 
 mod slot_allocation;
 use slot_allocation::*;
+mod production_ablation;
 
 mod immediate_combat;
 use immediate_combat::*;

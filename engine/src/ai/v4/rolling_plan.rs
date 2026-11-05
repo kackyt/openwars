@@ -131,6 +131,13 @@ pub(crate) struct RollingPlanInput {
     /// 自力でほとんど動けない砲台を運ぶ輸送部隊（補給輸送車）の能力。Someなら、砲台は
     /// この輸送部隊で射撃位置まで運ばれる前提で接近・補給を見積もる（標準経路）。
     pub artillery_carrier: Option<UnitStats>,
+    /// 砲台を積んでいない既存の補給輸送車の数。これを超えて買う砲台は、輸送車も
+    /// 同じ手番に別の施設で生産するため、施設を2つ使う（[`carrier_companion_slot`]）。
+    pub spare_artillery_carriers: usize,
+    /// 補給輸送車を今手番に生産できる空き施設（他の作戦が今手番に使う施設を除く）。
+    pub carrier_facilities_now: Vec<GridPosition>,
+    /// 補給輸送車を次の手番以降に生産できる施設。
+    pub carrier_facilities_later: Vec<GridPosition>,
     /// 自軍が所有する都市（砲台の優先据え付け・補給修理候補）。
     pub owned_cities: Vec<GridPosition>,
     /// 位置の価値を見積もるか（標準経路）。前衛が隘路を塞いでいる間は敵の地上直接攻撃が
@@ -327,9 +334,12 @@ struct SimEnemy {
 #[derive(Debug, Clone, Default)]
 struct SearchState {
     option_indices: Vec<usize>,
+    /// 購入と、運ぶ砲台に付ける補給輸送車が使う施設枠。
     used_slots: HashSet<ProductionSlot>,
     used_capture_targets: HashSet<GridPosition>,
     cost: u32,
+    /// 購入した運ぶ砲台の数（既存の空き輸送車を先に割り当てる）。
+    ferried_guns: usize,
 }
 
 impl SearchState {
@@ -352,11 +362,96 @@ impl SearchState {
             return None;
         }
         let mut child = self.clone();
-        child.option_indices.push(option_index);
         child.used_slots.insert(slot);
+        if needs_new_carrier(input, &option.stats, child.ferried_guns) {
+            // 輸送車も同じ手番に別の施設で生産する。空き施設が無ければこの砲台は買えない。
+            let companion = carrier_companion_slot(input, &child.used_slots, slot.build_turn)?;
+            child.used_slots.insert(companion);
+        }
+        if is_ferried_purchase(input, &option.stats) {
+            child.ferried_guns += 1;
+        }
+        child.option_indices.push(option_index);
         child.cost = next_cost;
         Some(child)
     }
+}
+
+/// 補給輸送車で運ぶ前提で計画する砲台か（標準経路で輸送車が生産可能な場合）。
+fn is_ferried_purchase(input: &RollingPlanInput, stats: &UnitStats) -> bool {
+    input.artillery_carrier.is_some() && is_ferried_gun(stats)
+}
+
+/// この砲台に新しい補給輸送車が要るか。既に買った運ぶ砲台の数が、空いている既存の
+/// 輸送車の数に達していれば、新しい輸送車を同じ手番に生産する。
+fn needs_new_carrier(input: &RollingPlanInput, stats: &UnitStats, ferried_guns: usize) -> bool {
+    is_ferried_purchase(input, stats) && ferried_guns >= input.spare_artillery_carriers
+}
+
+/// 運ぶ砲台に付ける補給輸送車を生産する施設枠。同じ手番に輸送車を生産できる未使用の
+/// 施設を座標順に1つ選ぶ。輸送車は作戦の生産候補に限らず、空いているどの施設でも作れる。
+/// 施設は1手番に1体しか生産できないので、輸送車の枠を数えないと計画は砲台を実際の
+/// 2倍作れると見積もり、輸送車に施設を取られた砲台が施設の無い予約として資金を拘束し続ける。
+fn carrier_companion_slot(
+    input: &RollingPlanInput,
+    used_slots: &HashSet<ProductionSlot>,
+    build_turn: u32,
+) -> Option<ProductionSlot> {
+    let facilities = if build_turn == 0 {
+        &input.carrier_facilities_now
+    } else {
+        &input.carrier_facilities_later
+    };
+    facilities
+        .iter()
+        .map(|&facility| ProductionSlot {
+            facility,
+            build_turn,
+        })
+        .filter(|slot| !used_slots.contains(slot))
+        .min_by_key(|slot| (slot.facility.y, slot.facility.x))
+}
+
+/// 購入列が使う施設枠（運ぶ砲台に付ける補給輸送車の枠を含む）。生産の早い順に
+/// 輸送車の枠を割り当て、施設が足りなければNone。
+fn slots_with_carriers(
+    input: &RollingPlanInput,
+    purchases: &[PlannedPurchase],
+) -> Option<HashSet<ProductionSlot>> {
+    let mut used_slots = purchases
+        .iter()
+        .copied()
+        .map(ProductionSlot::from)
+        .collect::<HashSet<_>>();
+    if used_slots.len() != purchases.len() {
+        return None;
+    }
+    let mut ordered = purchases.to_vec();
+    ordered.sort_unstable_by_key(|purchase| {
+        (
+            purchase.build_turn,
+            purchase.facility.y,
+            purchase.facility.x,
+        )
+    });
+    let mut ferried_guns = 0;
+    for purchase in ordered {
+        let Some(option) = input
+            .production_options
+            .iter()
+            .find(|option| option.purchase == purchase)
+        else {
+            continue;
+        };
+        if needs_new_carrier(input, &option.stats, ferried_guns) {
+            let companion = carrier_companion_slot(input, &used_slots, purchase.build_turn)?;
+            used_slots.insert(companion);
+        }
+        if is_ferried_purchase(input, &option.stats) {
+            ferried_guns += 1;
+        }
+    }
+    Some(used_slots)
 }
 
 /// 施設・生産turnごとに候補をまとめ、同じ枠の兵種indexは入力順で保持する。
@@ -780,6 +875,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     // 生産だけを前倒しして「計画はあるのに今手番の施設が遊ぶ」状態を除く。
     let shifted_purchases = left_shift_purchases(input, &selected.purchases);
     if shifted_purchases != selected.purchases
+        && slots_with_carriers(input, &shifted_purchases).is_some()
         && let Ok(mut shifted) = evaluate_fixed_package(input, &shifted_purchases)
     {
         shifted.candidates_considered = considered;
@@ -799,10 +895,14 @@ fn fill_best_effort_current_screen(
     search_turns: u32,
 ) -> ForcePackagePlan {
     let mut purchases = selected.purchases.clone();
-    let mut used_current_facilities = purchases
+    // 運ぶ砲台に付ける補給輸送車の施設も使用済みとして扱う。
+    let Some(initial_slots) = slots_with_carriers(input, &purchases) else {
+        return selected;
+    };
+    let mut used_current_facilities = initial_slots
         .iter()
-        .filter(|purchase| purchase.build_turn == 0)
-        .map(|purchase| purchase.facility)
+        .filter(|slot| slot.build_turn == 0)
+        .map(|slot| slot.facility)
         .collect::<HashSet<_>>();
     let mut current_cost = purchases
         .iter()
@@ -874,7 +974,9 @@ fn fill_best_effort_current_screen(
         // 今手番の安い穴埋めで食いつぶさない。予定を残したまま払える穴埋めだけを加える。
         let mut with_candidate = purchases.clone();
         with_candidate.push(candidate.purchase);
-        if !funding_suffices(input, &with_candidate) {
+        if !funding_suffices(input, &with_candidate)
+            || slots_with_carriers(input, &with_candidate).is_none()
+        {
             continue;
         }
         purchases = with_candidate;
@@ -907,18 +1009,22 @@ fn fill_best_effort_current_screen(
         };
         indexed.push(index);
     }
+    let Some(used_slots) = slots_with_carriers(input, &purchases) else {
+        return selected;
+    };
+    let ferried_guns = indexed
+        .iter()
+        .filter(|index| is_ferried_purchase(input, &input.production_options[**index].stats))
+        .count();
     let state = SearchState {
         used_capture_targets: HashSet::default(),
         option_indices: indexed,
-        used_slots: purchases
-            .iter()
-            .copied()
-            .map(ProductionSlot::from)
-            .collect(),
+        used_slots,
         cost: purchases
             .iter()
             .map(|purchase| purchase.cost)
             .fold(0_u32, u32::saturating_add),
+        ferried_guns,
     };
     let mut augmented = simulate_state_with_catalog(input, catalog, &state, search_turns);
     augmented.candidates_considered = selected.candidates_considered;
@@ -1131,7 +1237,16 @@ pub(crate) fn evaluate_fixed_package(
 ) -> Result<ForcePackagePlan, FixedPackageError> {
     // 編成は固定したまま、現在利用できる新しい施設を含めて最早枠へ載せ直す。
     // 同じ兵種が同じ時点で前線へ参加できるなら、古い施設座標に計画を縛らない。
-    let scheduled = left_shift_purchases(input, purchases);
+    // 前倒しで補給輸送車の施設が無くなる場合は、元の予定のまま載せ直す。
+    let shifted = left_shift_purchases(input, purchases);
+    let scheduled = if slots_with_carriers(input, &shifted).is_some() {
+        shifted
+    } else {
+        purchases.to_vec()
+    };
+    let Some(carrier_slots) = slots_with_carriers(input, &scheduled) else {
+        return Err(FixedPackageError::ProductionSlotUnavailable);
+    };
     let mut indexed = scheduled
         .iter()
         .map(|purchase| {
@@ -1164,6 +1279,7 @@ pub(crate) fn evaluate_fixed_package(
         }
         state.option_indices.push(option_index);
     }
+    state.used_slots = carrier_slots;
 
     let search_turns = plan_search_turns(input);
     let catalog = SimulationCatalog::new(input);
@@ -2898,6 +3014,9 @@ mod tests {
             hold_contestants: Vec::new(),
             committed_purchases: Vec::new(),
             artillery_carrier: None,
+            spare_artillery_carriers: 0,
+            carrier_facilities_now: Vec::new(),
+            carrier_facilities_later: Vec::new(),
             owned_cities: Vec::new(),
             positional: false,
             deploy_anchor: None,
@@ -3219,6 +3338,7 @@ mod tests {
         let previous_slot = input.production_options[0].purchase.into();
         let target = GridPosition { x: 8, y: 0 };
         let state = SearchState {
+            ferried_guns: 0,
             option_indices: vec![0],
             used_slots: HashSet::from_iter([previous_slot]),
             used_capture_targets: HashSet::from_iter([target]),
@@ -3257,6 +3377,7 @@ mod tests {
         input.production_options[0].purchase.cost = 10;
         let slot = input.production_options[0].purchase.into();
         let state = SearchState {
+            ferried_guns: 0,
             cost: u32::MAX - 5,
             ..SearchState::default()
         };
@@ -3338,6 +3459,7 @@ mod tests {
             engageable_enemy_indices: vec![0],
         });
         let state = SearchState {
+            ferried_guns: 0,
             used_capture_targets: HashSet::default(),
             option_indices: vec![0],
             used_slots: HashSet::from_iter([ProductionSlot {
@@ -3990,6 +4112,9 @@ mod tests {
         base.damage_chart = chart;
         base.positional = true;
         base.artillery_carrier = Some(carrier.clone());
+        // 施設は1つだけなので、砲台と輸送車を同じ手番には作れない。砲台を運ぶ空いた
+        // 補給輸送車が既にある前提で、地形による砲台の選択を検証する。
+        base.spare_artillery_carriers = 1;
         base.deploy_anchor = Some(GridPosition { x: 13, y: 1 });
         base.hold_window = Some(8);
         base.hold_contestants = vec![true, true];
@@ -4089,6 +4214,130 @@ mod tests {
             "地上の壁が生き残っていても航空部隊は砲台を攻撃できるはず: with={} without={}",
             with_gun.expected_loss,
             without_gun.expected_loss
+        );
+    }
+
+    /// 施設2つ・資金は十分な盤面で、運ぶ砲台と戦車を生産候補にした入力。
+    fn two_facility_ferry_input(spare_carriers: usize) -> RollingPlanInput {
+        let master = MasterDataRegistry::load().unwrap();
+        let unit = |name: &str| {
+            master
+                .create_unit_stats(&UnitName(name.to_owned()))
+                .unwrap()
+        };
+        let gun = unit("砲台");
+        let tank = unit("中戦車");
+        let mut case = input();
+        case.artillery_carrier = Some(unit("補給輸送車"));
+        case.spare_artillery_carriers = spare_carriers;
+        case.carrier_facilities_now =
+            vec![GridPosition { x: 0, y: 0 }, GridPosition { x: 1, y: 0 }];
+        case.current_funds = 200_000;
+        case.production_options = [GridPosition { x: 0, y: 0 }, GridPosition { x: 1, y: 0 }]
+            .into_iter()
+            .flat_map(|facility| {
+                [(gun.clone(), 23_500), (tank.clone(), 18_000)].map(|(stats, cost)| {
+                    ProductionPlanOption {
+                        capture_target: None,
+                        capture_arrival_turn: None,
+                        capture_completion_turn: None,
+                        capture_durability: None,
+                        capture_blocking_enemy_index: None,
+                        purchase: PlannedPurchase {
+                            facility,
+                            unit_type: stats.unit_type,
+                            build_turn: 0,
+                            cost,
+                        },
+                        stats,
+                        engageable_enemy_indices: vec![0],
+                    }
+                })
+            })
+            .collect();
+        case
+    }
+
+    #[test]
+    fn ferried_gun_also_uses_the_carrier_production_slot() {
+        let case = two_facility_ferry_input(0);
+        let gun_at = |x: usize| {
+            case.production_options
+                .iter()
+                .position(|o| {
+                    o.purchase.facility.x == x && o.stats.unit_type == UnitType::Artillery
+                })
+                .unwrap()
+        };
+        let slot = |x: usize| ProductionSlot {
+            facility: GridPosition { x, y: 0 },
+            build_turn: 0,
+        };
+        let one_gun = SearchState::default()
+            .with_affordable_purchase(&case, gun_at(0), slot(0))
+            .expect("施設が2つあれば砲台と輸送車を同じ手番に作れる");
+        assert_eq!(
+            one_gun.used_slots.len(),
+            2,
+            "輸送車も同じ手番に施設を1つ使う"
+        );
+        assert!(
+            one_gun
+                .with_affordable_purchase(&case, gun_at(1), slot(1))
+                .is_none(),
+            "残りの施設は輸送車が使うので、同じ手番に2門目は作れない"
+        );
+        // 2施設に砲台2門という前の計画は、載せ直すと施設が足りず実行できない。
+        let two_guns = [gun_at(0), gun_at(1)].map(|i| case.production_options[i].purchase);
+        assert!(matches!(
+            evaluate_fixed_package(&case, &two_guns),
+            Err(FixedPackageError::ProductionSlotUnavailable)
+        ));
+    }
+
+    #[test]
+    fn spare_carrier_lets_a_gun_use_a_single_slot() {
+        let case = two_facility_ferry_input(1);
+        let gun = case
+            .production_options
+            .iter()
+            .position(|o| o.purchase.facility.x == 0 && o.stats.unit_type == UnitType::Artillery)
+            .unwrap();
+        let tank = case
+            .production_options
+            .iter()
+            .position(|o| o.purchase.facility.x == 1 && o.stats.unit_type == UnitType::MdTank)
+            .unwrap();
+        let state = SearchState::default()
+            .with_affordable_purchase(&case, gun, case.production_options[gun].purchase.into())
+            .unwrap();
+        assert_eq!(state.used_slots.len(), 1, "空いた既存の輸送車で運べる");
+        assert!(
+            state
+                .with_affordable_purchase(
+                    &case,
+                    tank,
+                    case.production_options[tank].purchase.into()
+                )
+                .is_some(),
+            "残りの施設で戦車を作れる"
+        );
+    }
+
+    #[test]
+    fn walking_units_are_unaffected_without_a_carrier_model() {
+        let mut case = two_facility_ferry_input(0);
+        case.artillery_carrier = None;
+        let guns = case
+            .production_options
+            .iter()
+            .filter(|o| o.stats.unit_type == UnitType::Artillery)
+            .map(|o| o.purchase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slots_with_carriers(&case, &guns).map(|slots| slots.len()),
+            Some(2),
+            "輸送車を使わない経路（小規模マップ等）の施設計算は変えない"
         );
     }
 
