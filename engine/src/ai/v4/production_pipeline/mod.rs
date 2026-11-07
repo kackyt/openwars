@@ -49,13 +49,7 @@ pub(in crate::ai::v4) fn plan_production_with_registry(
     let ferries_artillery = input.policy == ProductionPolicy::Standard;
     if ferries_artillery {
         // 運ぶ手段の無い既存の砲台へ、作戦枠より先に補給輸送車を付ける。
-        // 比較時は実行可能な当手番購入の資金・施設を先取りさせない。
-        let reserve = if crate::ai::features::preserve_due_purchases_enabled() {
-            due_budget::protect_due_purchases(input, &state, plan_registry)
-        } else {
-            due_budget::DuePurchaseReserve::default()
-        };
-        allocate_artillery_carriers_with_reserve(input, &mut state, &reserve);
+        allocate_artillery_carriers(input, &mut state);
     }
     allocate_operation_slots(input, &mut state, plan_registry, contract_registry);
     if ferries_artillery {
@@ -340,7 +334,6 @@ pub(in crate::ai::v4) fn plan_production(
 
 mod slot_allocation;
 use slot_allocation::*;
-mod due_budget;
 mod plan_selection_trace;
 mod production_ablation;
 

@@ -12,11 +12,6 @@ pub fn narrow_assault_enabled() -> bool {
     std::env::var_os("OPENWARS_NARROW_ASSAULT").is_some()
 }
 
-/// 当手番の継続購入を補助輸送車の先取りから保護する比較用スイッチ。
-pub fn preserve_due_purchases_enabled() -> bool {
-    std::env::var_os("OPENWARS_DUE_BUDGET").is_some()
-}
-
 /// 観測敵だけの敵別編成評価。未観測増援・兵種比率・同種上限を使用しない試作。
 pub fn observed_composition_enabled() -> bool {
     std::env::var_os("OPENWARS_OBSERVED_COMPOSITION").is_some()
