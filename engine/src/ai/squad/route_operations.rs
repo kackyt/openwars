@@ -364,21 +364,22 @@ fn launches(
         )
     };
     let our_arrival = members.iter().filter_map(|member| eta(*member)).min();
-    let enemies = world
-        .iter_entities()
-        .filter(|entity| {
-            entity
-                .get::<Faction>()
-                .is_some_and(|faction| faction.0 != player)
-        })
-        .map(|entity| entity.id())
-        .collect::<Vec<_>>();
-    let enemy_arrival = enemies.iter().filter_map(|enemy| eta(*enemy)).min();
-    let enemy_near = enemies
-        .iter()
-        .filter(|enemy| eta(**enemy).is_some_and(|turns| turns <= KEY_POINT_ENEMY_TURNS))
-        .map(|enemy| unit_value(world, *enemy))
-        .sum::<u32>();
+    let mut enemy_arrival = None;
+    let mut enemy_near = 0_u32;
+    for entity in world.iter_entities() {
+        if entity
+            .get::<Faction>()
+            .is_some_and(|faction| faction.0 != player)
+        {
+            let ent = entity.id();
+            if let Some(turns) = eta(ent) {
+                enemy_arrival = Some(enemy_arrival.map_or(turns, |min: u32| min.min(turns)));
+                if turns <= KEY_POINT_ENEMY_TURNS {
+                    enemy_near += unit_value(world, ent);
+                }
+            }
+        }
+    }
     let our_force = members
         .iter()
         .map(|member| unit_value(world, *member))
@@ -441,7 +442,8 @@ fn enemy_units(world: &World, player: PlayerId) -> Vec<(GridPosition, u32)> {
             let faction = entity.get::<Faction>()?;
             let position = *entity.get::<GridPosition>()?;
             let stats = entity.get::<UnitStats>()?;
-            (faction.0 != player).then_some((position, stats.max_movement.max(1)))
+            (faction.0 != player && stats.max_movement > 0)
+                .then_some((position, stats.max_movement))
         })
         .collect()
 }
@@ -642,47 +644,39 @@ fn firing_position(
     let stats = world.get::<UnitStats>(gun)?;
     let at = *world.get::<GridPosition>(gun)?;
     let registry = world.get_resource::<crate::resources::master_data::MasterDataRegistry>()?;
-    let own_properties = world
-        .iter_entities()
-        .filter_map(|entity| {
-            let position = *entity.get::<GridPosition>()?;
-            let property = entity.get::<Property>()?;
-            (property.owner_id == Some(player)).then_some(position)
-        })
-        .collect::<crate::collections::HashSet<_>>();
-    let unowned_properties = world
-        .iter_entities()
-        .filter_map(|entity| {
-            let position = *entity.get::<GridPosition>()?;
-            let property = entity.get::<Property>()?;
-            (property.owner_id != Some(player)).then_some(position)
-        })
-        .collect::<crate::collections::HashSet<_>>();
-    // 壁になる味方の直接攻撃の部隊の位置。
-    let screen = world
-        .iter_entities()
-        .filter_map(|entity| {
-            let faction = entity.get::<Faction>()?;
-            let position = *entity.get::<GridPosition>()?;
-            let unit_stats = entity.get::<UnitStats>()?;
-            (faction.0 == player && unit_stats.min_range <= 1 && entity.id() != gun)
-                .then_some(position)
-        })
-        .collect::<Vec<_>>();
-    // 撃てる敵の戦力価値（価格×HP）。
-    let enemy_values = world
-        .iter_entities()
-        .filter_map(|entity| {
-            let faction = entity.get::<Faction>()?;
-            let position = *entity.get::<GridPosition>()?;
-            let unit_stats = entity.get::<UnitStats>()?;
-            let health = entity.get::<Health>()?;
-            (faction.0 != player).then_some((
-                position,
-                unit_stats.cost.saturating_mul(health.current) / health.max.max(1),
-            ))
-        })
-        .collect::<Vec<_>>();
+
+    let mut own_properties = crate::collections::HashSet::default();
+    let mut unowned_properties = crate::collections::HashSet::default();
+    let mut screen = Vec::new();
+    let mut enemy_values = Vec::new();
+
+    for entity in world.iter_entities() {
+        if let (Some(position), Some(property)) =
+            (entity.get::<GridPosition>(), entity.get::<Property>())
+        {
+            if property.owner_id == Some(player) {
+                own_properties.insert(*position);
+            } else {
+                unowned_properties.insert(*position);
+            }
+        }
+        if let (Some(faction), Some(position), Some(unit_stats)) = (
+            entity.get::<Faction>(),
+            entity.get::<GridPosition>(),
+            entity.get::<UnitStats>(),
+        ) {
+            if faction.0 == player {
+                if unit_stats.min_range <= 1 && entity.id() != gun {
+                    screen.push(*position);
+                }
+            } else if let Some(health) = entity.get::<Health>() {
+                enemy_values.push((
+                    *position,
+                    unit_stats.cost.saturating_mul(health.current) / health.max.max(1),
+                ));
+            }
+        }
+    }
     let enemy_cells = enemies
         .iter()
         .map(|(position, _)| *position)

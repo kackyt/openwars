@@ -142,28 +142,25 @@ pub fn judge_assault(
     previous: AssaultDecision,
 ) -> AssaultReport {
     let occupied = occupancy(world);
+
+    // 生産圏内の敵部隊。これらは首都攻略を塞ぐ障害として攻撃対象になる。
+    let mut query = world.query_filtered::<(
+        &GridPosition,
+        &Faction,
+        &UnitStats,
+        &UnitId,
+        Option<&Fuel>,
+    ), Without<Transporting>>();
+    let mut units = Vec::new();
+    for (position, faction, stats, id, fuel) in query.iter(world) {
+        let fuel_val = fuel.map_or(0, |f| f.current);
+        units.push((*position, faction.0, stats, id.0.as_u128() as u64, fuel_val));
+    }
+
     let map = world.resource::<Map>();
     let registry = world.resource::<MasterDataRegistry>();
     let chart = world.resource::<DamageChart>();
     let zone = PRODUCTION_RANGE as u32;
-
-    // 生産圏内の敵部隊。これらは首都攻略を塞ぐ障害として攻撃対象になる。
-    let mut units = Vec::new();
-    for entity in world.iter_entities() {
-        if entity.get::<Transporting>().is_some() {
-            continue;
-        }
-        let (Some(position), Some(faction), Some(stats), Some(id)) = (
-            entity.get::<GridPosition>(),
-            entity.get::<Faction>(),
-            entity.get::<UnitStats>(),
-            entity.get::<UnitId>(),
-        ) else {
-            continue;
-        };
-        let fuel = entity.get::<Fuel>().map_or(0, |f| f.current);
-        units.push((*position, faction.0, stats, id.0.as_u128() as u64, fuel));
-    }
     let defenders = units
         .iter()
         .filter(|(p, owner, ..)| {

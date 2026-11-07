@@ -65,6 +65,9 @@ pub(super) fn select_target(
             }
             let position = *enemy.get::<GridPosition>()?;
             let stats = enemy.get::<UnitStats>()?;
+            if stats.max_range == 0 {
+                return None;
+            }
             let cap_distance = board
                 .map
                 .distance(position.x, position.y, objective.x, objective.y);
@@ -75,7 +78,7 @@ pub(super) fn select_target(
                     let own_cap_distance = board.map.distance(p.x, p.y, objective.x, objective.y);
                     // 前衛の進行方向におり、次の接敵帯か、前衛を射程に収める敵。
                     (cap_distance <= own_cap_distance
-                        && distance <= movement.saturating_add(stats.max_range.max(1)))
+                        && distance <= movement.saturating_add(stats.max_range))
                     .then_some(distance)
                 })
                 .min()?;

@@ -277,7 +277,8 @@ fn enemy_indirect(world: &World, player: PlayerId, objective: GridPosition) -> V
                         world
                             .resource::<Map>()
                             .distance(p.x, p.y, objective.x, objective.y)
-                            <= s.max_range + crate::systems::production::PRODUCTION_RANGE as u32
+                            <= s.max_range
+                                .saturating_add(crate::systems::production::PRODUCTION_RANGE as u32)
                     })
         })
         .map(|entity| entity.id())
@@ -670,6 +671,9 @@ fn metrics(world: &World, player: PlayerId, objective: GridPosition) -> Position
     let map = world.resource::<Map>();
     let master = world.resource::<MasterDataRegistry>();
     let mut result = PositionMetrics::default();
+    let mut own_unit_positions = crate::collections::HashSet::default();
+    let mut facilities_to_check = Vec::new();
+
     for entity in world.iter_entities() {
         if let (Some(faction), Some(stats), Some(hp)) = (
             entity.get::<Faction>(),
@@ -687,20 +691,21 @@ fn metrics(world: &World, player: PlayerId, objective: GridPosition) -> Position
             }
             if faction.0 == player
                 && entity.get::<Transporting>().is_none()
-                && ground(stats)
-                && stats.max_range > 0
                 && let Some(p) = entity.get::<GridPosition>()
             {
-                let distance = map.distance(p.x, p.y, objective.x, objective.y);
-                if distance <= crate::systems::production::PRODUCTION_RANGE as u32 {
-                    result.own_units_in_production_range += 1;
-                }
-                if stats.min_range <= 1 {
-                    result.front_distance = Some(
-                        result
-                            .front_distance
-                            .map_or(distance, |old| old.min(distance)),
-                    );
+                own_unit_positions.insert(*p);
+                if ground(stats) && stats.max_range > 0 {
+                    let distance = map.distance(p.x, p.y, objective.x, objective.y);
+                    if distance <= crate::systems::production::PRODUCTION_RANGE as u32 {
+                        result.own_units_in_production_range += 1;
+                    }
+                    if stats.min_range <= 1 {
+                        result.front_distance = Some(
+                            result
+                                .front_distance
+                                .map_or(distance, |old| old.min(distance)),
+                        );
+                    }
                 }
             }
         }
@@ -717,18 +722,17 @@ fn metrics(world: &World, player: PlayerId, objective: GridPosition) -> Position
                 map.topology,
             );
             if in_range && master.is_production_facility(property.terrain.as_str()) {
-                let owned = property.owner_id == Some(player);
-                let occupied = world.iter_entities().any(|unit| {
-                    unit.get::<GridPosition>() == Some(position)
-                        && unit.get::<Transporting>().is_none()
-                        && unit.get::<Faction>().is_some_and(|f| f.0 == player)
-                });
-                if owned || occupied {
-                    result.blocked_production_sites += 1;
-                }
+                facilities_to_check.push((*position, property.owner_id == Some(player)));
             }
         }
     }
+
+    for (pos, owned) in facilities_to_check {
+        if owned || own_unit_positions.contains(&pos) {
+            result.blocked_production_sites += 1;
+        }
+    }
+
     result.winner = match &world.resource::<MatchState>().game_over {
         Some(GameOverCondition::Winner(id)) => Some(id.0),
         _ => None,
