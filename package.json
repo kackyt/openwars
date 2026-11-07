@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "pnpm -C web dev",
     "build": "pnpm -C web build",
-    "build:wasm": "wasm-pack build engine --target web --release --out-dir ../web/src/wasm -- --features v4_all"
+    "build:wasm": "wasm-pack build engine --target web --release --out-dir ../web/src/wasm"
   },
   "devDependencies": {
     "rulesync": "^43.3.0"

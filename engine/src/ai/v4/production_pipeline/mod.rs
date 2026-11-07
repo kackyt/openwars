@@ -18,8 +18,6 @@ pub(in crate::ai::v4) struct ProductionInputs<'a> {
         &'a HashMap<Entity, deployment::ActiveTargetAssignment>,
     pub(in crate::ai::v4) advancing_route_entities: &'a AdvancingCapitalRouteEntities,
     pub(in crate::ai::v4) turn: u32,
-    /// 実盤面で観測した弾薬。編成試作だけが予測用の既存部隊へ反映する。
-    pub(in crate::ai::v4) ammunition: &'a HashMap<Entity, (u32, u32)>,
 }
 /// 今回の配分だけで共有する作業状態。永続的な戦略状態はRegistryが所有する。
 struct ProductionState {
@@ -314,7 +312,6 @@ pub(in crate::ai::v4) fn plan_production(
     committed_combat_assignments: &HashMap<Entity, deployment::ActiveTargetAssignment>,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let route = AdvancingCapitalRouteEntities::default();
-    let ammunition = HashMap::default();
     let input = ProductionInputs {
         policy: ProductionPolicy::Standard,
         scan,
@@ -323,7 +320,6 @@ pub(in crate::ai::v4) fn plan_production(
         committed_combat_assignments,
         advancing_route_entities: &route,
         turn: 0,
-        ammunition: &ammunition,
     };
     plan_production_with_registry(
         &input,

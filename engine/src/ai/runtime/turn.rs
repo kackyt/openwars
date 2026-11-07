@@ -99,18 +99,6 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
         return issue_production_command(world, command);
     }
     prepare_squads(world, &step);
-    // V4は、手番の最初に敵首都への攻勢（GO／WAIT）を判定する。
-    if step.is_v4 && crate::ai::features::assault_go_enabled() {
-        crate::ai::assault_decision::refresh_assault_posture(world, player_id, step.turn);
-    }
-    // 狭い装甲経路に限定し、射撃できる先頭部隊も含めて車列の射点を更新する。
-    if step.is_v4
-        && crate::ai::features::narrow_assault_enabled()
-        && let Some((entity, command)) =
-            crate::ai::tactics::narrow_assault::decide_action(world, player_id, &step.acted)
-    {
-        return Some(issue_unit_command(world, entity, command));
-    }
     crate::ai::wait_probe::stage(world, "early_production_relief");
     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。

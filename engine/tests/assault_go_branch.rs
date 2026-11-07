@@ -486,7 +486,8 @@ fn assault_go_branch() {
     // GOが出た元のラウンド末盤面で判定を確定してから手番を開始する。
     // 特に後手は、先手の行動後に初めて判定すると元のGO局面を失ってしまう。
     world.insert_resource(engine::ai::assault_decision::AssaultPostures::default());
-    if engine::ai::features::assault_go_enabled() {
+    let assault_go_enabled = std::env::var("OPENWARS_ASSAULT_GO").is_ok();
+    if assault_go_enabled {
         engine::ai::assault_decision::refresh_assault_posture(&mut world, subject, from - 1);
         assert!(
             engine::ai::assault_decision::assault_objective(&world, subject).is_some(),
@@ -615,7 +616,7 @@ fn assault_go_branch() {
     let output = serde_json::json!({
         "from": from,
         "subject": subject.0,
-        "assault_go_enabled": engine::ai::features::assault_go_enabled(),
+        "assault_go_enabled": assault_go_enabled,
         "outcome": outcome,
         "opening_orders": opening,
         "opening_executed": opening_index,

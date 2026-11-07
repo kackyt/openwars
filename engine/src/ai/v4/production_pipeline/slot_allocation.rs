@@ -149,11 +149,6 @@ pub(super) fn evaluate_rolling_plan(
         return false;
     };
     if input.policy == ProductionPolicy::Standard
-        && crate::ai::features::observed_composition_enabled()
-    {
-        combat_input::apply_observed_ammunition(&mut combat_input, scan, input.ammunition);
-    }
-    if input.policy == ProductionPolicy::Standard
         && std::env::var("OPENWARS_COMMIT").is_ok()
         && let Some(previous) = continuation.as_ref()
     {
@@ -945,21 +940,8 @@ fn choose_rolling_plan(
                 .then(|| evaluated.as_ref().ok().cloned())
                 .flatten()
         });
-    let observed = rolling_plan::observed_composition::enabled();
-    let candidate_plan = if observed {
-        plan_force_package(combat_input)
-    } else {
-        reusable_candidate.or_else(|| plan_force_package(combat_input))
-    }?;
-    let candidate_order = observed.then(|| {
-        evaluated_continuation
-            .as_ref()
-            .and_then(|(_, evaluated)| evaluated.as_ref().ok())
-            // 実行不能な旧列は比較対象にできない。新案の予測へ旧購入だけを混ぜず新案へ進む。
-            .map_or(std::cmp::Ordering::Less, |previous| {
-                rolling_plan::observed_composition::compare(combat_input, &candidate_plan, previous)
-            })
-    });
+    let candidate_plan = reusable_candidate.or_else(|| plan_force_package(combat_input))?;
+    let candidate_order = None;
     let conflicted_facilities = evaluated_continuation
         .as_ref()
         .map(|(previous, evaluated)| {

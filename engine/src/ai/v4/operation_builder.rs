@@ -1179,17 +1179,6 @@ fn assess_operation_reinforcements(
     enemy_reinforcement: &EnemyReinforcementEnvelope,
 ) {
     let OperationObservation { scan, policy, .. } = *input;
-    if policy == ProductionPolicy::Standard && crate::ai::features::observed_composition_enabled() {
-        // この編成試作は観測実体だけを扱い、仮想増援の火力や購入予約で配分を変えない。
-        operation.expected_reinforcements.clear();
-        operation.unavoidable_reinforcements.clear();
-        operation.reinforcement_contingencies.clear();
-        operation.contingency_reserve_funds = 0;
-        operation.stress_reinforcement_funds = 0;
-        operation.facts.enemy_reinforcement_funds = 0;
-        operation.slots.combat_plan_required = u32::from(!operation.reachable_threats.is_empty());
-        return;
-    }
     if policy.reports_property_control() {
         let horizon = operation.threat_horizon.max(1);
         let expected_assessment = enemy_reinforcement_assessment(
@@ -1474,15 +1463,7 @@ fn record_committed_unit(
     if is_assigned_capture(input, ctx, unit, requires_transport) {
         force.friendly_capture_units_committed += 1;
     }
-    // 標準の役割試作は購入候補・交戦入力・既存の不足控除で同じ判定を使う。
-    // 占領担当の二重計上と無武装輸送車の混入は引き続き避ける。
-    if policy.counts_armed_carriers()
-        || (!unit.stats.can_capture
-            && rolling_plan::production_rules::allows_combat_role(
-                &unit.stats,
-                crate::ai::features::production_role_candidates_enabled(),
-            ))
-    {
+    if policy.counts_armed_carriers() || (!unit.stats.can_capture && unit.stats.max_cargo == 0) {
         // 迎撃枠の条件：到達できない脅威へ有効打を持ち、かつ自力で現地へ行ける
         let self_deployable = ctx.is_reachable(
             &scan.map,

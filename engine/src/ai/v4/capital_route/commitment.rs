@@ -301,19 +301,6 @@ pub(in crate::ai::v4) fn capital_route_commitment_for_entity(
         .filter(|commitment| commitment.player_id == player_id)
 }
 
-/// 分隊が首都ルートDAGの担当（前手番までに決めた区間目標）を持っているか。
-/// 持つ分隊の目標はDAGが決めるので、汎用の目標割り当て（ビーム探索）の対象にしない。
-pub(crate) fn squad_has_capital_route_commitment(
-    world: &World,
-    player_id: PlayerId,
-    squad_id: crate::ai::squad::SquadId,
-) -> bool {
-    world
-        .get_resource::<CapitalRoutePathRegistry>()
-        .and_then(|registry| registry.commitments.get(&squad_id))
-        .is_some_and(|commitment| commitment.player_id == player_id)
-}
-
 /// 指定目標へ到達できるDAG内の一経路を選び、分岐を通す実在ノードを返す。
 ///
 /// 始点直後の複数枝は当手番の戦力需要が高い方を選び、合流以降は同じ後続ノード列を使う。

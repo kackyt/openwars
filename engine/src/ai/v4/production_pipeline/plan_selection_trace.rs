@@ -109,7 +109,6 @@ pub(super) fn snapshot(
         "anchor": [operation.anchor.x, operation.anchor.y],
         "island": format!("{:?}", operation.island_id),
         "exact_property_control": combat.exact_property_control,
-        "observed_composition": rolling_plan::observed_composition::enabled(),
         "funds": combat.current_funds, "income": combat.income_per_turn,
         "hard_deadline": combat.hard_deadline,
         "hold_window": combat.hold_window, "hold_contestants": combat.hold_contestants,

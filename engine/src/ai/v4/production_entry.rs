@@ -255,17 +255,6 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         plan_contract::PlanContractRegistry::default()
     };
     rolling_registry.reconcile_produced_steps(player_id, &produced_plan_steps);
-    let ammunition = if policy == ProductionPolicy::Standard
-        && crate::ai::features::observed_composition_enabled()
-    {
-        world
-            .query::<(Entity, &crate::components::Ammo)>()
-            .iter(world)
-            .map(|(entity, ammo)| (entity, (ammo.ammo1, ammo.ammo2)))
-            .collect()
-    } else {
-        HashMap::default()
-    };
     let input = production_pipeline::ProductionInputs {
         policy,
         scan: &scan,
@@ -274,7 +263,6 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         committed_combat_assignments: &committed_combat_assignments,
         advancing_route_entities: &advancing_route_entities,
         turn,
-        ammunition: &ammunition,
     };
     let (planned, mut plan_trace) = production_pipeline::plan_production_with_registry(
         &input,

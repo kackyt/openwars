@@ -124,7 +124,7 @@ fn shared_direct_width_limits_attacks_across_movement_types() {
             shared_direct_width: cap,
         });
         let mut run = CombatRun::start(&catalog, &SearchState::default());
-        let attacks = run.friendly_attacks(&input, 1);
+        let attacks = run.friendly_attacks(1);
         assert_eq!(attacks, cap.unwrap_or(4));
     }
 }
