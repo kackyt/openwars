@@ -18,6 +18,8 @@ pub(in crate::ai::v4) struct ProductionInputs<'a> {
         &'a HashMap<Entity, deployment::ActiveTargetAssignment>,
     pub(in crate::ai::v4) advancing_route_entities: &'a AdvancingCapitalRouteEntities,
     pub(in crate::ai::v4) turn: u32,
+    /// 実盤面で観測した弾薬。編成試作だけが予測用の既存部隊へ反映する。
+    pub(in crate::ai::v4) ammunition: &'a HashMap<Entity, (u32, u32)>,
 }
 /// 今回の配分だけで共有する作業状態。永続的な戦略状態はRegistryが所有する。
 struct ProductionState {
@@ -43,11 +45,18 @@ pub(in crate::ai::v4) fn plan_production_with_registry(
         return (state.commands, state.plan_trace);
     }
     assign_committed_combat(input, &mut state);
+    plan_selection_trace::record_operations(input, &state, plan_registry);
     let ferries_artillery = input.policy == ProductionPolicy::Standard
         && crate::ai::v4::artillery_ferry::artillery_ferry_enabled();
     if ferries_artillery {
         // 運ぶ手段の無い既存の砲台へ、作戦枠より先に補給輸送車を付ける。
-        allocate_artillery_carriers(input, &mut state);
+        // 比較時は実行可能な当手番購入の資金・施設を先取りさせない。
+        let reserve = if crate::ai::features::preserve_due_purchases_enabled() {
+            due_budget::protect_due_purchases(input, &state, plan_registry)
+        } else {
+            due_budget::DuePurchaseReserve::default()
+        };
+        allocate_artillery_carriers_with_reserve(input, &mut state, &reserve);
     }
     allocate_operation_slots(input, &mut state, plan_registry, contract_registry);
     if ferries_artillery {
@@ -264,6 +273,7 @@ fn finalize_turn_production(
         input.policy.optimizes_facilities(),
     );
 
+    plan_selection_trace::record_orders(input, &commands);
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
     let remaining_funds = allocation.remaining_funds();
     plan_trace.leftover_funds = remaining_funds;
@@ -311,6 +321,7 @@ pub(in crate::ai::v4) fn plan_production(
     committed_combat_assignments: &HashMap<Entity, deployment::ActiveTargetAssignment>,
 ) -> (Vec<PlannedProduction>, ProductionPlanTrace) {
     let route = AdvancingCapitalRouteEntities::default();
+    let ammunition = HashMap::default();
     let input = ProductionInputs {
         policy: ProductionPolicy::Standard,
         scan,
@@ -319,6 +330,7 @@ pub(in crate::ai::v4) fn plan_production(
         committed_combat_assignments,
         advancing_route_entities: &route,
         turn: 0,
+        ammunition: &ammunition,
     };
     plan_production_with_registry(
         &input,
@@ -329,6 +341,8 @@ pub(in crate::ai::v4) fn plan_production(
 
 mod slot_allocation;
 use slot_allocation::*;
+mod due_budget;
+mod plan_selection_trace;
 mod production_ablation;
 
 mod immediate_combat;

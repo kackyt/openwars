@@ -40,7 +40,14 @@ fn inspect_assault_scenario() -> anyhow::Result<()> {
     world.insert_resource(GameRng::new(seed));
     let mut settings = PlayerAiSettings::default();
     for side in [PlayerId(1), PlayerId(2)] {
-        settings.set_version(side, if side == player { AiVersion::V4 } else { AiVersion::V200 });
+        settings.set_version(
+            side,
+            if side == player {
+                AiVersion::V4
+            } else {
+                AiVersion::V200
+            },
+        );
     }
     world.insert_resource(settings);
     let mut entities = HashMap::new();
@@ -48,20 +55,31 @@ fn inspect_assault_scenario() -> anyhow::Result<()> {
     branch_fixture::place_funds(&mut world, metrics, turn - 1);
     // 盤面を各案へ保存・復元しても、同じログ部隊を同じUUIDで追えるようにする。
     for (&id, &entity) in &entities {
-        world.entity_mut(entity).insert(UnitId(uuid::Uuid::from_u128(u128::from(id))));
+        world
+            .entity_mut(entity)
+            .insert(UnitId(uuid::Uuid::from_u128(u128::from(id))));
     }
     // 配置・HP・所有者・積荷の組を元ログと照合してから手番を開始する。
     for row in snapshot["units"].as_array().unwrap() {
         let id = row["unit_id"].as_u64().unwrap();
         let entity = entities[&id];
-        assert_eq!(world.get::<Health>(entity).unwrap().current, row["hp"].as_u64().unwrap() as u32);
+        assert_eq!(
+            world.get::<Health>(entity).unwrap().current,
+            row["hp"].as_u64().unwrap() as u32
+        );
         if let Some(carrier) = row["transporting_by"].as_u64() {
-            assert_eq!(world.get::<Transporting>(entity).unwrap().0, entities[&carrier]);
+            assert_eq!(
+                world.get::<Transporting>(entity).unwrap().0,
+                entities[&carrier]
+            );
         } else {
-            assert_eq!(*world.get::<GridPosition>(entity).unwrap(), GridPosition {
-                x: row["x"].as_u64().unwrap() as usize,
-                y: row["y"].as_u64().unwrap() as usize,
-            });
+            assert_eq!(
+                *world.get::<GridPosition>(entity).unwrap(),
+                GridPosition {
+                    x: row["x"].as_u64().unwrap() as usize,
+                    y: row["y"].as_u64().unwrap() as usize,
+                }
+            );
         }
     }
     {
@@ -80,27 +98,41 @@ fn inspect_assault_scenario() -> anyhow::Result<()> {
         let state = world.resource::<MatchState>();
         anyhow::ensure!(state.game_over.is_none(), "対象の手番より前に終局した");
         let active = world.resource::<Players>().0[state.active_player_index.0].id;
-        if active == player && state.current_phase == Phase::Main { break; }
+        if active == player && state.current_phase == Phase::Main {
+            break;
+        }
         anyhow::ensure!(preparatory_commands < 1000, "対象の手番へ到達しない");
         engine::ai::execute_ai_turn(&mut world, active);
         schedule.run(&mut world);
         preparatory_commands += 1;
     }
-    let objective = world.iter_entities().find_map(|entity| {
-        let property = entity.get::<Property>()?;
-        (property.terrain == Terrain::Capital && property.owner_id.is_some_and(|owner| owner != player))
-            .then(|| entity.get::<GridPosition>().copied()).flatten()
-    }).ok_or_else(|| anyhow::anyhow!("敵首都がない"))?;
+    let objective = world
+        .iter_entities()
+        .find_map(|entity| {
+            let property = entity.get::<Property>()?;
+            (property.terrain == Terrain::Capital
+                && property.owner_id.is_some_and(|owner| owner != player))
+            .then(|| entity.get::<GridPosition>().copied())
+            .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("敵首都がない"))?;
     use engine::ai::assault_probe::ProbePlan;
     // 案を絞る場合は ASSAULT_PLANS=baseline,advance のように指定する。
     let plans = match std::env::var("ASSAULT_PLANS") {
-        Ok(text) => text.split(',').map(|name| match name.trim() {
-            "baseline" => Ok(ProbePlan::Baseline),
-            "counter_battery" => Ok(ProbePlan::CounterBattery),
-            "advance" => Ok(ProbePlan::Advance),
-            other => Err(anyhow::anyhow!("未知の案: {other}")),
-        }).collect::<anyhow::Result<Vec<_>>>()?,
-        Err(_) => vec![ProbePlan::Baseline, ProbePlan::CounterBattery, ProbePlan::Advance],
+        Ok(text) => text
+            .split(',')
+            .map(|name| match name.trim() {
+                "baseline" => Ok(ProbePlan::Baseline),
+                "counter_battery" => Ok(ProbePlan::CounterBattery),
+                "advance" => Ok(ProbePlan::Advance),
+                other => Err(anyhow::anyhow!("未知の案: {other}")),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        Err(_) => vec![
+            ProbePlan::Baseline,
+            ProbePlan::CounterBattery,
+            ProbePlan::Advance,
+        ],
     };
     let report = engine::ai::assault_probe::compare_plans(
         &mut world, &master, &map_name, player, objective, horizon, &plans,

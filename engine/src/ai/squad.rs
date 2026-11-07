@@ -4457,8 +4457,14 @@ fn select_landing_candidate(
         .cloned();
 
     let mut enemy_threats = Vec::new();
-    let mut enemy_query = world.query::<(&GridPosition, &Faction, &UnitStats, Option<&Health>)>();
-    for (position, faction, stats, health) in enemy_query.iter(world) {
+    let mut enemy_query = world.query::<(
+        &GridPosition,
+        &Faction,
+        &UnitStats,
+        Option<&Health>,
+        Option<&crate::components::Ammo>,
+    )>();
+    for (position, faction, stats, health, ammo) in enemy_query.iter(world) {
         if faction.0 == cargo_faction {
             continue;
         }
@@ -4470,6 +4476,7 @@ fn select_landing_candidate(
             stats.min_range,
             stats.max_range,
             stats.max_movement,
+            ammo.map_or((0, 0), |ammo| (ammo.ammo1, ammo.ammo2)),
         ));
     }
 
@@ -4539,6 +4546,7 @@ fn select_landing_candidate(
                     terrain_defense,
                     &enemy_threats,
                     chart,
+                    &registry,
                 )
             });
             let transport_distance = map.distance(
@@ -9057,7 +9065,7 @@ mod tests {
         world.insert_resource(registry);
         world.insert_resource(island_map);
         let mut damage_chart = crate::resources::DamageChart::new();
-        damage_chart.insert_damage(UnitType::Artillery, UnitType::Infantry, 50);
+        damage_chart.insert_damage(UnitType::LightSpGun, UnitType::Infantry, 50);
         world.insert_resource(damage_chart);
 
         let player = PlayerId(1);
@@ -9104,10 +9112,17 @@ mod tests {
         world.entity_mut(cargo).insert(Transporting(transport));
         world.spawn((
             Faction(PlayerId(2)),
+            crate::components::Ammo {
+                ammo1: 6,
+                max_ammo1: 6,
+                ammo2: 0,
+                max_ammo2: 0,
+            },
             GridPosition { x: 1, y: 2 },
             UnitStats {
-                unit_type: UnitType::Artillery,
-                movement_type: MovementType::Artillery,
+                // 実マスターでも射程2〜3の軽自走砲を使い、残弾を明示する。
+                unit_type: UnitType::LightSpGun,
+                movement_type: MovementType::Tank,
                 min_range: 2,
                 max_range: 3,
                 max_movement: 5,

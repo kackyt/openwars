@@ -234,6 +234,7 @@ pub(super) fn responsibilities(
             .copied()
             .partition(|member| is_indirect(world, *member));
         let mut taken = crate::collections::HashSet::default();
+        let direct_count = direct.len();
         for gun in indirect {
             let found = firing_position(world, map, player, &enemies, gun, target, front, &taken);
             if std::env::var_os("OPENWARS_ROUTE_OPS_DEBUG").is_some() {
@@ -312,6 +313,26 @@ pub(super) fn responsibilities(
             .into_iter()
             .filter(|member| !covered.contains(member))
             .collect::<Vec<_>>();
+        if std::env::var_os("OPENWARS_ROUTE_OPS_DEBUG").is_some() {
+            // 経路作戦の責務内訳（経路A/Bの切り分け用）。既定では無効。
+            let attacks = assigned
+                .iter()
+                .filter(|responsibility| responsibility.mission_type == MissionType::Attack)
+                .map(|responsibility| responsibility.members.len())
+                .sum::<usize>();
+            eprintln!(
+                "ROUTE-OPS P{player:?} defend={} launched={launched} mission={mission_type:?} target=({},{}) front=({},{}) direct={} assigned={} assigned_attack={} rest={}",
+                order.defend,
+                target.x,
+                target.y,
+                front.x,
+                front.y,
+                direct_count,
+                assigned.iter().map(|r| r.members.len()).sum::<usize>(),
+                attacks,
+                rest.len()
+            );
+        }
         responsibilities.extend(assigned);
         if !rest.is_empty() {
             responsibilities.push(CampaignResponsibility {

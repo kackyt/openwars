@@ -14,6 +14,11 @@ use bevy_ecs::prelude::Entity;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+pub(super) mod observed_composition;
+pub(super) mod production_rules;
+#[cfg(test)]
+mod shared_frontage_tests;
+
 // 1施設手番ごとの候補を順に展開するため、同手番に複数施設を使う混成案が
 // beamから落ちない幅を確保する。候補全体の直積を走査する旧方式には戻さない。
 pub(crate) const SEARCH_BEAM_WIDTH: usize = 64;
@@ -315,12 +320,15 @@ struct FriendlyAttackProfile {
     /// 同じ手番にこの敵を直接攻撃できるunit数の上限（敵の周りの到達可能な空きマス数）。
     /// `None` は上限なし（間接攻撃、または地形を見ない従来モデル）。
     firing_slots: Option<u32>,
+    /// 観測編成試作で本番の武器・反撃を選ぶ交戦距離。
+    attack_distance: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct EnemyAttackProfile {
     base_damage: u32,
     contact_turn: u32,
+    attack_distance: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -483,6 +491,7 @@ struct SimulationCatalog {
     carrier_movement_type: Option<MovementType>,
     /// 前衛が後ろの間接砲を敵の直接攻撃から守るか。
     positional: bool,
+    observed_composition: bool,
 }
 
 impl SimulationCatalog {
@@ -518,6 +527,7 @@ impl SimulationCatalog {
         });
         catalog.frontage = frontage;
         catalog.positional = input.positional;
+        catalog.observed_composition = observed_composition::enabled();
         catalog.carrier_movement_type = input
             .artillery_carrier
             .as_ref()
@@ -573,6 +583,7 @@ impl SimulationCatalog {
             frontage: None,
             carrier_movement_type: None,
             positional: false,
+            observed_composition: false,
         }
     }
 }
@@ -726,9 +737,14 @@ fn ferry_carrier<'a>(input: &'a RollingPlanInput, stats: &UnitStats) -> Option<&
         .filter(|carrier| carrier.loadable_unit_types.contains(&stats.unit_type))
 }
 
-/// 交戦を予測する手番数。硬い期限があれば期限まで。
+/// 購入・排除期限は維持し、試作時だけ保持判定までの交戦も計算する。
 fn plan_search_turns(input: &RollingPlanInput) -> u32 {
-    input.hard_deadline.unwrap_or(DEFAULT_SEARCH_TURNS).max(1)
+    production_rules::forecast_turns(
+        input.hard_deadline,
+        input.hold_window,
+        !crate::ai::code_path::is_extended()
+            && crate::ai::features::production_hold_horizon_enabled(),
+    )
 }
 
 pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackagePlan> {
@@ -743,6 +759,11 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
             .or(input.capture_completion_turn)
             .unwrap_or(1)
             .max(1);
+        let search_turns = production_rules::forecast_turns(
+            Some(search_turns),
+            input.hold_window,
+            crate::ai::features::production_hold_horizon_enabled(),
+        );
         let mut plan =
             simulate_state_with_catalog(input, &catalog, &SearchState::default(), search_turns);
         plan.candidates_considered = 1;
@@ -762,6 +783,7 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     let mut frontier = vec![(root.clone(), CombatRun::start(&catalog, &root))];
     // 全中間案の敵別forecastを保持すると長期戦でメモリと比較時間が膨張する。
     // 最終選択に必要な3案だけを逐次更新し、各候補のsimulateも1回に限定する。
+    let mut best_observed: Option<ForcePackagePlan> = None;
     let mut best_within_deadline: Option<ForcePackagePlan> = None;
     let mut best_feasible: Option<ForcePackagePlan> = None;
     let mut best_effort: Option<ForcePackagePlan> = None;
@@ -813,7 +835,13 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         for (state, run, mut plan) in evaluated {
             considered = considered.saturating_add(1);
             plan.candidates_considered = considered;
-            if plan.feasible && holds_objective && input.economy_of_force {
+            if catalog.observed_composition {
+                if best_observed.as_ref().is_none_or(|current| {
+                    observed_composition::compare(input, &plan, current).is_lt()
+                }) {
+                    best_observed = Some(plan.clone());
+                }
+            } else if plan.feasible && holds_objective && input.economy_of_force {
                 // 戦力節約の守りは、保持できる最も安い案を選び、残りを主戦場へ回す。
                 update_cheapest(&mut best_hold, &plan);
             } else if plan.feasible && holds_objective {
@@ -832,22 +860,29 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
                     );
                 }
             }
-            update_best_effort(&mut best_effort, &plan);
+            if !catalog.observed_composition {
+                update_best_effort(&mut best_effort, &plan);
+            }
             evaluated_next.push((state, run, plan));
         }
         let beam_width = input.search_beam_width.clamp(1, SEARCH_BEAM_WIDTH);
         if evaluated_next.len() > beam_width {
             truncated = true;
-            evaluated_next.sort_by_key(|(_, _, plan)| {
-                (
-                    holds_objective && !plan.feasible,
-                    hold_exchange_rank(input, plan),
-                    plan.remaining_hp(),
-                    plan.expected_loss,
-                    plan.completion_for_ordering(),
-                    plan.production_cost,
-                )
-            });
+            if catalog.observed_composition {
+                evaluated_next
+                    .sort_by(|(_, _, a), (_, _, b)| observed_composition::compare(input, a, b));
+            } else {
+                evaluated_next.sort_by_key(|(_, _, plan)| {
+                    (
+                        holds_objective && !plan.feasible,
+                        hold_exchange_rank(input, plan),
+                        plan.remaining_hp(),
+                        plan.expected_loss,
+                        plan.completion_for_ordering(),
+                        plan.production_cost,
+                    )
+                });
+            }
             evaluated_next.truncate(beam_width);
         }
         frontier = evaluated_next
@@ -859,12 +894,15 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
         }
     }
 
-    let mut selected = best_within_deadline
-        .or(best_hold)
-        .or(best_feasible)
-        // 期限内に全滅できる案が無くても、何も作らず停止しない。
-        .or(best_effort)?;
-    if !selected.feasible {
+    let mut selected = if catalog.observed_composition {
+        best_observed?
+    } else {
+        best_within_deadline
+            .or(best_hold)
+            .or(best_feasible)
+            .or(best_effort)?
+    };
+    if !selected.feasible && !catalog.observed_composition {
         // 実行不能な将来列のために現在の空き施設と現金を寝かせない。今出せる
         // 直接戦闘要員を前線screenとして加え、資金が競合する最も遅い予定から
         // 次revisionへ送り返す。実行可能案の高価な必須counter予約には触れない。
@@ -877,6 +915,8 @@ pub(crate) fn plan_force_package(input: &RollingPlanInput) -> Option<ForcePackag
     if shifted_purchases != selected.purchases
         && slots_with_carriers(input, &shifted_purchases).is_some()
         && let Ok(mut shifted) = evaluate_fixed_package(input, &shifted_purchases)
+        && (!catalog.observed_composition
+            || !observed_composition::compare(input, &shifted, &selected).is_gt())
     {
         shifted.candidates_considered = considered;
         shifted.search_truncated = truncated;
@@ -1318,7 +1358,55 @@ fn simulate_state_with_catalog(
     }
     let mut run = CombatRun::start(catalog, state);
     run.advance_to(input, search_turns);
+    trace_hold_assessment(input, &run, state);
     run.into_plan(input, state)
+}
+
+/// 固定購入案の保持判定について、実際に加算する敵味方と金額だけを診断する。
+fn trace_hold_assessment(input: &RollingPlanInput, run: &CombatRun<'_>, state: &SearchState) {
+    if !input.defensive_emplacement || std::env::var_os("OPENWARS_HOLD_VALUE_TRACE").is_none() {
+        return;
+    }
+    if std::env::var("OPENWARS_HOLD_VALUE_TRACE").as_deref() == Ok("single")
+        && state.option_indices.len() != 1
+    {
+        return;
+    }
+    let Some(window) = input.hold_window else {
+        return;
+    };
+    eprintln!(
+        "HOLD_ASSESSMENT {}",
+        serde_json::json!({
+            "anchor": input.deploy_anchor.map(|p| [p.x, p.y]),
+            "funds": input.current_funds, "window": window, "simulated_through": run.completed_turns,
+            "friendly_value": run.surviving_friendly_value(window),
+            "enemy_value": run.surviving_enemy_value(input, window),
+            "holds": run.holds_objective(input, window),
+            "ground_chokepoint_width":run.catalog.frontage.as_ref().map(|f|f.ground_chokepoint_width),
+            "screen_at_simulation_end":run.living_ground_direct_count(run.completed_turns),
+            "purchases": state.option_indices.iter().map(|&i| {
+                let p = input.production_options[i].purchase;
+                serde_json::json!({"unit": p.unit_type.as_str(), "facility": [p.facility.x,p.facility.y], "turn":p.build_turn})
+            }).collect::<Vec<_>>(),
+            "friendly": (0..run.friendly_states.len()).map(|i| {
+                let unit = run.friendly(i); let hp = run.friendly_states[i].hp;
+                let counted = unit.available_turn <= window && unit.attack_profiles.iter().flatten().any(|p| p.ready_turn <= window);
+                serde_json::json!({"unit":unit.stats.unit_type.as_str(), "hp":hp, "cost":unit.stats.cost, "counted":counted,
+                "available_turn":unit.available_turn,
+                "earliest_attack":unit.attack_profiles.iter().flatten().map(|p|p.ready_turn).min(),
+                "shots":unit.attacks_left.saturating_sub(run.friendly_states[i].attacks_left),
+                "earliest_live_target_attack":unit.attack_profiles.iter().enumerate()
+                    .filter(|(j,_)| run.enemy_states[*j].hp > 0)
+                    .filter_map(|(_,p)|p.as_ref().map(|p|p.ready_turn)).min(),
+                "lane_width":run.catalog.frontage.as_ref().and_then(|f|f.width(&FiringLane::with_carrier(&unit.stats,run.catalog.carrier_movement_type)))})
+            }).collect::<Vec<_>>(),
+            "enemy": run.catalog.enemies.iter().zip(&run.enemy_states).enumerate().map(|(i,(unit, state))| {
+                let counted = unit.source.available_turn <= window && input.hold_contestants.get(i).copied().unwrap_or(true);
+                serde_json::json!({"unit":unit.source.stats.unit_type.as_str(), "position":[unit.source.position.x,unit.source.position.y], "hp":state.hp, "cost":unit.source.stats.cost, "counted":counted})
+            }).collect::<Vec<_>>(),
+        })
+    );
 }
 
 /// 1購入案の交戦シミュレーションの途中状態。
@@ -1342,6 +1430,89 @@ struct CombatRun<'c> {
     finished: bool,
     /// 保持期限の手番を終えた時点で、拠点を取って保持できていたか。
     holds_at_window: Option<bool>,
+    /// 予測の記録用。友軍と同じ順で、購入ごとの射撃・与被害価値を数える。通常の探索では None。
+    ledger: Option<Vec<UnitLedger>>,
+}
+
+/// 1体が計画内シミュレーションで予測した交戦結果。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct UnitLedger {
+    pub shots: u32,
+    pub dealt_value: u32,
+    pub taken_value: u32,
+    pub first_shot_turn: Option<u32>,
+    pub death_turn: Option<u32>,
+}
+
+impl UnitLedger {
+    fn note(&mut self, turn: u32, shot: bool, dealt_value: u32, taken_value: u32, hp_after: u32) {
+        if shot {
+            self.shots += 1;
+            self.first_shot_turn.get_or_insert(turn);
+        }
+        self.dealt_value = self.dealt_value.saturating_add(dealt_value);
+        self.taken_value = self.taken_value.saturating_add(taken_value);
+        if hp_after == 0 {
+            self.death_turn.get_or_insert(turn);
+        }
+    }
+}
+
+/// 購入1件ごとの予測。`predict_unit_outcomes` の戻り値。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PredictedUnit {
+    pub purchase: PlannedPurchase,
+    pub ledger: UnitLedger,
+    pub simulated_turns: u32,
+}
+
+/// 選ばれた購入列を、観測編成の交戦シミュレーションで再実行し、購入ごとの予測を返す。
+/// 観測編成が無効なとき、または購入が候補に見つからないときは、その分を返さない。
+pub(crate) fn predict_unit_outcomes(
+    input: &RollingPlanInput,
+    purchases: &[PlannedPurchase],
+) -> Vec<PredictedUnit> {
+    if !observed_composition::enabled() {
+        return Vec::new();
+    }
+    predict_with_observed_rules(input, purchases)
+}
+
+/// 観測編成の交戦規則で予測を取る本体。単体試験は環境変数を使わず、これを直接呼ぶ。
+fn predict_with_observed_rules(
+    input: &RollingPlanInput,
+    purchases: &[PlannedPurchase],
+) -> Vec<PredictedUnit> {
+    let mut state = SearchState::default();
+    let mut matched = Vec::new();
+    for purchase in purchases {
+        if let Some(index) = input
+            .production_options
+            .iter()
+            .position(|option| option.purchase == *purchase)
+        {
+            state.option_indices.push(index);
+            matched.push(*purchase);
+        }
+    }
+    let mut catalog = SimulationCatalog::new(input);
+    catalog.observed_composition = true;
+    let mut run = CombatRun::start(&catalog, &state);
+    run.ledger = Some(vec![UnitLedger::default(); run.friendly_states.len()]);
+    run.advance_to(input, plan_search_turns(input));
+    let existing = catalog.existing_units.len();
+    let Some(ledger) = run.ledger.as_ref() else {
+        return Vec::new();
+    };
+    matched
+        .into_iter()
+        .enumerate()
+        .map(|(offset, purchase)| PredictedUnit {
+            purchase,
+            ledger: ledger[existing + offset],
+            simulated_turns: run.completed_turns,
+        })
+        .collect()
 }
 
 impl<'c> CombatRun<'c> {
@@ -1365,6 +1536,7 @@ impl<'c> CombatRun<'c> {
             completed_turns: 0,
             finished: false,
             holds_at_window: None,
+            ledger: None,
         };
         for option_index in &state.option_indices {
             run.add_production(*option_index);
@@ -1444,8 +1616,8 @@ impl<'c> CombatRun<'c> {
             .sum();
         let enemy_hp_before = arrived_enemy_hp(&catalog.enemies, &self.enemy_states, turn);
         let friendly_hp_before = total_hp(&self.friendly_states) + total_hp(&self.protected_states);
-        let attack_count = self.friendly_attacks(turn);
-        self.enemy_attacks(turn);
+        let attack_count = self.friendly_attacks(input, turn);
+        self.enemy_attacks(input, turn);
         let enemy_hp_after = arrived_enemy_hp(&catalog.enemies, &self.enemy_states, turn);
         let friendly_hp_after = total_hp(&self.friendly_states) + total_hp(&self.protected_states);
         self.turn_forecasts.push(CampaignTurnForecast {
@@ -1468,7 +1640,7 @@ impl<'c> CombatRun<'c> {
     }
 
     /// 友軍が並び順に1回ずつ攻撃し、生存した標的から反撃を受ける。攻撃回数を返す。
-    fn friendly_attacks(&mut self, turn: u32) -> u32 {
+    fn friendly_attacks(&mut self, input: &RollingPlanInput, turn: u32) -> u32 {
         let catalog = self.catalog;
         let mut attack_count = 0_u32;
         // 敵ごとに、この手番に既に直接攻撃したunit数。周りの空きマスを超えて殴れない。
@@ -1491,30 +1663,57 @@ impl<'c> CombatRun<'c> {
         let mut engaged_front = 0_u32;
         let mut indirect_fired = 0_u32;
         let mut front_attacks: HashMap<FiringLane, u32> = HashMap::default();
+        // 移動タイプ別の枠とは別に、地上の直接戦闘部隊が前線マスを取り合う数。
+        let mut shared_direct_attacks = 0_u32;
         for index in order {
             let friendly = self.friendly(index);
-            let friendly_state = &mut self.friendly_states[index];
-            if friendly_state.hp == 0
-                || friendly_state.attacks_left == 0
-                || turn < friendly.available_turn
-            {
+            let state = &self.friendly_states[index];
+            if state.hp == 0 || state.attacks_left == 0 || turn < friendly.available_turn {
                 continue;
             }
-            let Some((target_index, attack_profile)) = select_target(
-                friendly,
-                &catalog.enemies,
-                &self.enemy_states,
-                &direct_attacks,
-                turn,
-            ) else {
+            let target = if catalog.observed_composition {
+                observed_composition::select_target(
+                    input,
+                    friendly,
+                    state,
+                    &catalog.enemies,
+                    &self.enemy_states,
+                    &direct_attacks,
+                    turn,
+                )
+            } else {
+                select_target(
+                    friendly,
+                    &catalog.enemies,
+                    &self.enemy_states,
+                    &direct_attacks,
+                    turn,
+                )
+            };
+            let Some((target_index, attack_profile)) = target else {
                 continue;
             };
+            let friendly_state = &mut self.friendly_states[index];
             let lane = FiringLane::with_carrier(&friendly.stats, catalog.carrier_movement_type);
             if catalog
                 .frontage
                 .as_ref()
                 .and_then(|frontage| frontage.width(&lane))
                 .is_some_and(|width| front_attacks.get(&lane).copied().unwrap_or(0) >= width)
+            {
+                continue;
+            }
+            let ground_direct = lane.indirect_range.is_none()
+                && !matches!(
+                    friendly.stats.movement_type,
+                    MovementType::Air | MovementType::Ship
+                );
+            if ground_direct
+                && catalog
+                    .frontage
+                    .as_ref()
+                    .and_then(|frontage| frontage.shared_direct_width)
+                    .is_some_and(|width| shared_direct_attacks >= width)
             {
                 continue;
             }
@@ -1539,7 +1738,52 @@ impl<'c> CombatRun<'c> {
                 direct_attacks[target_index] = direct_attacks[target_index].saturating_add(1);
             }
             *front_attacks.entry(lane).or_default() += 1;
+            if ground_direct {
+                shared_direct_attacks += 1;
+            }
             let target = &mut self.enemy_states[target_index];
+            if catalog.observed_composition {
+                use observed_composition::Combatant;
+                let enemy = &catalog.enemies[target_index].source;
+                if let Some(result) = observed_composition::exchange(
+                    &input.master_data,
+                    &input.damage_chart,
+                    Combatant {
+                        stats: &friendly.stats,
+                        hp: friendly_state.hp,
+                        ammo: friendly_state.ammo,
+                        defense: 0,
+                    },
+                    Combatant {
+                        stats: &enemy.stats,
+                        hp: target.hp,
+                        ammo: target.ammo,
+                        defense: enemy.defense_bonus,
+                    },
+                    attack_profile.attack_distance,
+                ) {
+                    friendly_state.hp = result.attacker_hp;
+                    friendly_state.ammo = result.attacker_ammo;
+                    friendly_state.attacks_left = friendly_state.attacks_left.saturating_sub(1);
+                    target.hp = result.defender_hp;
+                    target.ammo = result.defender_ammo;
+                    if target.hp == 0 {
+                        target.destroyed_turn = Some(turn);
+                    }
+                    self.first_attack_turn.get_or_insert(turn);
+                    attack_count = attack_count.saturating_add(1);
+                    if let Some(ledger) = self.ledger.as_mut() {
+                        ledger[index].note(
+                            turn,
+                            true,
+                            enemy.stats.cost.saturating_mul(result.damage) / 100,
+                            friendly.stats.cost.saturating_mul(result.counter_damage) / 100,
+                            result.attacker_hp,
+                        );
+                    }
+                }
+                continue;
+            }
             let damage = calculate_damage_formula(
                 attack_profile.base_damage,
                 friendly_state.hp,
@@ -1573,7 +1817,7 @@ impl<'c> CombatRun<'c> {
     /// 敵砲兵・直接戦闘unitも手番ごとに最も有利な友軍を攻撃する。
     /// 占領兵だけを損耗対象にすると、射程へ入った護衛砲台が無傷という予測になり、
     /// 間接火力だけの脆い編成を過大評価する。
-    fn enemy_attacks(&mut self, turn: u32) {
+    fn enemy_attacks(&mut self, input: &RollingPlanInput, turn: u32) {
         let catalog = self.catalog;
         // 地上直接戦闘unitが隘路幅（ground_chokepoint_width）以上生存していれば前線の壁が成立し、
         // 敵の地上直接攻撃と、壁の向こうから射程が届かない短射程の敵地上間接砲は後方の長射程砲へ届かない。
@@ -1603,6 +1847,48 @@ impl<'c> CombatRun<'c> {
             } else {
                 Some(enemy.source.stats.max_range.saturating_add(1))
             };
+            if catalog.observed_composition {
+                if let Some((protected, index, result)) = observed_composition::enemy_target(
+                    input,
+                    self,
+                    enemy_index,
+                    turn,
+                    shielded_min_max_range,
+                ) {
+                    let state = if protected {
+                        &mut self.protected_states[index]
+                    } else {
+                        &mut self.friendly_states[index]
+                    };
+                    state.hp = result.defender_hp;
+                    state.ammo = result.defender_ammo;
+                    let enemy_state = &mut self.enemy_states[enemy_index];
+                    enemy_state.hp = result.attacker_hp;
+                    enemy_state.ammo = result.attacker_ammo;
+                    enemy_state.attacks_left = enemy_state.attacks_left.saturating_sub(1);
+                    if enemy_state.hp == 0 {
+                        enemy_state.destroyed_turn = Some(turn);
+                    }
+                    if !protected && self.ledger.is_some() {
+                        let friendly_cost = self.friendly(index).stats.cost;
+                        if let Some(ledger) = self.ledger.as_mut() {
+                            ledger[index].note(
+                                turn,
+                                false,
+                                enemy
+                                    .source
+                                    .stats
+                                    .cost
+                                    .saturating_mul(result.counter_damage)
+                                    / 100,
+                                friendly_cost.saturating_mul(result.damage) / 100,
+                                result.defender_hp,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             let existing_target = strongest_attack_in_damage_order(
                 &catalog.existing_by_enemy_damage[enemy_index],
                 &catalog.existing_units,
@@ -1726,8 +2012,24 @@ impl<'c> CombatRun<'c> {
     fn holds_objective(&self, input: &RollingPlanInput, turn: u32) -> bool {
         let capturers_survive = input.capture_completion_turn.is_none()
             || self.capture_survivor_count() >= input.required_capture_survivors.max(1);
-        capturers_survive
-            && self.surviving_friendly_value(turn) > self.surviving_enemy_value(input, turn)
+        if self.catalog.observed_composition {
+            // 保持への関与敵と、その他の観測敵を区別する。遠方の敵の全滅は保持条件にしない。
+            capturers_survive
+                && self
+                    .catalog
+                    .enemies
+                    .iter()
+                    .zip(&self.enemy_states)
+                    .enumerate()
+                    .filter(|(i, (enemy, _))| {
+                        enemy.source.available_turn <= turn
+                            && input.hold_contestants.get(*i).copied().unwrap_or(true)
+                    })
+                    .all(|(_, (_, enemy))| enemy.hp == 0)
+        } else {
+            capturers_survive
+                && self.surviving_friendly_value(turn) > self.surviving_enemy_value(input, turn)
+        }
     }
 
     fn into_plan(self, input: &RollingPlanInput, state: &SearchState) -> ForcePackagePlan {
@@ -1907,6 +2209,8 @@ struct EngagementRow {
     firing_slots: Option<u32>,
     /// 据えた砲台を敵が射程へ入るまで撃てないとき、その最早turn（絶対値）。
     enemy_in_range_turn: Option<u32>,
+    attack_distance: u32,
+    enemy_attack_distance: u32,
 }
 
 impl EngagementTemplate {
@@ -2065,6 +2369,22 @@ impl EngagementTemplate {
                     friendly_travel,
                     firing_slots,
                     enemy_in_range_turn,
+                    attack_distance: super::combat_profile::preferred_attack_distance(
+                        &input.master_data,
+                        &input.damage_chart,
+                        stats,
+                        &enemy.stats,
+                        distance,
+                    )
+                    .unwrap_or(stats.max_range.max(1)),
+                    enemy_attack_distance: super::combat_profile::preferred_attack_distance(
+                        &input.master_data,
+                        &input.damage_chart,
+                        &enemy.stats,
+                        stats,
+                        distance,
+                    )
+                    .unwrap_or(enemy.stats.max_range.max(1)),
                 }
             })
             .collect::<Vec<EngagementRow>>();
@@ -2126,6 +2446,7 @@ impl EngagementTemplate {
                         incoming_damage,
                         ready_turn,
                         firing_slots: row.firing_slots,
+                        attack_distance: row.attack_distance,
                     }
                 })
             })
@@ -2150,6 +2471,7 @@ impl EngagementTemplate {
                 (row.enemy_base_damage > 0).then_some(EnemyAttackProfile {
                     base_damage: row.enemy_base_damage,
                     contact_turn,
+                    attack_distance: row.enemy_attack_distance,
                 })
             })
             .collect::<Vec<_>>();
@@ -2307,6 +2629,7 @@ fn strongest_attack_in_damage_order(
 struct UnitCombatState {
     hp: u32,
     attacks_left: u32,
+    ammo: (u32, u32),
 }
 
 impl UnitCombatState {
@@ -2314,6 +2637,7 @@ impl UnitCombatState {
         Self {
             hp: unit.hp,
             attacks_left: unit.attacks_left,
+            ammo: (unit.stats.max_ammo1, unit.stats.max_ammo2),
         }
     }
 }
@@ -2323,6 +2647,7 @@ impl UnitCombatState {
 struct EnemyCombatState {
     hp: u32,
     attacks_left: u32,
+    ammo: (u32, u32),
     destroyed_turn: Option<u32>,
 }
 
@@ -2331,6 +2656,7 @@ impl EnemyCombatState {
         Self {
             hp: enemy.hp,
             attacks_left: enemy.attacks_left,
+            ammo: (enemy.source.stats.max_ammo1, enemy.source.stats.max_ammo2),
             destroyed_turn: enemy.destroyed_turn,
         }
     }
@@ -2406,6 +2732,30 @@ struct BattleFrontage {
     widths: HashMap<FiringLane, u32>,
     /// 地上車両が前線へ至る経路の最小点カット幅（橋などの隘路では 1〜2、広い平地では大）。
     ground_chokepoint_width: u32,
+    /// 地上の直接戦闘部隊全体が1手番に攻撃できる数。移動タイプごとの区分では別枠になる
+    /// 同じマスを、実際には戦車も装甲車も歩兵も取り合うため、共有試作時だけ持つ。
+    shared_direct_width: Option<u32>,
+}
+
+/// 明示的な計画診断で、直接部隊と間接部隊に与える射点上限の差を確認する。
+pub(crate) fn frontage_diagnostic(input: &RollingPlanInput) -> serde_json::Value {
+    let Some(frontage) = battle_frontage(input) else {
+        return serde_json::Value::Null;
+    };
+    let mut lanes = frontage
+        .widths
+        .iter()
+        .map(|(lane, width)| {
+            serde_json::json!({
+                "movement": format!("{:?}", lane.movement_type),
+                "carrier": format!("{:?}", lane.carrier_movement_type),
+                "indirect_range": lane.indirect_range, "width": width,
+            })
+        })
+        .collect::<Vec<_>>();
+    lanes.sort_by_key(|row| row.to_string());
+    serde_json::json!({"ground_chokepoint_width":frontage.ground_chokepoint_width,
+        "shared_direct_width":frontage.shared_direct_width, "lanes":lanes})
 }
 
 impl BattleFrontage {
@@ -2428,6 +2778,13 @@ impl BattleFrontage {
 /// 山を越えられる歩兵と戦車では通れる地形が違うため、移動種別ごとに求める。今いる敵が
 /// いなければ上限を設けない。
 fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
+    battle_frontage_with(
+        input,
+        !crate::ai::code_path::is_extended() && crate::ai::features::shared_frontage_enabled(),
+    )
+}
+
+fn battle_frontage_with(input: &RollingPlanInput, shared_direct: bool) -> Option<BattleFrontage> {
     let blocked = input
         .enemies
         .iter()
@@ -2471,7 +2828,7 @@ fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
     let ground_chokepoint_width = if ground_origins.is_empty() {
         1
     } else {
-        front_min_cut(input, MovementType::Tank, &ground_origins, &blocked).max(1)
+        front_min_cut(input, &[MovementType::Tank], &ground_origins, &blocked).max(1)
     };
     let widths = origins_by_lane
         .into_iter()
@@ -2479,7 +2836,7 @@ fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
             // 直接戦闘unitは周りの敵を倒せば入れるため1体分は残す。間接砲は撃てる位置が
             // 無ければ撃てない。
             let width = match lane.indirect_range {
-                None => front_min_cut(input, lane.movement_type, &origins, &blocked).max(1),
+                None => front_min_cut(input, &[lane.movement_type], &origins, &blocked).max(1),
                 Some(range) => indirect_firing_cells(
                     input,
                     lane.movement_type,
@@ -2491,10 +2848,48 @@ fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
             };
             (lane, width)
         })
-        .collect();
+        .collect::<HashMap<_, _>>();
+    let shared_direct_width = shared_direct.then(|| {
+        // 戦車も装甲車も歩兵も、同じ地上の前線マスに立つ。通れる地形の違いは各区分の幅に
+        // 残し、全体では「どれかが入れるマス」の最小点カットを超えて同時に攻撃させない。
+        let mut types = Vec::<MovementType>::new();
+        let mut origins = Vec::<GridPosition>::new();
+        let mut lane_sum = 0_u32;
+        for (lane, width) in &widths {
+            if lane.indirect_range.is_none()
+                && !matches!(lane.movement_type, MovementType::Air | MovementType::Ship)
+            {
+                if !types.contains(&lane.movement_type) {
+                    types.push(lane.movement_type);
+                }
+                lane_sum = lane_sum.saturating_add(*width);
+            }
+        }
+        for (stats, origin) in input
+            .existing_units
+            .iter()
+            .map(|unit| (&unit.stats, unit.position))
+            .chain(
+                input
+                    .production_options
+                    .iter()
+                    .map(|option| (&option.stats, option.purchase.facility)),
+            )
+        {
+            if stats.min_range <= 1 && types.contains(&stats.movement_type) {
+                origins.push(origin);
+            }
+        }
+        origins.sort_unstable_by_key(|pos| (pos.y, pos.x));
+        origins.dedup();
+        front_min_cut(input, &types, &origins, &blocked)
+            .max(1)
+            .min(lane_sum.max(1))
+    });
     Some(BattleFrontage {
         widths,
         ground_chokepoint_width,
+        shared_direct_width,
     })
 }
 
@@ -2559,7 +2954,7 @@ fn indirect_firing_cells(
 /// マスの数を超えない。
 fn front_min_cut(
     input: &RollingPlanInput,
-    movement_type: MovementType,
+    movement_types: &[MovementType],
     origins: &[GridPosition],
     blocked: &HashSet<GridPosition>,
 ) -> u32 {
@@ -2567,15 +2962,22 @@ fn front_min_cut(
     let passable = |cell: GridPosition| {
         !blocked.contains(&cell)
             && map.get_terrain(cell.x, cell.y).is_some_and(|terrain| {
-                crate::systems::movement::get_valid_movement_cost(
-                    &input.master_data,
-                    movement_type,
-                    terrain,
-                )
-                .is_some()
+                movement_types.iter().any(|movement_type| {
+                    crate::systems::movement::get_valid_movement_cost(
+                        &input.master_data,
+                        *movement_type,
+                        terrain,
+                    )
+                    .is_some()
+                })
             })
     };
-    let reachable = reachable_cells(input, movement_type, origins, blocked);
+    // 1体の移動経路は単一の移動タイプの地形だけを通る。異なる区分の経路を混ぜず、
+    // 各タイプが到達できるマスの和集合を共有の前線マスとする。
+    let mut reachable = HashSet::default();
+    for movement_type in movement_types {
+        reachable.extend(reachable_cells(input, *movement_type, origins, blocked));
+    }
     let cells = reachable
         .iter()
         .copied()
@@ -2925,6 +3327,7 @@ pub(crate) fn production_options(
     mut can_reach: impl FnMut(GridPosition, &UnitStats) -> bool,
 ) -> Vec<ProductionPlanOption> {
     let allow_cargo = crate::ai::code_path::is_extended();
+    let armed_carriers = crate::ai::features::production_role_candidates_enabled();
     let mut options = Vec::new();
     for build_turn in 0..future_turns {
         let facilities = if build_turn == 0 {
@@ -2935,7 +3338,8 @@ pub(crate) fn production_options(
         for (facility, terrain) in facilities {
             for (unit_type, stats) in available_types {
                 if stats.cost == 0
-                    || (!allow_cargo && stats.max_cargo > 0)
+                    || (!allow_cargo
+                        && !production_rules::allows_combat_role(stats, armed_carriers))
                     || !master_data.can_produce_unit(terrain.as_str(), *unit_type)
                     || !can_reach(*facility, stats)
                 {
@@ -2996,7 +3400,7 @@ mod tests {
         }
     }
 
-    fn input() -> RollingPlanInput {
+    pub(super) fn input() -> RollingPlanInput {
         let map = Map::new(12, 1, Terrain::Plains, GridTopology::Square);
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::Bcopters, UnitType::Infantry, 40);

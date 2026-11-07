@@ -50,6 +50,8 @@ pub enum ReplanReason {
     /// 必要な兵站路が成立し、形成中の首都攻略を現在盤面から組み直した。
     AssaultAuthorized,
     NoFeasibleReplacement,
+    /// 観測敵別の未対処率・実損耗を同一入力で比較して改善した。
+    ObservedEnemyCoverageImproved,
 }
 
 /// その手番に行った計画ライフサイクル上の判断。
@@ -1090,7 +1092,8 @@ impl V4RollingPlanRegistry {
         )
     }
 
-    /// 島campaign向け選択。`island_id`が同じ限りPlanIdと実績台帳を維持する。
+    /// 従来の選択契約を検証するテスト入口。
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn select_for_operation(
         &mut self,
@@ -1109,6 +1112,44 @@ impl V4RollingPlanRegistry {
         candidate: ForcePackagePlan,
         hard_deadline: Option<u32>,
         conflicted_facilities: HashSet<GridPosition>,
+    ) -> SelectedPlan {
+        self.select_for_operation_with_comparison(
+            player_id,
+            turn,
+            kind,
+            island_id,
+            anchor,
+            objective_properties,
+            target_enemies,
+            execution_authorized,
+            continuation,
+            candidate,
+            hard_deadline,
+            conflicted_facilities,
+            None,
+        )
+    }
+
+    /// 島campaign向け選択。比較結果は同じ入力で再評価した候補と継続案の順序。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_for_operation_with_comparison(
+        &mut self,
+        player_id: PlayerId,
+        turn: u32,
+        kind: OperationKind,
+        island_id: Option<IslandId>,
+        anchor: GridPosition,
+        objective_properties: Vec<GridPosition>,
+        target_enemies: HashSet<Entity>,
+        execution_authorized: bool,
+        continuation: Option<(
+            PlanContinuation,
+            Result<ForcePackagePlan, FixedPackageError>,
+        )>,
+        candidate: ForcePackagePlan,
+        hard_deadline: Option<u32>,
+        conflicted_facilities: HashSet<GridPosition>,
+        candidate_order: Option<std::cmp::Ordering>,
     ) -> SelectedPlan {
         let production_slot_deferred = !conflicted_facilities.is_empty();
         let candidate_executable = executable_plan(kind, &candidate);
@@ -1178,7 +1219,10 @@ impl V4RollingPlanRegistry {
 
         // 兵站路が成立した瞬間は、形成開始時の古い敵編成をそのまま実行しない。
         // 同じPlanIdのrevisionを現在盤面へ更新し、既に配属済みのEntityは維持する。
-        if authorization_activated && candidate_executable {
+        if authorization_activated
+            && candidate_executable
+            && candidate_order.is_none_or(|order| !order.is_gt())
+        {
             let revision = PlanRevision(previous.revision.0.saturating_add(1));
             self.replace_plan(
                 previous.index,
@@ -1226,7 +1270,8 @@ impl V4RollingPlanRegistry {
             production_slot_deferred
         };
 
-        if !formation_must_replan
+        if candidate_order.is_none()
+            && !formation_must_replan
             && !authorization_activated
             && can_defer
             && matches!(
@@ -1284,7 +1329,10 @@ impl V4RollingPlanRegistry {
         // PlanIdを全て捨てない。この契約は首都攻略だけでなく、中央島のCapture/Defense
         // にも必要である。残編成を現在の生産枠へ載せ直せる場合は、未完了stepだけを
         // Plannedへ戻して同じ計画内で再発注する。
-        if previous.production_failed && continuation_error.is_none() {
+        if previous.production_failed
+            && continuation_error.is_none()
+            && candidate_order.is_none_or(|order| !order.is_lt())
+        {
             let plan = evaluated.expect("再発注可能な固定編成が評価済み");
             let stored = &mut self.active[previous.index];
             for step in &mut stored.steps {
@@ -1326,14 +1374,16 @@ impl V4RollingPlanRegistry {
                 reason: Some(ReplanReason::ProductionStepFailed),
             };
         }
-        let decision = decide_lifecycle(ReplanAssessment {
+        let mut decision = decide_lifecycle(ReplanAssessment {
             objective_complete: target_enemies.is_empty() && stored.execution.objectives_secured(),
             production_failed: previous.production_failed,
             continuation_error,
             continuation: continuation_metrics,
             // 編成trancheの途中は敵が毎ターン増えても購入列を捨てない。生産失敗など
             // 硬い実行不能だけを先に処理し、完了後に次tranche/最終案を比較する。
-            candidate: (!formation_in_progress || formation_must_replan)
+            candidate: (candidate_order.is_some()
+                || !formation_in_progress
+                || formation_must_replan)
                 .then_some(candidate_metrics)
                 .flatten(),
             hard_deadline,
@@ -1346,6 +1396,21 @@ impl V4RollingPlanRegistry {
             switch_delay: 0,
         });
 
+        // 試作の候補/継続案は同じ観測集合で比較済み。金額保持や総HPの旧比較で
+        // 敵別の改善を上書きしない。実行不能・完了・生産失敗の処理は維持する。
+        if let Some(order) = candidate_order
+            && continuation_error.is_none()
+            && !previous.production_failed
+            && !(target_enemies.is_empty() && stored.execution.objectives_secured())
+        {
+            if order.is_lt() && candidate_executable {
+                decision.disposition = PlanDisposition::Revised;
+                decision.reason = Some(ReplanReason::ObservedEnemyCoverageImproved);
+            } else {
+                decision.disposition = PlanDisposition::Continued;
+                decision.reason = None;
+            }
+        }
         match decision.disposition {
             PlanDisposition::Continued => {
                 let plan = evaluated.expect("継続判定には実行可能な現行案がある");
@@ -1487,14 +1552,31 @@ impl V4RollingPlanRegistry {
 
     /// 生産命令を発行した時点でstepをIssuedへ進める。
     pub(crate) fn mark_issued(&mut self, step_ref: PlanStepRef, turn: u32) {
+        // 明示した局面診断だけ、発注がどのrevisionへ記録されたかを追跡する。
+        let trace = std::env::var("OPENWARS_PLAN_SELECTION_TRACE_TURN")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            == Some(turn);
         for plan in &mut self.active {
             if plan.plan_id != step_ref.plan_id || plan.revision != step_ref.revision {
                 continue;
             }
             if let Some(step) = plan.steps.iter_mut().find(|step| step.step == step_ref) {
                 step.status = PurchaseStatus::Issued { turn };
+                if trace {
+                    eprintln!("PLAN_ISSUED turn={turn} matched=true step={step_ref:?}");
+                }
                 return;
             }
+        }
+        if trace {
+            eprintln!(
+                "PLAN_ISSUED turn={turn} matched=false step={step_ref:?} active={:?}",
+                self.active
+                    .iter()
+                    .map(|p| (p.plan_id, p.revision, p.kind))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -2200,6 +2282,122 @@ mod tests {
             required_capture_survivor_count: 0,
             candidates_considered: 1,
             search_truncated: false,
+        }
+    }
+
+    #[test]
+    fn observed_candidate_forecast_cannot_be_attached_to_an_old_deferred_purchase_list() {
+        let mut registry = V4RollingPlanRegistry::default();
+        let player = PlayerId(1);
+        let anchor = GridPosition { x: 2, y: 3 };
+        let island = Some(IslandId(1));
+        let enemies = HashSet::from_iter([Entity::from_raw(10)]);
+        registry.select_for_operation(
+            player,
+            1,
+            OperationKind::AssaultCapital,
+            island,
+            anchor,
+            vec![anchor],
+            enemies.clone(),
+            false,
+            None,
+            feasible_plan(0),
+            None,
+            HashSet::default(),
+        );
+        let previous = registry
+            .continuation_for_operation(
+                player,
+                1,
+                OperationKind::AssaultCapital,
+                island,
+                &[anchor],
+                &enemies,
+            )
+            .unwrap();
+        let mut candidate = feasible_plan(0);
+        candidate.purchases[0].unit_type = UnitType::MdTank;
+        candidate.purchases[0].cost = 18_000;
+        candidate.production_cost = 18_000;
+        let expected = candidate.purchases.clone();
+        let selected = registry.select_for_operation_with_comparison(
+            player,
+            1,
+            OperationKind::AssaultCapital,
+            island,
+            anchor,
+            vec![anchor],
+            enemies,
+            false,
+            Some((previous, Err(FixedPackageError::ProductionSlotUnavailable))),
+            candidate,
+            None,
+            HashSet::from_iter([anchor]),
+            Some(std::cmp::Ordering::Less),
+        );
+        assert_eq!(selected.plan.purchases, expected);
+        assert_eq!(selected.disposition, PlanDisposition::Revised);
+    }
+
+    #[test]
+    fn observed_candidate_order_is_not_overwritten_by_the_old_cost_comparison() {
+        for (order, expected) in [
+            (std::cmp::Ordering::Less, PlanDisposition::Revised),
+            (std::cmp::Ordering::Greater, PlanDisposition::Continued),
+        ] {
+            let mut registry = V4RollingPlanRegistry::default();
+            let player = PlayerId(1);
+            let anchor = GridPosition { x: 2, y: 3 };
+            let enemies = HashSet::from_iter([Entity::from_raw(10)]);
+            registry.select_for_operation(
+                player,
+                1,
+                OperationKind::Defense,
+                None,
+                anchor,
+                vec![anchor],
+                enemies.clone(),
+                true,
+                None,
+                feasible_plan(0),
+                None,
+                HashSet::default(),
+            );
+            let previous = registry
+                .continuation_for_operation(
+                    player,
+                    1,
+                    OperationKind::Defense,
+                    None,
+                    &[anchor],
+                    &enemies,
+                )
+                .unwrap();
+            let mut candidate = feasible_plan(0);
+            candidate.production_cost = if order.is_lt() { 10_000 } else { 1_000 };
+            let selected = registry.select_for_operation_with_comparison(
+                player,
+                1,
+                OperationKind::Defense,
+                None,
+                anchor,
+                vec![anchor],
+                enemies,
+                true,
+                Some((previous, Ok(feasible_plan(0)))),
+                candidate,
+                None,
+                HashSet::default(),
+                Some(order),
+            );
+            assert_eq!(selected.disposition, expected);
+            if order.is_lt() {
+                assert_eq!(
+                    selected.reason,
+                    Some(ReplanReason::ObservedEnemyCoverageImproved)
+                );
+            }
         }
     }
 

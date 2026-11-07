@@ -2,9 +2,7 @@
 use super::probe_tests::{pos, spawn, world};
 use super::*;
 use crate::ai::tactics::board::TacticalBoard;
-use crate::ai::tactics::scoring::{
-    DIRECT_THREAT_TERRAIN_CAP, direct_threat_terrain_score, terrain_defense_bonus,
-};
+use crate::ai::tactics::scoring::{direct_threat_terrain_score, terrain_defense_bonus};
 use crate::ai::tactics::unit::UnitState;
 use crate::resources::{Map, Terrain, UnitType};
 
@@ -41,12 +39,9 @@ fn v4_direct_unit_prefers_defensive_terrain_in_enemy_reach() {
             direct_threat_terrain_score(&board, &unit, position, defense)
         })
     };
-    // V4: 森(20%)で避けられる期待損失 = 50HP × 20% × 6000/100 = 600。道路は0。
-    // 山(40%)は1200だが上限で頭打ち。敵の直接攻撃圏の外（格子距離11）は0。
-    assert_eq!(
-        terrain_scores(&mut world),
-        [600, 0, DIRECT_THREAT_TERRAIN_CAP, 0]
-    );
+    // 本番式で51HP→森42HP・山36HP。避ける損失は9×60=540、15×60=900。
+    // 道路および敵の直接攻撃圏の外（格子距離11）は0。
+    assert_eq!(terrain_scores(&mut world), [540, 0, 900, 0]);
     // V3は基準線として位置取りを変えない。
     world
         .resource_mut::<crate::ai::PlayerAiSettings>()

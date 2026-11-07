@@ -78,6 +78,15 @@ pub fn run_squad_beam_search(world: &mut World, perspective_player: PlayerId) {
         .filter(|s| s.plan.owner_id == Some(perspective_player))
         // V4の生産目的を持つ局地任務は、優先敵が有効な間は別前線へ上書きしない。
         .filter(|s| !protected_squads.contains(&s.id))
+        // 首都ルートDAGが区間目標を決めている分隊は、近さの加点で目標を奪わない。
+        .filter(|s| {
+            !(crate::ai::features::dag_squad_targets_enabled()
+                && crate::ai::v4::capital_route::commitment::squad_has_capital_route_commitment(
+                    world,
+                    perspective_player,
+                    s.id,
+                ))
+        })
         .filter(|s| !s.members.is_empty() && !matches!(s.plan.mission_type, MissionType::Transport))
         .filter(|s| s.plan.target_island.is_none())
         .cloned()

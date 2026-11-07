@@ -81,6 +81,331 @@ fn trace_units(world: &mut World) -> Vec<(u64, u32, String, usize, usize, u32, b
     units
 }
 
+/// 診断用の初手介入。実際のAIへ固定座標のルールを追加しない。
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct OpeningOrder {
+    from: [usize; 2],
+    to: Option<[usize; 2]>,
+    target: Option<[usize; 2]>,
+}
+
+fn execute_opening(
+    world: &mut World,
+    schedule: &mut Schedule,
+    player: PlayerId,
+    order: &OpeningOrder,
+) -> String {
+    use engine::ai::AiCommand;
+    use engine::systems::movement::{OccupantInfo, calculate_reachable_tiles};
+    let from = GridPosition {
+        x: order.from[0],
+        y: order.from[1],
+    };
+    let actor = world
+        .iter_entities()
+        .find_map(|e| {
+            (e.get::<Faction>().is_some_and(|f| f.0 == player)
+                && e.get::<GridPosition>() == Some(&from)
+                && e.get::<UnitStats>().is_some()
+                && e.get::<Transporting>().is_none())
+            .then_some(e.id())
+        })
+        .expect("介入する部隊が指定位置にいない");
+    assert!(engine::systems::action::is_unit_selectable(world, actor));
+    let to = order.to.map_or(from, |p| GridPosition { x: p[0], y: p[1] });
+    let stats = world.get::<UnitStats>(actor).unwrap().clone();
+    let occupied = world
+        .iter_entities()
+        .filter_map(|e| {
+            if e.get::<Transporting>().is_some() {
+                return None;
+            }
+            let p = e.get::<GridPosition>()?;
+            let f = e.get::<Faction>()?;
+            let s = e.get::<UnitStats>()?;
+            let c = e.get::<CargoCapacity>();
+            Some((
+                (p.x, p.y),
+                OccupantInfo {
+                    player_id: f.0,
+                    is_transport: s.max_cargo > 0,
+                    unit_type: s.unit_type,
+                    loadable_types: s.loadable_unit_types.clone(),
+                    free_slots: c
+                        .map_or(s.max_cargo, |c| c.max.saturating_sub(c.loaded.len() as u32)),
+                },
+            ))
+        })
+        .collect();
+    let reachable = calculate_reachable_tiles(
+        world.resource::<Map>(),
+        &occupied,
+        (from.x, from.y),
+        stats.movement_type,
+        stats.max_movement,
+        world.get::<Fuel>(actor).unwrap().current,
+        player,
+        stats.unit_type,
+        world.resource::<MasterDataRegistry>(),
+    );
+    assert!(
+        reachable.contains(&(to.x, to.y)),
+        "指定先へ合法に移動できない: {from:?} -> {to:?}"
+    );
+    let mut expected_hit = None;
+    let command = if let Some(p) = order.target {
+        let target_pos = GridPosition { x: p[0], y: p[1] };
+        let target = world
+            .iter_entities()
+            .find_map(|e| {
+                (e.get::<Faction>().is_some_and(|f| f.0 != player)
+                    && e.get::<GridPosition>() == Some(&target_pos)
+                    && e.get::<UnitStats>().is_some())
+                .then_some(e.id())
+            })
+            .expect("指定した攻撃対象がいない");
+        assert!(
+            engine::systems::combat::get_attackable_targets_at(world, actor, to, to == from)
+                .contains(&target),
+            "指定対象を合法に攻撃できない"
+        );
+        expected_hit = Some((target, world.get::<Health>(target).unwrap().current));
+        AiCommand::Attack {
+            target_pos: to,
+            target_entity: target,
+        }
+    } else {
+        assert!(
+            to == from || !occupied.contains_key(&(to.x, to.y)),
+            "介入先が占有されている"
+        );
+        let capture = stats.can_capture
+            && world.iter_entities().any(|e| {
+                e.get::<GridPosition>() == Some(&to)
+                    && e.get::<Property>()
+                        .is_some_and(|p| p.owner_id != Some(player))
+            });
+        if capture {
+            AiCommand::Capture { target_pos: to }
+        } else {
+            AiCommand::Wait { target_pos: to }
+        }
+    };
+    let label = format!("{command:?}");
+    engine::ai::execute_ai_command(world, actor, command);
+    schedule.run(world);
+    assert_eq!(
+        world.get::<GridPosition>(actor),
+        Some(&to),
+        "介入の移動命令が成立しなかった"
+    );
+    assert!(
+        world.get::<ActionCompleted>(actor).is_some_and(|d| d.0),
+        "介入が行動完了になっていない"
+    );
+    if let Some((target, hp)) = expected_hit {
+        assert!(
+            world.get::<Health>(target).is_none_or(|h| h.current < hp),
+            "介入の攻撃が成立しなかった"
+        );
+    }
+    label
+}
+
+/// 継続前進の診断。固定砲台・輸送役・占領役には介入せず、自力移動できる戦闘車両を
+/// 前方から順に動かす。射撃可能部隊も動かす案では、移動後に敵を射程に収めるセルだけを使う。
+fn front_push_order(
+    world: &mut World,
+    player: PlayerId,
+    include_firing: bool,
+) -> Option<OpeningOrder> {
+    use engine::ai::turn_distance::{TurnDistanceCache, calculate_turn_distance};
+    use engine::systems::movement::{OccupantInfo, calculate_reachable_tiles};
+    let objective = engine::ai::assault_decision::assault_objective(world, player)?;
+    let units = world
+        .iter_entities()
+        .filter_map(|e| {
+            let stats = e.get::<UnitStats>()?;
+            let pos = *e.get::<GridPosition>()?;
+            if e.get::<Faction>()?.0 != player
+                || e.get::<Transporting>().is_some()
+                || stats.can_capture
+                || stats.max_range == 0
+                || stats.max_movement <= 1
+                || matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
+                || !engine::systems::action::is_unit_selectable(world, e.id())
+                || e.get::<HasMoved>()?.0
+                || e.get::<Ammo>()
+                    .is_some_and(|a| a.ammo1 == 0 && a.ammo2 == 0)
+            {
+                return None;
+            }
+            Some((e.id(), pos, stats.clone(), e.get::<Fuel>()?.current))
+        })
+        .collect::<Vec<_>>();
+    let occupied = world
+        .iter_entities()
+        .filter_map(|e| {
+            if e.get::<Transporting>().is_some() {
+                return None;
+            }
+            let p = e.get::<GridPosition>()?;
+            let f = e.get::<Faction>()?;
+            let s = e.get::<UnitStats>()?;
+            Some((
+                (p.x, p.y),
+                OccupantInfo {
+                    player_id: f.0,
+                    is_transport: s.max_cargo > 0,
+                    unit_type: s.unit_type,
+                    loadable_types: s.loadable_unit_types.clone(),
+                    free_slots: 0,
+                },
+            ))
+        })
+        .collect();
+    let empty = Default::default();
+    let mut cache = TurnDistanceCache::default();
+    let mut best = None;
+    for (actor, from, stats, fuel) in units {
+        let current_targets =
+            engine::systems::combat::get_attackable_targets_at(world, actor, from, true);
+        let has_shot = current_targets.iter().any(|&target| {
+            engine::ai::pruning::evaluate_attack_exchange(
+                world,
+                actor,
+                target,
+                from,
+                world.resource::<DamageChart>(),
+            )
+            .is_some_and(|e| e.expected_damage > 0)
+        });
+        if has_shot && !include_firing {
+            continue;
+        }
+        // 地形だけの残り経路で前進方向を決める。敵・味方の占有は実際の移動候補生成で守る。
+        let range = if stats.min_range > 1 {
+            stats.min_range
+        } else {
+            0
+        };
+        let before = calculate_turn_distance(
+            world.resource::<Map>(),
+            world.resource::<MasterDataRegistry>(),
+            &empty,
+            (from.x, from.y),
+            (objective.x, objective.y),
+            stats.movement_type,
+            stats.max_movement,
+            range,
+            player,
+            &mut cache,
+        );
+        if before.used_mp == u32::MAX {
+            continue;
+        }
+        let reachable = calculate_reachable_tiles(
+            world.resource::<Map>(),
+            &occupied,
+            (from.x, from.y),
+            stats.movement_type,
+            stats.max_movement,
+            fuel,
+            player,
+            stats.unit_type,
+            world.resource::<MasterDataRegistry>(),
+        );
+        for (x, y) in reachable {
+            let to = GridPosition { x, y };
+            if to == from || occupied.contains_key(&(x, y)) {
+                continue;
+            }
+            let after = calculate_turn_distance(
+                world.resource::<Map>(),
+                world.resource::<MasterDataRegistry>(),
+                &empty,
+                (x, y),
+                (objective.x, objective.y),
+                stats.movement_type,
+                stats.max_movement,
+                range,
+                player,
+                &mut cache,
+            );
+            if after.used_mp >= before.used_mp {
+                continue;
+            }
+            // 直接部隊は今手番の移動攻撃、間接部隊は移動後の次手番の射撃位置を調べる。
+            let targets = engine::systems::combat::get_attackable_targets_at(
+                world,
+                actor,
+                to,
+                stats.min_range > 1,
+            );
+            let mut attack = None;
+            for target in targets {
+                let Some(exchange) = engine::ai::pruning::evaluate_attack_exchange(
+                    world,
+                    actor,
+                    target,
+                    to,
+                    world.resource::<DamageChart>(),
+                ) else {
+                    continue;
+                };
+                if exchange.expected_damage == 0 {
+                    continue;
+                }
+                let position = *world.get::<GridPosition>(target).unwrap();
+                let hp = world.get::<Health>(actor).unwrap().current;
+                if stats.min_range <= 1 && exchange.expected_counter_damage < hp {
+                    let rank = (
+                        exchange.expected_damage,
+                        std::cmp::Reverse(world.resource::<Map>().distance(
+                            position.x,
+                            position.y,
+                            objective.x,
+                            objective.y,
+                        )),
+                    );
+                    if attack.as_ref().is_none_or(|(old, _)| rank > *old) {
+                        attack = Some((rank, position));
+                    }
+                }
+            }
+            if has_shot
+                && stats.min_range > 1
+                && !engine::systems::combat::get_attackable_targets_at(world, actor, to, true)
+                    .iter()
+                    .any(|&target| {
+                        engine::ai::pruning::evaluate_attack_exchange(
+                            world,
+                            actor,
+                            target,
+                            to,
+                            world.resource::<DamageChart>(),
+                        )
+                        .is_some_and(|e| e.expected_damage > 0)
+                    })
+            {
+                continue;
+            }
+            let rank = (before.used_mp, after.used_mp, y, x, actor.to_bits());
+            if best.as_ref().is_none_or(|(old, _)| rank < *old) {
+                best = Some((
+                    rank,
+                    OpeningOrder {
+                        from: [from.x, from.y],
+                        to: Some([x, y]),
+                        target: attack.map(|(_, p)| [p.x, p.y]),
+                    },
+                ));
+            }
+        }
+    }
+    best.map(|(_, order)| order)
+}
+
 #[test]
 #[ignore]
 fn assault_go_branch() {
@@ -179,6 +504,19 @@ fn assault_go_branch() {
     engine::systems::turn_management::advance_next_phase(&mut world);
     schedule.run(&mut world);
 
+    let opening: Vec<OpeningOrder> = std::env::var("BRANCH_OPENING_FILE")
+        .ok()
+        .map_or_else(Vec::new, |p| {
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        });
+    let mut opening_index = 0;
+    let push_mode = std::env::var("BRANCH_FRONT_PUSH").ok();
+    assert!(
+        push_mode
+            .as_deref()
+            .is_none_or(|mode| mode == "idle" || mode == "all")
+    );
+    let mut push_count = 0;
     let detailed = std::env::var_os("BRANCH_TRACE_ACTIONS").is_some();
     let mut trace = Vec::new();
     if detailed {
@@ -219,8 +557,37 @@ fn assault_go_branch() {
             } else {
                 Vec::new()
             };
-            let action = execute_ai_turn(&mut world, active);
-            schedule.run(&mut world);
+            let mut pushed = false;
+            if active == subject && push_mode.is_some() {
+                engine::ai::assault_decision::refresh_assault_posture(&mut world, subject, turn);
+            }
+            let order = if active == subject
+                && push_mode.is_some()
+                && !(turn == from && opening_index < opening.len())
+            {
+                front_push_order(&mut world, subject, push_mode.as_deref() == Some("all"))
+            } else {
+                None
+            };
+            let action = if active == subject && turn == from && opening_index < opening.len() {
+                engine::ai::assault_decision::refresh_assault_posture(&mut world, subject, turn);
+                assert!(
+                    engine::ai::assault_decision::assault_objective(&world, subject).is_some(),
+                    "介入時にGOが成立していない"
+                );
+                let label =
+                    execute_opening(&mut world, &mut schedule, subject, &opening[opening_index]);
+                opening_index += 1;
+                Some(label)
+            } else if let Some(order) = order {
+                pushed = true;
+                push_count += 1;
+                Some(execute_opening(&mut world, &mut schedule, subject, &order))
+            } else {
+                let action = execute_ai_turn(&mut world, active);
+                schedule.run(&mut world);
+                action
+            };
             if detailed {
                 let after = trace_units(&mut world);
                 let changed_before = before
@@ -234,7 +601,7 @@ fn assault_go_branch() {
                 trace.push(
                     serde_json::json!({"turn":turn,"player":active.0,"action":action,
                     "go":engine::ai::assault_decision::assault_objective(&world, subject).is_some(),
-                    "before":changed_before,"after":changed_after}),
+                    "front_push":pushed,"before":changed_before,"after":changed_after}),
                 );
             }
             if action.is_none() {
@@ -250,6 +617,10 @@ fn assault_go_branch() {
         "subject": subject.0,
         "assault_go_enabled": engine::ai::features::assault_go_enabled(),
         "outcome": outcome,
+        "opening_orders": opening,
+        "opening_executed": opening_index,
+        "push_mode": push_mode,
+        "push_count": push_count,
         "rounds": rounds,
         "action_trace": trace,
     });

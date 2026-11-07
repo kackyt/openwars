@@ -119,6 +119,7 @@ pub(crate) fn v3_positioning_score(
             defense_bonus,
             &board.enemies,
             &board.damage_chart,
+            &board.registry,
         )
 }
 
@@ -181,6 +182,7 @@ pub(crate) fn direct_threat_terrain_score(
         defense_bonus,
         &board.enemies,
         &board.damage_chart,
+        &board.registry,
     )
     .min(DIRECT_THREAT_TERRAIN_CAP)
 }
@@ -279,7 +281,7 @@ pub(crate) fn stranded_infantry_score(
             &unit.position,
             board.player_id,
             &board.properties,
-            &board.enemies,
+            board.enemies.iter().map(|enemy| enemy.0),
         )
     {
         return 0;

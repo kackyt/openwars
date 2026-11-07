@@ -352,6 +352,28 @@ pub struct ProductionPlanSnapshot {
     pub unfilled_slots: Vec<UnfilledDemandSnapshot>,
     pub steps: Vec<ProductionStepSnapshot>,
     pub rolling_combat_plans: Vec<RollingCombatPlanSnapshot>,
+    /// 当手番に購入予定の部隊ごとの予測（`OPENWARS_PREDICTION_LEDGER` 有効時のみ）。
+    pub unit_predictions: Vec<UnitPredictionSnapshot>,
+}
+
+/// 購入1件ごとの、計画内シミュレーション上の予測。実際の戦果と突き合わせて偏りを測る。
+#[derive(Debug, Serialize)]
+pub struct UnitPredictionSnapshot {
+    pub plan_id: Option<u64>,
+    pub revision: Option<u32>,
+    pub operation_kind: String,
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    pub unit_type: UnitType,
+    pub facility_x: usize,
+    pub facility_y: usize,
+    pub cost: u32,
+    pub shots: u32,
+    pub dealt_value: u32,
+    pub taken_value: u32,
+    pub first_shot_turn: Option<u32>,
+    pub death_turn: Option<u32>,
+    pub simulated_turns: u32,
 }
 
 /// 敵の実生産履歴に基づく次手番予測と、既済予測の平均絶対誤差。
@@ -1372,6 +1394,27 @@ pub fn snapshot_production_plan_for_player(
         unfilled_slots,
         steps,
         rolling_combat_plans,
+        unit_predictions: plan
+            .unit_predictions
+            .iter()
+            .map(|prediction| UnitPredictionSnapshot {
+                plan_id: prediction.plan_id.map(|id| id.0),
+                revision: prediction.revision.map(|revision| revision.0),
+                operation_kind: format!("{:?}", prediction.operation_kind),
+                anchor_x: prediction.anchor.x,
+                anchor_y: prediction.anchor.y,
+                unit_type: prediction.unit_type,
+                facility_x: prediction.facility.x,
+                facility_y: prediction.facility.y,
+                cost: prediction.cost,
+                shots: prediction.shots,
+                dealt_value: prediction.dealt_value,
+                taken_value: prediction.taken_value,
+                first_shot_turn: prediction.first_shot_turn,
+                death_turn: prediction.death_turn,
+                simulated_turns: prediction.simulated_turns,
+            })
+            .collect(),
     })
 }
 

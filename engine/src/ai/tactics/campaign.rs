@@ -57,7 +57,9 @@ pub(crate) fn campaign_action_context(
     // 首都攻略DAGの外側では地域への入口へ進むが、地域内ではControl/Captureの
     // 指令に従う。`Some(None)`はanchor直行を止めて局地戦術へ任せる明示値であり、
     // その場合に古いSquad目標へフォールバックしてはならない。
-    let target = if crate::ai::code_path::is_extended() {
+    let target = if crate::ai::code_path::is_extended()
+        || crate::ai::features::dag_squad_targets_enabled()
+    {
         crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
             world, player_id, entity,
         )

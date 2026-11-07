@@ -11,6 +11,7 @@
 pub(crate) mod approach;
 pub(crate) mod blockade;
 pub(crate) mod board;
+pub(crate) mod narrow_assault;
 pub(crate) mod scoring;
 pub(crate) mod small_map;
 pub(crate) mod unit;

@@ -103,6 +103,14 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     if step.is_v4 && crate::ai::features::assault_go_enabled() {
         crate::ai::assault_decision::refresh_assault_posture(world, player_id, step.turn);
     }
+    // 狭い装甲経路に限定し、射撃できる先頭部隊も含めて車列の射点を更新する。
+    if step.is_v4
+        && crate::ai::features::narrow_assault_enabled()
+        && let Some((entity, command)) =
+            crate::ai::tactics::narrow_assault::decide_action(world, player_id, &step.acted)
+    {
+        return Some(issue_unit_command(world, entity, command));
+    }
     crate::ai::wait_probe::stage(world, "early_production_relief");
     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
@@ -148,6 +156,7 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
         && let Some((entity, command)) =
             crate::ai::v4::artillery_ferry::decide_artillery_ferry(world, player_id, &step.acted)
     {
+        trace_loaded_carrier_command(world, entity, "ferry", &format!("{command:?}"));
         return Some(issue_transport_command(world, entity, command));
     }
     // 両首都が同じ陸塊の盤面では、装甲車が後方の重歩兵を前線の奥の敵の近くまで運ぶ（V4）。
@@ -433,6 +442,7 @@ fn mark_acted(world: &mut World, entities: impl IntoIterator<Item = Entity>) {
 /// unit命令を適用して行動済みにし、ログ用の命令文字列を返す。
 fn issue_unit_command(world: &mut World, entity: Entity, command: AiCommand) -> String {
     let command_text = format!("{:?}", command);
+    trace_loaded_carrier_command(world, entity, "unit", &command_text);
 
     execute_ai_command(world, entity, command);
     mark_acted(world, [entity]);
@@ -443,6 +453,7 @@ fn issue_unit_command(world: &mut World, entity: Entity, command: AiCommand) -> 
 /// 両方を記録し、行動済みのcargoを遊兵として数えない。ただしUnload systemは未行動cargoが
 /// 残る間は輸送役を行動完了にしないため、最後のcargoを降ろすまで輸送役は行動済みにしない。
 fn issue_transport_command(world: &mut World, entity: Entity, command: AiCommand) -> String {
+    trace_loaded_carrier_command(world, entity, "transport", &format!("{:?}", command));
     let (dropped_cargo, transport_keeps_dropping) = match &command {
         AiCommand::Drop { cargo_entity, .. } => (
             Some(*cargo_entity),
@@ -550,4 +561,26 @@ fn end_turn(world: &mut World, player_id: PlayerId) {
     if let Some(mut events) = world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>() {
         events.send(crate::events::NextPhaseCommand);
     }
+}
+
+/// 砲台を積んだ輸送部隊への命令を標準エラーへ出す診断（`OPENWARS_FERRY_DROP_DIAG`、既定では無効）。
+/// 「誰が輸送車を動かしたか」を、発行経路（`via`）つきで追うために使う。
+fn trace_loaded_carrier_command(world: &mut World, entity: Entity, via: &str, command: &str) {
+    if std::env::var_os("OPENWARS_FERRY_DROP_DIAG").is_none() {
+        return;
+    }
+    let loaded = world
+        .query::<&crate::components::Transporting>()
+        .iter(world)
+        .any(|transporting| transporting.0 == entity);
+    if !loaded {
+        return;
+    }
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    eprintln!(
+        "CARRIER-CMD T{turn} e={} via={via} cmd={command}",
+        entity.to_bits()
+    );
 }

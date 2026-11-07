@@ -171,6 +171,30 @@ pub struct RollingCombatPlanTrace {
     pub search_truncated: bool,
 }
 
+/// 計画が購入ごとに予測した交戦結果。実際の戦果と突き合わせて予測の偏りを測るための記録。
+/// 乱数加算を除く、計画内シミュレーション上の値であり、実際の結果ではない。
+#[derive(Debug, Clone)]
+pub struct UnitPredictionTrace {
+    pub plan_id: Option<PlanId>,
+    pub revision: Option<PlanRevision>,
+    pub operation_kind: OperationKind,
+    pub anchor: GridPosition,
+    pub unit_type: UnitType,
+    pub facility: GridPosition,
+    pub cost: u32,
+    /// 予測した射撃回数。
+    pub shots: u32,
+    /// 予測で与えた価値（敵の購入額×減らしたHP/100）。反撃で与えた分を含む。
+    pub dealt_value: u32,
+    /// 予測で受けた価値（自軍の購入額×減ったHP/100）。反撃で受けた分を含む。
+    pub taken_value: u32,
+    /// 予測上の初射撃・撃破された手番（購入手番からの相対。無ければNone）。
+    pub first_shot_turn: Option<u32>,
+    pub death_turn: Option<u32>,
+    /// 予測した交戦の手番数（購入手番の翌手番から数える）。
+    pub simulated_turns: u32,
+}
+
 /// 1 ターン・1 プレイヤー分の生産計画トレース。
 #[derive(Debug, Clone)]
 pub struct ProductionPlanTrace {
@@ -197,6 +221,8 @@ pub struct ProductionPlanTrace {
     pub enemy_production_forecast: EnemyProductionForecastTrace,
     /// 当手番に充足しなかった要求枠と理由。要求自体は `operations` に残る。
     pub unfilled_slots: Vec<UnfilledSlotTrace>,
+    /// 当手番に購入予定の部隊ごとの予測。`OPENWARS_PREDICTION_LEDGER` 有効時だけ記録する。
+    pub unit_predictions: Vec<UnitPredictionTrace>,
 }
 
 /// 当手番に充足しなかった要求枠1件。
@@ -227,6 +253,7 @@ impl ProductionPlanTrace {
             reserved_funds: 0,
             uncommitted_funds: funds,
             unfilled_slots: Vec::new(),
+            unit_predictions: Vec::new(),
         }
     }
 

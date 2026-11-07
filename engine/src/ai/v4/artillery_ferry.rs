@@ -76,6 +76,85 @@ const SITE_SEARCH_TURNS: u32 = 2;
 /// 近くに陣地が無いときに、向かう陣地を探す範囲（輸送車の移動手番）。
 const FAR_SITE_SEARCH_TURNS: u32 = 4;
 
+/// 陣地が無いとき、受け持ちの範囲に入る降車マスを探す範囲（輸送車の移動手番）。
+const ZONE_ENTRY_TURNS: u32 = 8;
+
+/// 降車できなかった手番の、候補マスが落ちた理由の診断を標準エラーへ出すか。
+fn drop_diagnostics_enabled() -> bool {
+    std::env::var_os("OPENWARS_FERRY_DROP_DIAG").is_some()
+}
+
+/// 降車候補マスが落ちた最初の理由。`deliver_one` の判定順と同じ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropRejection {
+    Occupied,
+    Impassable,
+    NotReboardable,
+    OutOfZone,
+    OnFacility,
+    OnUnownedProperty,
+    ReservedForRepair,
+    /// 敵の脅威圏内で、前に味方の盾が無い。
+    NoScreen,
+    /// 据えても次の手番に撃てる敵が無い、またはリスクが上回る。
+    NoValue,
+    Accepted,
+}
+
+/// 診断の対象（どの輸送車・砲台・範囲か）。
+#[derive(Clone, Copy)]
+struct DropDiagSubject {
+    player: PlayerId,
+    carrier_id: u64,
+    carrier: GridPosition,
+    gun: GridPosition,
+    zone: Option<GridPosition>,
+}
+
+/// 降車できなかった手番の、理由ごとの候補マス数。
+#[derive(Debug, Default)]
+struct DropRejections {
+    counts: [u32; 10],
+}
+
+impl DropRejections {
+    fn tally(&mut self, reason: DropRejection) {
+        self.counts[reason as usize] += 1;
+    }
+
+    fn report(&self, subject: &DropDiagSubject, kind: &str, context: &str) {
+        let DropDiagSubject {
+            player,
+            carrier_id,
+            carrier,
+            gun,
+            zone,
+        } = *subject;
+        let zone = zone.map_or("none".to_owned(), |point| {
+            format!("({},{})", point.x, point.y)
+        });
+        eprintln!(
+            "FERRY-DROP-DIAG P{player:?} id={carrier_id} kind={kind} zone={zone} carrier=({},{}) gun=({},{}) occupied={} impassable={} \
+             not_reboardable={} out_of_zone={} facility={} unowned={} repair={} no_screen={} \
+             no_value={} accepted={} {context}",
+            carrier.x,
+            carrier.y,
+            gun.x,
+            gun.y,
+            self.counts[DropRejection::Occupied as usize],
+            self.counts[DropRejection::Impassable as usize],
+            self.counts[DropRejection::NotReboardable as usize],
+            self.counts[DropRejection::OutOfZone as usize],
+            self.counts[DropRejection::OnFacility as usize],
+            self.counts[DropRejection::OnUnownedProperty as usize],
+            self.counts[DropRejection::ReservedForRepair as usize],
+            self.counts[DropRejection::NoScreen as usize],
+            self.counts[DropRejection::NoValue as usize],
+            self.counts[DropRejection::Accepted as usize],
+        );
+    }
+}
+
 /// 砲台の運搬を使うか。Cargo feature または環境変数で切り替える。
 pub(crate) fn artillery_ferry_enabled() -> bool {
     crate::ai::features::artillery_ferry_enabled()
@@ -123,6 +202,9 @@ pub(crate) fn decide_artillery_ferry(
     let cached_idle = world
         .get_resource::<ArtilleryFerryIdle>()
         .is_some_and(|idle| idle.player_id == player_id && idle.turn == turn);
+    if drop_diagnostics_enabled() {
+        eprintln!("FERRY-TURN T{turn} P{player_id:?}");
+    }
     // 砲台が1基も無い手番から記録し、後で作った砲台を新しい砲台として見分ける。
     let routes = update_gun_routes(world, player_id, turn);
     let guards = guard_posts(world, player_id, &routes);
@@ -623,14 +705,7 @@ impl ArtilleryFerry<'_> {
         let mut sites = drop_cost
             .into_iter()
             .filter(|(cell, _)| {
-                (*cell == current || !self.occupancy.contains_key(cell))
-                    && self.passable(&gun.stats, *cell)
-                    && self.reboardable(gun, *cell)
-                    && self.in_zone(gun, *cell)
-                    && !self.on_own_facility(*cell)
-                    && !self.on_unowned_property(*cell)
-                    && !self.is_city_reserved_for_repair(*cell, gun)
-                    && self.can_safely_emplace(gun, *cell)
+                self.droppable_cell(gun, *cell, current) && self.can_safely_emplace(gun, *cell)
             })
             .filter_map(|(cell, cost)| {
                 let value = self.emplacement_value(gun, cell);
@@ -639,6 +714,56 @@ impl ArtilleryFerry<'_> {
             .collect::<Vec<_>>();
         sites.sort_by_key(|(cell, ..)| *cell);
         sites
+    }
+
+    /// 砲台を降ろせる地形のマスか。空きマスで、砲台が通れ、降ろした後に乗り直せ、受け持ちの
+    /// 範囲に入り、自軍の生産施設・未所有の拠点・修理用に空ける都市の上ではない。
+    /// 敵の脅威や射撃価値は見ない（それは据え付ける時点の判断）。
+    fn droppable_cell(&self, gun: &BoardUnit, cell: Cell, current: Cell) -> bool {
+        (cell == current || !self.occupancy.contains_key(&cell))
+            && self.passable(&gun.stats, cell)
+            && self.reboardable(gun, cell)
+            && self.in_zone(gun, cell)
+            && !self.on_own_facility(cell)
+            && !self.on_unowned_property(cell)
+            && !self.is_city_reserved_for_repair(cell, gun)
+    }
+
+    /// 陣地が無いときの行き先: 輸送車が `turns` 手番以内に着ける、受け持ちの範囲の降車マスのうち
+    /// 最も早く着けるマス。要衝のマスそのものへ向かうと、要衝の周りの敵の影響で道が切れ、
+    /// 直線距離で代用して行き止まりへ引き込まれる。輸送車の現在地から広げた経路なら、
+    /// 輸送車自身の移動規則（敵のZOC・占有）がそのまま働く。
+    fn zone_entry_site(
+        &self,
+        carrier: &BoardUnit,
+        gun: &BoardUnit,
+        origin: Cell,
+        turns: u32,
+    ) -> Option<Cell> {
+        let reach = calculate_reachable_tile_costs(
+            &self.board.map,
+            self.occupancy,
+            origin,
+            carrier.stats.movement_type,
+            carrier.stats.max_movement.saturating_mul(turns),
+            carrier.stats.max_fuel,
+            self.board.player,
+            carrier.stats.unit_type,
+            &self.board.registry,
+        );
+        let current = Self::cell(gun.position);
+        let mut drop_cost = HashMap::<Cell, u32>::default();
+        for (stop, cost) in &reach {
+            for cell in self.board.map.get_adjacent(stop.0, stop.1) {
+                let entry = drop_cost.entry(cell).or_insert(u32::MAX);
+                *entry = (*entry).min(*cost);
+            }
+        }
+        drop_cost
+            .into_iter()
+            .filter(|(cell, _)| self.droppable_cell(gun, *cell, current))
+            .min_by_key(|(cell, cost)| (*cost, *cell))
+            .map(|(cell, _)| cell)
     }
 
     /// `turns` 手番以内に運べる陣地のうち、評価が最も大きいマスとその評価。
@@ -920,6 +1045,50 @@ impl ArtilleryFerry<'_> {
             })
     }
 
+    /// 範囲の中心から、最寄りの敵と最寄りの自軍直接部隊までの距離（診断用）。
+    fn zone_context(&self, zone: Option<GridPosition>) -> String {
+        let Some(point) = zone else {
+            return "zone_enemy=- zone_front=-".to_owned();
+        };
+        let center = Self::cell(point);
+        let enemy = self
+            .enemies()
+            .map(|enemy| self.distance(center, enemy.position))
+            .min();
+        let front = self
+            .own()
+            .filter(|unit| unit.stats.min_range <= 1 && unit.stats.max_cargo == 0)
+            .map(|unit| self.distance(center, unit.position))
+            .min();
+        let show = |value: Option<u32>| value.map_or("-".to_owned(), |v| v.to_string());
+        format!("zone_enemy={} zone_front={}", show(enemy), show(front))
+    }
+
+    /// 降車候補マスが落ちる最初の理由（診断用）。判定順は `deliver_one` と同じ。
+    fn drop_rejection(&self, gun: &BoardUnit, cell: Cell, current: Cell) -> DropRejection {
+        if cell != current && self.occupancy.contains_key(&cell) {
+            DropRejection::Occupied
+        } else if !self.passable(&gun.stats, cell) {
+            DropRejection::Impassable
+        } else if !self.reboardable(gun, cell) {
+            DropRejection::NotReboardable
+        } else if !self.in_zone(gun, cell) {
+            DropRejection::OutOfZone
+        } else if self.on_own_facility(cell) {
+            DropRejection::OnFacility
+        } else if self.on_unowned_property(cell) {
+            DropRejection::OnUnownedProperty
+        } else if self.is_city_reserved_for_repair(cell, gun) {
+            DropRejection::ReservedForRepair
+        } else if !self.can_safely_emplace(gun, cell) {
+            DropRejection::NoScreen
+        } else if self.emplacement_value(gun, cell) <= 0 {
+            DropRejection::NoValue
+        } else {
+            DropRejection::Accepted
+        }
+    }
+
     /// 2. 砲台を載せた補給輸送車を、撃てる位置の隣まで運んで降ろす。
     fn deliver(&self) -> Option<(Entity, AiCommand)> {
         for carrier in self
@@ -957,6 +1126,9 @@ impl ArtilleryFerry<'_> {
         // (輸送車が撃破されない, 降ろす位置の評価, 輸送車の被弾が少ない, 座標)。
         type DropKey = (bool, i64, Reverse<u32>, Reverse<(Cell, Cell)>);
         let mut best_drop: Option<DropKey> = None;
+        // 降ろせない手番で、候補マスが落ちた理由の内訳を記録する診断（既定では無効）。
+        let drop_diag = drop_diagnostics_enabled();
+        let mut diag = DropRejections::default();
         // (撃破されない, 被弾ゼロの安全地帯, 前線に近い, 被弾が少ない, 座標) が最大の移動先。
         // 降車できない補給車が敵の射程内（threat_hp > 0）へ無防備に突っ込んで被弾するのを防ぐ。
         type MoveKey = (bool, bool, Reverse<u32>, Reverse<u32>, Reverse<Cell>);
@@ -968,6 +1140,11 @@ impl ArtilleryFerry<'_> {
             .best_site(gun, current, SITE_SEARCH_TURNS)
             .map(|(cell, _)| cell)
             .or_else(|| self.nearest_site(gun, current, FAR_SITE_SEARCH_TURNS))
+            .or_else(|| {
+                crate::ai::features::ferry_zone_entry_enabled()
+                    .then(|| self.zone_entry_site(carrier, gun, current, ZONE_ENTRY_TURNS))
+                    .flatten()
+            })
             .or_else(|| {
                 self.routes
                     .get(&gun.entity)
@@ -994,7 +1171,7 @@ impl ArtilleryFerry<'_> {
                 .min()
                 .unwrap_or(u32::MAX),
         };
-        for stop in stops {
+        for &stop in &stops {
             let threat_hp = self.threat.damage_hp(carrier, stop);
             let survives = threat_hp < hp;
             let move_key = (
@@ -1008,6 +1185,9 @@ impl ArtilleryFerry<'_> {
                 best_move = Some(move_key);
             }
             for cell in self.board.map.get_adjacent(stop.0, stop.1) {
+                if drop_diag {
+                    diag.tally(self.drop_rejection(gun, cell, current));
+                }
                 if (cell != current && self.occupancy.contains_key(&cell))
                     || !self.passable(&gun.stats, cell)
                     || !self.reboardable(gun, cell)
@@ -1028,6 +1208,20 @@ impl ArtilleryFerry<'_> {
                     best_drop = Some(key);
                 }
             }
+        }
+        if drop_diag && !matches!(best_drop, Some((true, ..))) {
+            let (kind, zone) = match self.routes.get(&gun.entity) {
+                Some(point) => ("route", Some(*point)),
+                None => ("guard", self.guards.get(&gun.entity).copied()),
+            };
+            let subject = DropDiagSubject {
+                player: self.board.player,
+                carrier_id: carrier.entity.to_bits(),
+                carrier: carrier.position,
+                gun: gun.position,
+                zone,
+            };
+            diag.report(&subject, kind, &self.zone_context(zone));
         }
         if let Some((true, _, _, Reverse((stop, cell)))) = best_drop {
             return Some(AiCommand::Drop {
@@ -1143,6 +1337,37 @@ impl ArtilleryFerry<'_> {
             }
         }
         let (.., Reverse(stop)) = best_move?;
+        if drop_diag && fresh {
+            // 目標へ最も近い停止先（安全を無視）と、実際に選んだ停止先の脅威・近さを比べる。
+            let closest = stops.iter().copied().min_by_key(|cell| front(*cell));
+            let threat_at = |cell: Cell| self.threat.damage_hp(carrier, cell);
+            eprintln!(
+                "FERRY-MOVE-DIAG id={} hp={} dest={} dest_src={} dest_cell={:?} at={:?} to={:?} stops={} cur(threat={},front={}) chosen(threat={},front={}) closest(threat={},front={})",
+                carrier.entity.to_bits(),
+                hp,
+                destination.is_some(),
+                if self.best_site(gun, current, SITE_SEARCH_TURNS).is_some() {
+                    "best_site"
+                } else if self
+                    .nearest_site(gun, current, FAR_SITE_SEARCH_TURNS)
+                    .is_some()
+                {
+                    "nearest_site"
+                } else {
+                    "route_or_guard"
+                },
+                destination,
+                current,
+                stop,
+                stops.len(),
+                threat_at(current),
+                front(current),
+                threat_at(stop),
+                front(stop),
+                closest.map_or(0, threat_at),
+                closest.map_or(0, front),
+            );
+        }
         (fresh && stop != current).then_some(AiCommand::Wait {
             target_pos: GridPosition {
                 x: stop.0,

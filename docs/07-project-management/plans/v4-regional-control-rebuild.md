@@ -365,3 +365,69 @@ A群をまとめて入れた版を、重点マップと回帰マップで base �
 - 1日分の改修の経緯: `feature/cooperative-ordering-20261103` の `HANDOFF.md`、`DEEPSEEK_IMPLEMENTATION_PLAN.md`、`docs/verification/2026-11-02-deepseek-plan/fire-follow-order-review.md`
 - CODEX の計画と検証: `CODEX_IMPLEMENTATION_PLAN.md`、`docs/verification/2026-11-01-codex/`、`docs/verification/2026-11-02-codex/regional-execution-review.md`
 - 評価ツール: `scripts/eval_matchup.py`、`scripts/run_matchup_sweep.py`、`.rulesync/skills/openwars-ai-improvement-cycle/scripts/compare_benchmarks.py`
+
+## 2026-11-07 脅威モデルの整合と、停滞の調査記録（map_20）
+
+### 採用した修正: 間接砲・直接攻撃の期待ダメージを本番式へ揃える
+
+`engine/src/ai/threat.rs` の脅威見積もりが、実マスター・本番ダメージ式と食い違っていた。
+
+- 敵の現在HPを無視して満HP扱いだった（`EnemyThreatInfo` の4項目目が未使用）。
+- 残弾を無視して主兵装固定だった（`select_weapon` を通していない）。
+- 地形防御を百分率の減算で扱っていた（本番は `(基礎×HP+105)/(100+防御)`）。
+
+修正後は、敵の現在HP・残弾・合法な武器選択・本番のダメージ式で見積もる。`EnemyThreatInfo` へ残弾
+`(u32, u32)` を追加し、生成2箇所（`tactics/board.rs` の `observe_enemies`、`squad.rs` の
+`select_landing_candidate`）で `Ammo` を渡す。公開脅威関数4本に `MasterDataRegistry` を追加。
+
+既存テスト4件は、敵の残弾を明示する・実在兵種（軽自走砲）を使う・本番式に期待値を合わせる形へ更新。
+追加テスト4件（損傷砲のHP反映、弾切れで脅威0、主弾切れ→副兵装選択、非対応兵種0）。
+
+成果（map_20、V4対V200、先後×seed1〜4、各1局）:
+
+| 手番 | 基準 | 脅威修正 |
+|---|---|---|
+| 先手 | 通常勝利 4/4（59.0T） | 通常勝利 2/4（65.0T） |
+| 後手 | 通常勝利 1/4（66T）、判定負け1 | 通常勝利 3/4（69.7T）、判定負け0 |
+
+後手seed2の判定負け（18-28）が通常勝利（35-11）になり、後手の停滞は緩んだ。先手はseed1・2が
+判定勝ちに落ちた。
+
+### 調査で確定した事実
+
+- **攻め急落スパイク**: 1手番だけ Attack の人材が一桁に落ち、Defense が35体以上へ跳ね上がる。
+  基準8局では0件、脅威修正後は3件（先手seed1・T32、先手seed2・T30、後手seed1・T14）。
+- **Defense 大分隊の出どころ**: `squad/route_operations.rs` の `responsibilities` の `rest`。
+  `route_operation_responsibilities(local_only = true)` で攻撃責務が少ない／フィルタで捨てられると、
+  残り全員が作戦の `mission_type` で `front` へ一括で向かう。守りの作戦では Defense になる。
+  分隊IDと目標の一致で確認（先手seed1・T32 の分隊225、42体、目標(17,16)）。
+- **前線の要衝に30〜40体を集めること自体は正しい**: 後手seed1で、防衛部隊を別目標へ散らすと
+  T13に49体が (18,6)・(8,8) へ移り、前線 (5,14) が薄くなって拠点が22〜23で横ばいになった。
+  基準では (5,14) に34体が集まり、T30以降に拠点を33まで伸ばした。
+- `route_operations.rs` の `defend` 判定は、1手番だけ反転する（前後の手番は `launched=true`）。
+
+### 試作して採用しなかったもの（すべて削除済み）
+
+| 試作 | 切り替え | 結果 | 不採用の理由 |
+|---|---|---|---|
+| 前線配分の受け入れ上限 | `OPENWARS_ROUTE_FRONT_CAP` | 行動列が基準と完全一致 | `distribute_members_across_route_fronts` は V4 の実行経路（`local_only = true`）を通らない |
+| 守りの余剰を Attack 化 | `OPENWARS_FRONT_SURPLUS_ATTACK` | 先手2/4（68.5T）、後手0/4 | 余剰が別目標へ散り、前線の壁が薄くなって後手が崩壊 |
+| 防衛任務の局地攻撃（4マス・移動込み） | `OPENWARS_DEFENSE_LOCAL_ATTACK` | 先手2/4（60.0T）、後手0/4 | 後手が3/4→0/4。壁が動いて薄くなる |
+| 同上、その場射撃に限定 | `OPENWARS_DEFENSE_LOCAL_ATTACK` | 先手2/4（75.5T）、後手3/4（77.7T） | 勝ち数は同じで、決着が8〜10手番遅い。後手seed4が19-27へ悪化 |
+
+### 残っている課題
+
+- 先手の2局（seed1・2）が、脅威修正で判定勝ちへ落ちる理由。守りの作戦の1手番反転で、
+  大部隊が Defense に染まって前進が止まるためと考えられるが、機序の一部は未確認。
+- 守りの作戦の `rest` を、前線の厚みを保ったまま有効に使う設計（攻撃機会の拡大は有効だが、
+  決着が遅くなる副作用がある）。
+- 次の予定: 脅威モデル修正のみの状態で seed1〜8 の確定評価。
+
+### 診断スイッチ（既定無効・挙動を変えない）
+
+- `OPENWARS_GO_DIAG`: `GO-DIAG` / `GO-DIST`（攻勢判定と、首都生産圏までの手番数分布・到達不能の内訳）
+- `OPENWARS_PRIORITY_DIAG`: `PRIO`（選ばれた行動の優先度・任務・兵種・目標から敵首都までの距離）
+- `OPENWARS_STAGING_DIAG`: `STAGING-DIAG`（集結線の切り替え状態）
+- `OPENWARS_FERRY_DROP_DIAG`: 砲台の降車候補が落ちた理由の内訳
+- `OPENWARS_ROUTE_OPS_DEBUG`: `ROUTE-OPS`（経路作戦の direct/assigned/rest の内訳）
+- `OPENWARS_FERRY_ZONE_ENTRY`: 砲台輸送車が要衝ではなく受け持ち範囲の降車マスへ向かう（既定有効）

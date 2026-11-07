@@ -976,7 +976,7 @@ fn should_tactical_merge(
         tactical
             .enemies
             .iter()
-            .any(|(enemy, _, _, hp, _, _, movement)| {
+            .any(|(enemy, _, _, hp, _, _, movement, _)| {
                 *hp > 0
                     && tactical
                         .map

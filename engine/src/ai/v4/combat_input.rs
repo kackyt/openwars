@@ -5,6 +5,9 @@ use crate::ai::v4::property_control::{
 use crate::ai::v4::trace::campaign_scope_audit_enabled;
 use crate::ai::v4::*;
 
+#[cfg(test)]
+mod tests;
+
 #[allow(unused_imports)]
 use crate::ai::planning::decision::AdoptedTurnPortfolio;
 
@@ -69,21 +72,75 @@ pub(in crate::ai::v4) fn combat_plan_input(
     finish_combat_input(&input, draft)
 }
 
+/// 予測内では補給を仮定しないため、既存部隊の使用可能弾数を現在残量へ制限する。
+/// 元のマスター/盤面statsは変更せず、この入力が所有する予測用コピーだけを更新する。
+pub(in crate::ai::v4) fn apply_observed_ammunition(
+    input: &mut RollingPlanInput,
+    scan: &BoardScan,
+    ammunition: &HashMap<Entity, (u32, u32)>,
+) {
+    let current = |unit: &FriendlyPlanUnit| {
+        let mut candidates = scan
+            .my_units
+            .iter()
+            .chain(&scan.ferried_units)
+            .filter(|source| {
+                source.pos == unit.position
+                    && source.stats.unit_type == unit.stats.unit_type
+                    && source.hp == unit.hp
+            })
+            .map(|source| {
+                source
+                    .entity
+                    .and_then(|entity| ammunition.get(&entity).copied())
+            });
+        let first = candidates.next();
+        // 同位置同種の搭載部隊など、対応が一意でない場合に最大弾数を創作しない。
+        if candidates.next().is_some() {
+            (0, 0)
+        } else {
+            first.flatten().unwrap_or((0, 0))
+        }
+    };
+    for unit in &mut input.existing_units {
+        (unit.stats.max_ammo1, unit.stats.max_ammo2) = current(unit);
+    }
+    for unit in &mut input.protected_units {
+        if unit.available_turn == 0 {
+            (unit.stats.max_ammo1, unit.stats.max_ammo2) = current(unit);
+        }
+    }
+    for enemy in &mut input.enemies {
+        let ammo = enemy
+            .entity
+            .and_then(|entity| ammunition.get(&entity).copied())
+            .unwrap_or((0, 0));
+        (enemy.stats.max_ammo1, enemy.stats.max_ammo2) = ammo;
+    }
+}
+
 fn collect_combat_targets(input: &CombatInputs<'_>, ctx: &mut ReachCtx) -> Option<CombatDraft> {
     let CombatInputs { scan, op, .. } = *input;
 
     let mut enemies = observed_combat_targets(scan, op);
     let (hard_deadline, capture_completion_turn, required_capture_survivors) =
         combat_capture_requirements(input, ctx);
-    if enemies.is_empty() {
+    let observed_only = input.policy == ProductionPolicy::Standard
+        && crate::ai::features::observed_composition_enabled();
+    if enemies.is_empty() && !observed_only {
         enemies = projected_capture_enemies(input);
     }
     match input.policy {
         ProductionPolicy::SmallMap if op.kind != OperationKind::Capture => {
             enemies.extend(op.expected_reinforcements.iter().cloned())
         }
-        ProductionPolicy::Standard => enemies.extend(op.unavoidable_reinforcements.iter().cloned()),
+        ProductionPolicy::Standard if !observed_only => {
+            enemies.extend(op.unavoidable_reinforcements.iter().cloned())
+        }
         _ => {}
+    }
+    if observed_only {
+        enemies.retain(|enemy| enemy.entity.is_some());
     }
     let hold_window = (input.policy == ProductionPolicy::Standard
         && matches!(op.kind, OperationKind::Capture | OperationKind::Defense)
@@ -154,6 +211,20 @@ fn collect_combat_targets(input: &CombatInputs<'_>, ctx: &mut ReachCtx) -> Optio
 }
 
 fn collect_existing_force(input: &CombatInputs<'_>, ctx: &mut ReachCtx, draft: &mut CombatDraft) {
+    collect_existing_force_with_roles(
+        input,
+        ctx,
+        draft,
+        crate::ai::features::production_role_candidates_enabled(),
+    );
+}
+
+fn collect_existing_force_with_roles(
+    input: &CombatInputs<'_>,
+    ctx: &mut ReachCtx,
+    draft: &mut CombatDraft,
+    armed_carriers: bool,
+) {
     let CombatInputs {
         scan,
         op,
@@ -167,7 +238,10 @@ fn collect_existing_force(input: &CombatInputs<'_>, ctx: &mut ReachCtx, draft: &
     let required_capture_survivors = draft.required_capture_survivors;
     let mut existing_units = Vec::new();
     for unit in scan.my_units.iter().chain(&scan.ferried_units) {
-        if input.policy == ProductionPolicy::Standard && unit.stats.max_cargo > 0 {
+        // 購入候補と同じ役割条件を使い、購入済みの武装輸送部隊を不足から差し引く。
+        if input.policy == ProductionPolicy::Standard
+            && !rolling_plan::production_rules::allows_combat_role(&unit.stats, armed_carriers)
+        {
             continue;
         }
         let Some(entity) = unit.entity else {
@@ -278,8 +352,11 @@ fn collect_production_options(
         |facility, stats| {
             // 計画内のどの敵にも損害を与えられない兵種（地上敵しかいない盤面の対空戦車等）は、
             // 作戦地点へ合流できても戦闘に寄与せず、敵の攻撃を吸うだけの駒になる。
-            // 輸送ユニットは積荷の運搬が役割なので、武装の有無では除外しない。
-            if stats.max_cargo == 0
+            // 既存経路の輸送候補は積荷の運搬も担う。標準の役割試作では武装輸送も
+            // 戦闘役として評価するため、対象敵への有効性を同じ条件で確認する。
+            let combat_role = input.policy == ProductionPolicy::Standard
+                && crate::ai::features::production_role_candidates_enabled();
+            if (stats.max_cargo == 0 || combat_role)
                 && !enemies.iter().any(|enemy| {
                     best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type) > 0
                 })

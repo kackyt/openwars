@@ -149,6 +149,11 @@ pub(super) fn evaluate_rolling_plan(
         return false;
     };
     if input.policy == ProductionPolicy::Standard
+        && crate::ai::features::observed_composition_enabled()
+    {
+        combat_input::apply_observed_ammunition(&mut combat_input, scan, input.ammunition);
+    }
+    if input.policy == ProductionPolicy::Standard
         && std::env::var("OPENWARS_COMMIT").is_ok()
         && let Some(previous) = continuation.as_ref()
     {
@@ -202,6 +207,34 @@ pub(super) fn evaluate_rolling_plan(
         operation_anchor,
         input.policy,
     );
+    if crate::ai::features::prediction_ledger_enabled() {
+        // 当手番の購入だけを、予測した射撃・与被害価値と共に記録する。
+        plan_trace.unit_predictions.retain(|prediction| {
+            prediction.operation_kind != operation_kind || prediction.anchor != operation_anchor
+        });
+        for predicted in
+            rolling_plan::predict_unit_outcomes(&combat_input, &selected.plan.purchases)
+        {
+            if predicted.purchase.build_turn != 0 {
+                continue;
+            }
+            plan_trace.unit_predictions.push(UnitPredictionTrace {
+                plan_id: selected.plan_id,
+                revision: selected.revision,
+                operation_kind,
+                anchor: operation_anchor,
+                unit_type: predicted.purchase.unit_type,
+                facility: predicted.purchase.facility,
+                cost: predicted.purchase.cost,
+                shots: predicted.ledger.shots,
+                dealt_value: predicted.ledger.dealt_value,
+                taken_value: predicted.ledger.taken_value,
+                first_shot_turn: predicted.ledger.first_shot_turn,
+                death_turn: predicted.ledger.death_turn,
+                simulated_turns: predicted.simulated_turns,
+            });
+        }
+    }
     if selected.plan_id.is_none() {
         if input.policy.issues_best_effort() {
             rolling_plans.insert(op_index, selected);
@@ -887,6 +920,12 @@ fn choose_rolling_plan(
     } = *input;
     let operation_kind = operation.kind;
     let operation_anchor = operation.anchor;
+    let selection_trace = super::plan_selection_trace::snapshot(
+        input,
+        operation,
+        combat_input,
+        continuation.as_ref(),
+    );
     // 首都攻略の編成中は、固定購入列が今も実行可能ならその再評価だけを行う。
     // 継続すると分かっている案の全beam searchを先に実行して捨てない。
     // ただし物件制御の前線作戦では毎ターンの動的最新盤面から合同探索を行う。
@@ -906,7 +945,21 @@ fn choose_rolling_plan(
                 .then(|| evaluated.as_ref().ok().cloned())
                 .flatten()
         });
-    let candidate_plan = reusable_candidate.or_else(|| plan_force_package(combat_input))?;
+    let observed = rolling_plan::observed_composition::enabled();
+    let candidate_plan = if observed {
+        plan_force_package(combat_input)
+    } else {
+        reusable_candidate.or_else(|| plan_force_package(combat_input))
+    }?;
+    let candidate_order = observed.then(|| {
+        evaluated_continuation
+            .as_ref()
+            .and_then(|(_, evaluated)| evaluated.as_ref().ok())
+            // 実行不能な旧列は比較対象にできない。新案の予測へ旧購入だけを混ぜず新案へ進む。
+            .map_or(std::cmp::Ordering::Less, |previous| {
+                rolling_plan::observed_composition::compare(combat_input, &candidate_plan, previous)
+            })
+    });
     let conflicted_facilities = evaluated_continuation
         .as_ref()
         .map(|(previous, evaluated)| {
@@ -923,7 +976,7 @@ fn choose_rolling_plan(
             )
         })
         .unwrap_or_default();
-    let selected = plan_registry.select_for_operation(
+    let selected = plan_registry.select_for_operation_with_comparison(
         player_id,
         turn,
         operation_kind,
@@ -936,6 +989,8 @@ fn choose_rolling_plan(
         candidate_plan,
         combat_input.hard_deadline,
         conflicted_facilities,
+        candidate_order,
     );
+    super::plan_selection_trace::record(selection_trace, &selected, combat_input);
     Some(selected)
 }

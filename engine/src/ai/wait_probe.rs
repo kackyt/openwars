@@ -502,6 +502,11 @@ pub(crate) fn unit_context(
         "mission":squad.map(|s|format!("{:?}",s.plan.mission_type)),"phase":squad.map(|s|format!("{:?}",s.plan.phase)),
         "departure_authorized":campaign.map(|c|c.departure_authorized),
         "squad_target":squad_target.map(|p|[p.x,p.y]),"campaign_target":campaign.and_then(|c|c.target).map(|p|[p.x,p.y]),
+        // 判断時点の敵間接砲を保存する。ターン末盤面とはHP・残弾が異なるため、予実照合に使う。
+        "enemy_indirect_fire": board.enemies.iter().filter(|enemy| enemy.4 > 1).map(|enemy| json!({
+            "position":[enemy.0.x,enemy.0.y], "unit_type":enemy.1.as_str(), "hp":enemy.3,
+            "min_range":enemy.4, "max_range":enemy.5, "ammo":[enemy.7.0,enemy.7.1]
+        })).collect::<Vec<_>>(),
         "squad_goal":squad_target.map(|p|goal_facts(world,board,p)),
         "campaign_goal":campaign.and_then(|c|c.target).map(|p|goal_facts(world,board,p))})
 }

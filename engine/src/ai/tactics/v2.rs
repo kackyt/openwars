@@ -174,7 +174,146 @@ pub(crate) fn decide_action(
     if let (Some(call), Some((rank, entity, command))) = (probe_call, best.evaluated_choice()) {
         call.finish(world, entity, command, rank);
     }
+    if std::env::var_os("OPENWARS_PRIORITY_DIAG").is_some()
+        && let Some((rank, entity, command)) = best.evaluated_choice()
+    {
+        // 選ばれた行動の優先度・任務・兵種・命令の種類を記録する診断（既定では無効）。
+        let kind = world
+            .get::<crate::components::UnitStats>(entity)
+            .map_or("?", |stats| stats.unit_type.as_str());
+        let command_text = format!("{command:?}");
+        let command_kind = command_text.split([' ', '{', '(']).next().unwrap_or("?");
+        // 分隊の目標から敵首都までの距離（目標が敵首都方面を向いているかの確認）。
+        let enemy_capital = world
+            .iter_entities()
+            .filter_map(|e| {
+                let property = e.get::<crate::components::Property>()?;
+                (property.terrain == crate::resources::Terrain::Capital
+                    && property.owner_id.is_some_and(|owner| owner != player_id))
+                .then(|| e.get::<GridPosition>().copied())
+                .flatten()
+            })
+            .min_by_key(|position| (position.y, position.x));
+        let target_to_capital = board.squads.target(entity).zip(enemy_capital).map_or(
+            "-".to_owned(),
+            |(target, capital)| {
+                board
+                    .map
+                    .distance(target.x, target.y, capital.x, capital.y)
+                    .to_string()
+            },
+        );
+        if std::env::var_os("OPENWARS_STAGING_DIAG").is_some()
+            && board
+                .squads
+                .mission(entity)
+                .is_some_and(|mission| *mission == MissionType::Attack)
+            && world
+                .get::<crate::components::UnitStats>(entity)
+                .is_some_and(|stats| !stats.can_capture)
+        {
+            // 集結線へ切り替わらない理由の診断（既定では無効）。
+            let turn = world
+                .get_resource::<crate::resources::MatchState>()
+                .map_or(0, |state| state.current_turn_number.0);
+            let target = board.squads.target(entity);
+            eprintln!(
+                "STAGING-DIAG T{turn} P{:?} e={} type={} target={:?} tgt_to_cap={} status={:?}",
+                player_id,
+                entity.to_bits(),
+                kind,
+                target.map(|t| (t.x, t.y)),
+                target_to_capital,
+                staging_status(world, &board, target)
+            );
+        }
+        eprintln!(
+            "PRIO P{:?} priority={:?} mission={:?} type={} cmd={} tgt_to_cap={}",
+            player_id,
+            rank.0,
+            board.squads.mission(entity),
+            kind,
+            command_kind,
+            target_to_capital
+        );
+    }
     best.choose(world, &board)
+}
+
+/// 本来の作戦目標が仕事を必要としているか（集結線へ切り替えられない理由）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingStatus {
+    /// 目標が無い、または周囲に敵がおらず目標が敵・未占領の拠点でもない。集結線へ切り替えられる。
+    Settled,
+    /// 目標の周囲に敵がいる。直接戦闘部隊と間接兵器の数、最短距離を持つ。
+    EnemyNear {
+        direct: u32,
+        indirect: u32,
+        nearest: u32,
+    },
+    /// 目標が敵または未占領の拠点。
+    HostileProperty,
+}
+
+/// 本来の作戦目標が仕事を必要としなくなっているか（盤面の状態だけで判定する）。
+///
+/// 目標が無い、または目標の周囲 [`STAGING_QUIET_RADIUS`] マスに敵がおらず、目標が未占領・
+/// 敵の拠点でない場合に [`StagingStatus::Settled`]。部隊の位置を条件に入れないので、集結線へ
+/// 一歩出た後に条件が外れて元の目標へ引き戻されることがない。
+fn staging_status(
+    world: &World,
+    board: &TacticalBoard,
+    target: Option<GridPosition>,
+) -> StagingStatus {
+    let Some(target) = target else {
+        return StagingStatus::Settled;
+    };
+    let (mut direct, mut indirect, mut nearest) = (0, 0, u32::MAX);
+    let mut hostile_property = false;
+    for entity in world.iter_entities() {
+        let Some(position) = entity.get::<GridPosition>() else {
+            continue;
+        };
+        let distance = board
+            .map
+            .distance(position.x, position.y, target.x, target.y);
+        if let Some(faction) = entity.get::<crate::components::Faction>()
+            && faction.0 != board.player_id
+            && distance <= STAGING_QUIET_RADIUS
+        {
+            nearest = nearest.min(distance);
+            if entity
+                .get::<crate::components::UnitStats>()
+                .is_some_and(|stats| stats.min_range > 1)
+            {
+                indirect += 1;
+            } else {
+                direct += 1;
+            }
+        }
+        if *position == target
+            && let Some(property) = entity.get::<crate::components::Property>()
+            && property.owner_id != Some(board.player_id)
+        {
+            hostile_property = true;
+        }
+    }
+    if direct + indirect > 0 {
+        StagingStatus::EnemyNear {
+            direct,
+            indirect,
+            nearest,
+        }
+    } else if hostile_property {
+        StagingStatus::HostileProperty
+    } else {
+        StagingStatus::Settled
+    }
+}
+
+/// 本来の作戦目標が仕事を必要としなくなっているか。
+fn target_is_settled(world: &World, board: &TacticalBoard, target: Option<GridPosition>) -> bool {
+    staging_status(world, board, target) == StagingStatus::Settled
 }
 
 /// 行動選択で使う1体のunitの事実。
@@ -192,7 +331,19 @@ struct UnitTactics {
     assault_objective: Option<GridPosition>,
     /// 前衛と間接火力が共有する突破対象。
     assault_target: Option<Entity>,
+    /// 首都ルートDAGの経路に沿って、今手番に進める最前のマス（DAG目標の試作が有効なときだけ）。
+    route_advance: Option<GridPosition>,
+    /// 攻勢（GO）の前に敵首都の集結線へ前進する部隊か。接近の目標が敵首都で、集結線より先の
+    /// 接近は加点しない。
+    staging_line: bool,
 }
+
+/// 集結線: 敵首都へ入るまでのターン距離がこの値以内なら、それ以上の接近を加点しない。
+/// 前進の目標を首都にしつつ、攻勢（GO）の判定を待たずに首都の守りへ突入しないための線。
+const STAGING_LINE_TURNS: u32 = 3;
+
+/// 本来の作戦目標の周囲でこのマス数以内に敵がいなければ、目標に仕事が残っていないとみなす。
+const STAGING_QUIET_RADIUS: u32 = 4;
 
 impl UnitTactics {
     /// 必要な状態が欠けているunit、またはcampaign所属に具体Squadが無いunit
@@ -225,9 +376,22 @@ impl UnitTactics {
                     MissionType::Attack | MissionType::Capture | MissionType::Transport
                 )
             });
+        // GOの前に、占領役でないAttack部隊は敵首都の集結線へ向かう（敵の現在位置は追わない）。
+        // 本来の作戦目標を果たし終えて手持ち無沙汰のときだけ（序盤の占領護衛や掃討から剥がさない）。
+        let staging_capital = (crate::ai::features::staging_line_enabled()
+            && assault_objective.is_none()
+            && !state.stats.can_capture
+            && board
+                .squads
+                .mission(entity)
+                .is_some_and(|mission| *mission == MissionType::Attack)
+            && target_is_settled(world, board, squad_target))
+        .then(|| crate::ai::assault_decision::enemy_capital(world, board.player_id))
+        .flatten();
+        let squad_target = staging_capital.or(squad_target);
         let is_solo = assault_objective.is_none()
             && (board.squads.is_solo_fallback(entity) || squad_target.is_none());
-        Some(Self {
+        let mut unit = Self {
             state,
             deployment_target,
             campaign,
@@ -236,7 +400,20 @@ impl UnitTactics {
             is_solo,
             assault_objective,
             assault_target: None,
-        })
+            route_advance: None,
+            staging_line: staging_capital.is_some(),
+        };
+        if crate::ai::features::dag_squad_targets_enabled() && unit.campaign.is_some() {
+            let reachable = unit.candidate_tiles(board);
+            unit.route_advance =
+                crate::ai::v4::capital_route::tactical::capital_route_advance_destination(
+                    world,
+                    board.player_id,
+                    entity,
+                    &reachable,
+                );
+        }
+        Some(unit)
     }
 
     /// campaignの非占領unitは、Squad目標を集合・戦闘の参照点として扱う。
@@ -484,6 +661,18 @@ fn tile_score(
                 super::approach::manhattan(position, target),
                 state.stats.max_movement,
             )
+        } else if unit.staging_line {
+            // 集結線より先は加点を打ち切る。線の外では実経路で首都へ近いほど加点する。
+            let turns = distances.turns(&state.stats, position, target, 0);
+            if turns.turns <= STAGING_LINE_TURNS {
+                super::approach::approach_bonus(STAGING_LINE_TURNS, 0, state.stats.max_movement)
+            } else {
+                super::approach::path_approach_bonus(
+                    turns,
+                    super::approach::manhattan(position, target),
+                    state.stats.max_movement,
+                )
+            }
         } else if board.approaches_squad_target_by_path {
             // V4は参照点・目標地点のどちらも、射程に捉えるまでの実経路で接近を比べる。
             squad_target_path_approach_score(state, position, target, distances)
@@ -813,11 +1002,12 @@ fn consider_wait(
             return false;
         }
         // 攻勢中は、作戦の目標ではなく敵首都から遠ざかるかで判定する。
-        let target = if unit.assault_objective.is_some() && state.stats.can_capture {
-            unit.squad_target
-        } else {
-            unit.assault_objective.or(context.target)
-        };
+        let target =
+            if unit.assault_objective.is_some() && state.stats.can_capture || unit.staging_line {
+                unit.squad_target
+            } else {
+                unit.assault_objective.or(context.target)
+            };
         target.is_none_or(|target| {
             // 参照点の周囲で働ける範囲までは「離れた」と扱わない。範囲外への後退は従来どおり拒否。
             let range = if unit.treats_target_as_reference() {
@@ -864,6 +1054,9 @@ fn consider_wait(
         ActionPriority::EnemyProductionBlockade
     } else if advances_capture {
         ActionPriority::CaptureAdvance
+    } else if unit.route_advance == Some(tile.position) && tile.position != state.position {
+        // DAG経路に沿う前進。通常の局地位置取りより優先する（小規模マップと同じ順序）。
+        ActionPriority::RouteAdvance
     } else {
         ActionPriority::Normal
     };

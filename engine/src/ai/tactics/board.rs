@@ -309,12 +309,13 @@ fn observe_enemies(
             &Health,
             Option<&crate::components::CargoCapacity>,
             Option<&crate::components::Transporting>,
+            Option<&crate::components::Ammo>,
         )>()
         .iter(world)
-        .filter(|(_, faction, _, health, _, transporting)| {
+        .filter(|(_, faction, _, health, _, transporting, _)| {
             faction.0 != player_id && health.current > 0 && transporting.is_none()
         })
-        .map(|(position, faction, stats, health, cargo, _)| {
+        .map(|(position, faction, stats, health, cargo, _, ammo)| {
             (
                 *position,
                 stats.unit_type,
@@ -325,6 +326,7 @@ fn observe_enemies(
                 stats.min_range,
                 stats.max_range,
                 stats.max_movement,
+                ammo.map_or((0, 0), |ammo| (ammo.ammo1, ammo.ammo2)),
             )
         })
         .collect()

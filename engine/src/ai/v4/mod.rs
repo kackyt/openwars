@@ -86,7 +86,7 @@ use trace::{
     CampaignTurnForecastTrace, EnemyProductionForecastTrace, ProductionDecision,
     ProductionDemandTrace, ProductionOperationTrace, ProductionPlanTrace, ProductionStepTrace,
     ProductionTraceDiagnostics, ReinforcementContingencyTrace, RollingCombatPlanTrace,
-    RollingPurchaseTrace, RollingTargetTrace, UnfilledSlotTrace,
+    RollingPurchaseTrace, RollingTargetTrace, UnfilledSlotTrace, UnitPredictionTrace,
 };
 
 use candidate::*;

@@ -26,6 +26,19 @@ pub(super) fn allocate_artillery_carriers(
     input: &ProductionInputs<'_>,
     state: &mut ProductionState,
 ) {
+    // 作戦購入後は未使用の保護予算を解放し、残額で輸送を補う。
+    allocate_artillery_carriers_with_reserve(
+        input,
+        state,
+        &due_budget::DuePurchaseReserve::default(),
+    );
+}
+
+pub(super) fn allocate_artillery_carriers_with_reserve(
+    input: &ProductionInputs<'_>,
+    state: &mut ProductionState,
+    reserve: &due_budget::DuePurchaseReserve,
+) {
     let ProductionInputs {
         scan, player_id, ..
     } = *input;
@@ -110,7 +123,10 @@ pub(super) fn allocate_artillery_carriers(
             .free_facilities
             .iter()
             .filter(|(position, terrain)| {
-                !allocation.is_facility_used(position) && scan.can_produce(*terrain, carrier_type)
+                !allocation.is_facility_used(position)
+                    && scan.can_produce(*terrain, carrier_type)
+                    // 最寄り施設を選ぶ前に除外し、別の合法な施設も検討する。
+                    && reserve.permits(*position, carrier_stats.cost, allocation.remaining_funds())
             })
             .map(|(position, _)| *position)
             .min_by_key(|position| {

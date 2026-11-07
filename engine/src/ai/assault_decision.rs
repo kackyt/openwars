@@ -174,6 +174,11 @@ pub fn judge_assault(
 
     let mut cache = ActionTurnDistanceCache::default();
     let mut engagements = Vec::new();
+    // 診断用: 関与できるまでの手番数の分布（0,1,2,3,4-5,6-8,9以上,到達不能）。既定では無効。
+    let distance_diag = std::env::var_os("OPENWARS_GO_DIAG").is_some();
+    let mut distance_buckets = [0_u32; 8];
+    // 到達不能の内訳（間接兵器・燃料不足・敵の占有やZOCに塞がれる・地形だけで届かない）。
+    let mut unreachable_kinds = [0_u32; 4];
     for (position, owner, stats, id, fuel) in &units {
         if *owner != player {
             continue;
@@ -228,6 +233,54 @@ pub fn judge_assault(
                 best = Some((distance.turns, "attack_blocker", Some((target.x, target.y))));
             }
         }
+        if distance_diag {
+            let bucket = match best {
+                None => 7,
+                Some((turns, ..)) => match turns {
+                    0..=3 => turns as usize,
+                    4..=5 => 4,
+                    6..=8 => 5,
+                    _ => 6,
+                },
+            };
+            distance_buckets[bucket] += 1;
+            if best.is_none() {
+                let kind = if indirect {
+                    0
+                } else {
+                    // 診断用の別cacheで、燃料と占有を外した距離を測り直して理由を切り分ける。
+                    let mut probe_cache = ActionTurnDistanceCache::default();
+                    let reaches =
+                        |occupancy: &HashMap<(usize, usize), OccupantInfo>,
+                         fuel: u32,
+                         cache: &mut ActionTurnDistanceCache| {
+                            calculate_action_distance_to_range(
+                                map,
+                                registry,
+                                occupancy,
+                                start,
+                                (objective.x, objective.y),
+                                stats.movement_type,
+                                stats.max_movement,
+                                fuel,
+                                0,
+                                zone,
+                                player,
+                                cache,
+                            )
+                            .is_some()
+                        };
+                    if reaches(&occupied, 1000, &mut probe_cache) {
+                        1
+                    } else if reaches(&HashMap::default(), 1000, &mut probe_cache) {
+                        2
+                    } else {
+                        3
+                    }
+                };
+                unreachable_kinds[kind] += 1;
+            }
+        }
         if let Some((turns, mode, target)) = best
             && turns <= SUSTAIN_TURNS
         {
@@ -241,6 +294,11 @@ pub fn judge_assault(
                 target,
             });
         }
+    }
+    if distance_diag {
+        eprintln!(
+            "GO-DIST P{player:?} buckets(0,1,2,3,4-5,6-8,9+,unreachable)={distance_buckets:?} unreachable_kinds(indirect,fuel,blocked,terrain)={unreachable_kinds:?}"
+        );
     }
     engagements.sort_by_key(|e| (e.turns, e.unit_id));
     let front_strength = engagements
@@ -273,7 +331,7 @@ struct AssaultPosture {
 }
 
 /// 指定勢力から見た敵首都（座標順で最初のもの）。
-fn enemy_capital(world: &World, player: PlayerId) -> Option<GridPosition> {
+pub(crate) fn enemy_capital(world: &World, player: PlayerId) -> Option<GridPosition> {
     world
         .iter_entities()
         .filter_map(|entity| {
@@ -309,6 +367,34 @@ pub fn refresh_assault_posture(world: &mut World, player: PlayerId, turn: u32) {
         .filter(|posture| posture.objective == objective)
         .map_or(AssaultDecision::Wait, |posture| posture.decision);
     let report = judge_assault(world, player, objective, previous_decision);
+    if std::env::var_os("OPENWARS_GO_DIAG").is_some() {
+        // 攻勢判定の内訳を記録する診断（既定では無効）。距離別の関与数で、GOに届かない理由を見る。
+        let by_turns = |limit: u32| {
+            report
+                .engagements
+                .iter()
+                .filter(|e| e.turns <= limit)
+                .count()
+        };
+        let modes = report
+            .engagements
+            .iter()
+            .fold((0, 0), |(enter, attack), e| match e.mode {
+                "enter_zone" => (enter + 1, attack),
+                _ => (enter, attack + 1),
+            });
+        eprintln!(
+            "GO-DIAG T{turn} P{player:?} decision={:?} front={} sustain={} defenders_in_zone={} engaged<=2={} engaged<=3={} enter_zone={} attack_blocker={}",
+            report.decision,
+            report.front_strength,
+            report.sustain_strength,
+            report.defenders_in_zone,
+            by_turns(FRONT_TURNS),
+            by_turns(SUSTAIN_TURNS),
+            modes.0,
+            modes.1,
+        );
+    }
     world.resource_mut::<AssaultPostures>().by_player.insert(
         player,
         AssaultPosture {

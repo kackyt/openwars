@@ -98,6 +98,7 @@ impl EnemyProductionBlockade {
             defense_bonus,
             &board.enemies,
             &board.damage_chart,
+            &board.registry,
         );
         BlockadeTile {
             starts_on_site,
