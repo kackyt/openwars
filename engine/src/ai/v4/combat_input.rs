@@ -143,8 +143,7 @@ fn collect_combat_targets(input: &CombatInputs<'_>, ctx: &mut ReachCtx) -> Optio
         enemies.retain(|enemy| enemy.entity.is_some());
     }
     let hold_window = (input.policy == ProductionPolicy::Standard
-        && matches!(op.kind, OperationKind::Capture | OperationKind::Defense)
-        && crate::ai::features::route_hold_enabled())
+        && matches!(op.kind, OperationKind::Capture | OperationKind::Defense))
     .then(|| capture_hold_window(op, capture_completion_turn));
     if hold_window.is_some() && std::env::var("OPENWARS_THEATRE").is_ok() {
         // 実験: 同じ陸塊の残りの敵も計画へ加える。保持の判定には使わず、保持できる案の
@@ -400,7 +399,6 @@ fn collect_production_options(
     // 運ぶ砲台は補給輸送車と組で使うので、計画は組の値段で評価して資金も組の分だけ確保する。
     // 補給輸送車は生産の段で、同じ手番に砲台の隣の施設へ確保した資金で買う。
     if input.policy == ProductionPolicy::Standard
-        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled()
         && let Some((_, carrier)) = scan
             .available_types
             .iter()
@@ -516,23 +514,21 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
         hold_window,
         hold_contestants,
         committed_purchases: Vec::new(),
-        artillery_carrier: (input.policy == ProductionPolicy::Standard
-            && crate::ai::v4::artillery_ferry::artillery_ferry_enabled())
-        .then(|| {
-            scan.available_types
-                .iter()
-                .find(|(_, stats)| crate::ai::v4::artillery_ferry::is_artillery_carrier(stats))
-                .map(|(_, stats)| stats.clone())
-        })
-        .flatten(),
+        artillery_carrier: (input.policy == ProductionPolicy::Standard)
+            .then(|| {
+                scan.available_types
+                    .iter()
+                    .find(|(_, stats)| crate::ai::v4::artillery_ferry::is_artillery_carrier(stats))
+                    .map(|(_, stats)| stats.clone())
+            })
+            .flatten(),
         spare_artillery_carriers: spare_artillery_carriers(scan),
         carrier_facilities_now: carrier_facilities(scan, &scan.free_facilities)
             .filter(|facility| !input.used_facilities.contains(facility))
             .collect(),
         carrier_facilities_later: carrier_facilities(scan, &scan.production_facilities).collect(),
         owned_cities: scan.owned_cities.clone(),
-        positional: input.policy == ProductionPolicy::Standard
-            && crate::ai::features::positional_enabled(),
+        positional: input.policy == ProductionPolicy::Standard,
         deploy_anchor: Some(op.anchor),
         defensive_emplacement: op.kind == OperationKind::Defense,
         economy_of_force: economy_budget.is_some(),
@@ -595,7 +591,6 @@ fn spare_artillery_carriers(scan: &BoardScan) -> usize {
 /// 交戦できるかを測る移動タイプ。自力でほとんど動けない砲台は、運ぶ輸送部隊の足で測る。
 fn engagement_movement(input: &CombatInputs<'_>, stats: &UnitStats) -> MovementType {
     if input.policy == ProductionPolicy::Standard
-        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled()
         && crate::ai::v4::artillery_ferry::is_ferried_gun(stats)
         && let Some((_, carrier)) = input
             .scan

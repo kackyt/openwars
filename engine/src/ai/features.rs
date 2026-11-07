@@ -1,27 +1,6 @@
-//! V4 AIのフィーチャーフラグ管理。
-//! Cargo feature または環境変数によって有効化される。
-//! WASM環境（ブラウザ）では環境変数が存在しないため、Cargo feature または wasm32 ターゲットで常時有効化する。
-
-/// 進軍路ごとの攻守決定・戦力配分案（OPENWARS_CONCENTRATE）
-pub fn route_concentrate_enabled() -> bool {
-    cfg!(target_arch = "wasm32")
-        || cfg!(feature = "route_concentrate")
-        || std::env::var("OPENWARS_CONCENTRATE").is_ok()
-}
-
-/// 首都ルート進軍路ごとの目標分割・戦力保持評価（OPENWARS_HOLD）
-pub fn route_hold_enabled() -> bool {
-    cfg!(target_arch = "wasm32")
-        || cfg!(feature = "route_hold")
-        || std::env::var("OPENWARS_HOLD").is_ok()
-}
-
-/// 戦力劣勢な進軍路の拠点防衛ドクトリン（OPENWARS_ROUTE_DEFENSE）
-pub fn route_defense_enabled() -> bool {
-    cfg!(target_arch = "wasm32")
-        || cfg!(feature = "route_defense")
-        || std::env::var("OPENWARS_ROUTE_DEFENSE").is_ok()
-}
+//! V4 AIの実験的フィーチャー・環境変数管理。
+//! 常時有効化された基本機能（進軍路集中・保持・防衛、砲台運搬、陣地防御、全都市占領、前線共有等）は
+//! 本体ロジックへ組み込み済み。このモジュールは現在比較検証中の試作スイッチを管理する。
 
 /// GO判定後の敵首都への攻勢（OPENWARS_ASSAULT_GO）。検証中のため既定では無効。
 pub fn assault_go_enabled() -> bool {
@@ -43,12 +22,6 @@ pub fn observed_composition_enabled() -> bool {
     std::env::var_os("OPENWARS_OBSERVED_COMPOSITION").is_some()
 }
 
-/// 地上の直接戦闘部隊が、移動タイプに関係なく同じ前線マスを取り合うとして数える。
-/// 既定で有効。比較のために戻す場合だけ `OPENWARS_SHARED_FRONTAGE=0` を設定する。
-pub fn shared_frontage_enabled() -> bool {
-    std::env::var("OPENWARS_SHARED_FRONTAGE").map_or(true, |value| value != "0")
-}
-
 /// 購入ごとの予測（射撃回数・与被害価値・死亡手番）を生産計画トレースへ記録する。既定では無効。
 /// 観測編成（`OPENWARS_OBSERVED_COMPOSITION`）の交戦シミュレーションでだけ値を持つ。
 pub fn prediction_ledger_enabled() -> bool {
@@ -66,12 +39,6 @@ pub fn production_hold_horizon_enabled() -> bool {
     observed_composition_enabled() || std::env::var_os("OPENWARS_PRODUCTION_HOLD_HORIZON").is_some()
 }
 
-/// 砲台を積んだ輸送車が、陣地が無いとき要衝のマスではなく受け持ちの範囲に入る降車マスへ向かう。
-/// 既定で有効。比較のために戻す場合だけ `OPENWARS_FERRY_ZONE_ENTRY=0` を設定する。
-pub fn ferry_zone_entry_enabled() -> bool {
-    std::env::var("OPENWARS_FERRY_ZONE_ENTRY").map_or(true, |value| value != "0")
-}
-
 /// 首都ルートDAGの担当分隊は、毎手番ビーム探索で目標を決め直さず、DAGの区間目標を
 /// 行動の目標にする。標準経路の比較検証中は明示的に有効化する。
 pub fn dag_squad_targets_enabled() -> bool {
@@ -82,39 +49,4 @@ pub fn dag_squad_targets_enabled() -> bool {
 /// 標準経路の比較検証中は明示的に有効化する。
 pub fn staging_line_enabled() -> bool {
     std::env::var_os("OPENWARS_STAGING_LINE").is_some()
-}
-
-/// 補給輸送車による砲台の運搬・陣地展開（OPENWARS_ARTILLERY_FERRY）
-pub fn artillery_ferry_enabled() -> bool {
-    cfg!(target_arch = "wasm32")
-        || cfg!(feature = "artillery_ferry")
-        || std::env::var("OPENWARS_ARTILLERY_FERRY").is_ok()
-}
-
-/// 陣地防御・布陣型思考（OPENWARS_POSITIONAL）
-pub fn positional_enabled() -> bool {
-    cfg!(target_arch = "wasm32")
-        || cfg!(feature = "positional")
-        || std::env::var("OPENWARS_POSITIONAL").is_ok()
-}
-
-/// 攻勢進軍路上の未所有都市を占領対象として認可（OPENWARS_ROUTE_CAPTURE_ALL）
-pub fn route_capture_all_enabled() -> bool {
-    cfg!(target_arch = "wasm32")
-        || cfg!(feature = "route_capture_all")
-        || std::env::var_os("OPENWARS_ROUTE_CAPTURE_ALL").is_some()
-}
-
-/// 進軍路の戦力予算計算における手番数考慮（OPENWARS_ROUTE_BUDGET_TURNS）
-pub fn route_budget_turns() -> u32 {
-    if let Ok(value) = std::env::var("OPENWARS_ROUTE_BUDGET_TURNS")
-        && let Ok(num) = value.parse::<u32>()
-    {
-        return num;
-    }
-    if cfg!(target_arch = "wasm32") || cfg!(feature = "route_budget_turns") {
-        1
-    } else {
-        0
-    }
 }

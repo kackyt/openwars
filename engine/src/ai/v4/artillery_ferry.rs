@@ -155,11 +155,6 @@ impl DropRejections {
     }
 }
 
-/// 砲台の運搬を使うか。Cargo feature または環境変数で切り替える。
-pub(crate) fn artillery_ferry_enabled() -> bool {
-    crate::ai::features::artillery_ferry_enabled()
-}
-
 /// 自力でほとんど動けない間接砲（砲台）か。
 pub(crate) fn is_ferried_gun(stats: &UnitStats) -> bool {
     stats.min_range > 1 && stats.max_movement <= 1
@@ -1140,11 +1135,7 @@ impl ArtilleryFerry<'_> {
             .best_site(gun, current, SITE_SEARCH_TURNS)
             .map(|(cell, _)| cell)
             .or_else(|| self.nearest_site(gun, current, FAR_SITE_SEARCH_TURNS))
-            .or_else(|| {
-                crate::ai::features::ferry_zone_entry_enabled()
-                    .then(|| self.zone_entry_site(carrier, gun, current, ZONE_ENTRY_TURNS))
-                    .flatten()
-            })
+            .or_else(|| self.zone_entry_site(carrier, gun, current, ZONE_ENTRY_TURNS))
             .or_else(|| {
                 self.routes
                     .get(&gun.entity)

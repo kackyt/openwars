@@ -46,8 +46,7 @@ pub(in crate::ai::v4) fn plan_production_with_registry(
     }
     assign_committed_combat(input, &mut state);
     plan_selection_trace::record_operations(input, &state, plan_registry);
-    let ferries_artillery = input.policy == ProductionPolicy::Standard
-        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled();
+    let ferries_artillery = input.policy == ProductionPolicy::Standard;
     if ferries_artillery {
         // 運ぶ手段の無い既存の砲台へ、作戦枠より先に補給輸送車を付ける。
         // 比較時は実行可能な当手番購入の資金・施設を先取りさせない。

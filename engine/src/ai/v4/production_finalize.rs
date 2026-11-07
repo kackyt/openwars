@@ -81,10 +81,8 @@ pub(super) fn finalize(
 /// 計画が砲台の購入額へ上乗せする、補給輸送車の価格。砲台でなければ、または運搬を使わない
 /// 経路では0。計画側の上乗せ（`combat_input`）と同じ条件で求める。
 fn carrier_package_cost(scan: &BoardScan, unit_type: UnitType) -> u32 {
-    use crate::ai::v4::artillery_ferry::{
-        artillery_ferry_enabled, is_artillery_carrier, is_ferried_gun,
-    };
-    if crate::ai::code_path::is_extended() || !artillery_ferry_enabled() {
+    use crate::ai::v4::artillery_ferry::{is_artillery_carrier, is_ferried_gun};
+    if crate::ai::code_path::is_extended() {
         return 0;
     }
     let is_gun = scan

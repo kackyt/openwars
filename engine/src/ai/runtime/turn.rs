@@ -152,7 +152,6 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     // 補給輸送車が砲台を撃てる位置へ運び、撃つ敵が居なくなれば積み直して前へ運ぶ（V4）。
     if step.is_v4
         && step.tactics == TurnTactics::Standard
-        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled()
         && let Some((entity, command)) =
             crate::ai::v4::artillery_ferry::decide_artillery_ferry(world, player_id, &step.acted)
     {
@@ -216,10 +215,7 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
 /// 生産施設からの退避で動かさないunit。行動済みに加え、運ぶ砲台と補給輸送車を含む。
 fn relief_skip_entities(world: &mut World, step: &TurnStep) -> HashSet<Entity> {
     let mut skip = step.acted.clone();
-    if step.is_v4
-        && step.tactics == TurnTactics::Standard
-        && crate::ai::v4::artillery_ferry::artillery_ferry_enabled()
-    {
+    if step.is_v4 && step.tactics == TurnTactics::Standard {
         skip.extend(crate::ai::v4::artillery_ferry::own_ferry_units(
             world,
             step.player_id,

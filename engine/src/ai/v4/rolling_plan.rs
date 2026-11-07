@@ -2778,10 +2778,7 @@ impl BattleFrontage {
 /// 山を越えられる歩兵と戦車では通れる地形が違うため、移動種別ごとに求める。今いる敵が
 /// いなければ上限を設けない。
 fn battle_frontage(input: &RollingPlanInput) -> Option<BattleFrontage> {
-    battle_frontage_with(
-        input,
-        !crate::ai::code_path::is_extended() && crate::ai::features::shared_frontage_enabled(),
-    )
+    battle_frontage_with(input, !crate::ai::code_path::is_extended())
 }
 
 fn battle_frontage_with(input: &RollingPlanInput, shared_direct: bool) -> Option<BattleFrontage> {

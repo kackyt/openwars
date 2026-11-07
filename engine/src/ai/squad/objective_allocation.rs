@@ -451,7 +451,6 @@ pub(super) fn restrict_captures_to_key_points(
     };
     // 占領目標を絞らない（route_capture_all）。ただし守りの進軍路（ゴーサインを
     // 出していない最低限の守り）の側の施設は、守りの要衝の周りに限る。
-    let capture_all = crate::ai::features::route_capture_all_enabled();
     let mut kept = Vec::new();
     let mut released = Vec::new();
     for responsibility in responsibilities {
@@ -459,13 +458,9 @@ pub(super) fn restrict_captures_to_key_points(
             .members
             .iter()
             .find_map(|member| world.get::<Faction>(*member).map(|faction| faction.0));
-        let allowed = if capture_all {
-            player.is_none_or(|player| {
-                capture_target_allowed(world, map, player, responsibility.target, orders)
-            })
-        } else {
-            key_point_capture_target(world, map, responsibility.target, orders)
-        };
+        let allowed = player.is_none_or(|player| {
+            capture_target_allowed(world, map, player, responsibility.target, orders)
+        });
         if allowed {
             kept.push(responsibility);
         } else {
@@ -644,32 +639,6 @@ pub(super) fn beyond_defended_route(
         })
         .min_by_key(|(point, defend)| (distance(*point), !*defend, point.y, point.x));
     nearest.is_some_and(|(point, defend)| defend && distance(point) > KEY_POINT_CAPTURE_RADIUS)
-}
-
-/// 配分案を遂行中に占領へ向かってよい施設か。中立の施設か、要衝の周りの施設。
-fn key_point_capture_target(
-    world: &World,
-    map: &Map,
-    target: GridPosition,
-    orders: &[crate::ai::v4::capital_route::force_demand::RouteOrder],
-) -> bool {
-    let neutral = world.iter_entities().any(|entity| {
-        entity.get::<GridPosition>() == Some(&target)
-            && entity
-                .get::<Property>()
-                .is_some_and(|property| property.owner_id.is_none())
-    });
-    // 実験: 半径を変える（OPENWARS_ROUTE_CAPTURE_RADIUS）。
-    let radius = std::env::var("OPENWARS_ROUTE_CAPTURE_RADIUS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(KEY_POINT_CAPTURE_RADIUS);
-    neutral
-        || orders.iter().any(|order| {
-            [order.key_point, order.staging]
-                .iter()
-                .any(|point| map.distance(point.x, point.y, target.x, target.y) <= radius)
-        })
 }
 
 /// 余った戦闘役を首都ルートの前線へ配る。配った戦闘役は `remaining` から外す。

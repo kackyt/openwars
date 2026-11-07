@@ -793,8 +793,7 @@ impl BoardScan {
         let mut route_posture = None;
         // 同一陸塊の首都戦役では、島単位の一つのCapture目標を首都ルートの進軍路ごとに分け、
         // 生産の作戦を配置側の前線（進軍路）と揃える。敵首都は首都作戦が担う。
-        if crate::ai::features::route_hold_enabled()
-            && home_island.is_some()
+        if home_island.is_some()
             && home_island == enemy_capital_island
             && let Some(island) = home_island
             && let Some(fronts) = capital_route_front_properties(world, player_id, island)
@@ -831,7 +830,7 @@ impl BoardScan {
                 .iter()
                 .map(|(position, _)| *position)
                 .collect::<Vec<_>>();
-            let budget_turns = crate::ai::features::route_budget_turns();
+            let budget_turns = 1;
             // 占領役（最も安い占領可能な地上兵）の足で、移動コストを加味した実ターンを測る。
             let capturer = available_types
                 .iter()
@@ -842,9 +841,7 @@ impl BoardScan {
                 })
                 .min_by_key(|(unit_type, stats)| (stats.cost, unit_type.as_str()))
                 .map(|(_, stats)| stats.clone());
-            if crate::ai::features::route_concentrate_enabled()
-                && let Some(capturer) = capturer
-            {
+            if let Some(capturer) = capturer {
                 // 拠点は拠点あたりの収入を、敵首都は敵の総収入を、数ターン分の価値とみなす。
                 let property_count = u32::try_from(owned_properties.len().max(1)).unwrap_or(1);
                 let values = PostureValues {
@@ -912,7 +909,7 @@ impl BoardScan {
                 });
             }
             // 配分案で各進軍路の攻守を決めた場合は、それに従う。
-            if crate::ai::features::route_defense_enabled() && route_posture.is_none() {
+            if route_posture.is_none() {
                 let all_own_units = my_units
                     .iter()
                     .chain(&ferried_units)
