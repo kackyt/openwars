@@ -18,12 +18,16 @@ pub(crate) fn decide_forming_campaign_site_relief(
     skip_entities: &HashSet<Entity>,
     include_active_missions: bool,
 ) -> Option<(Entity, AiCommand)> {
+    // 遅い退避は通常行動を試した後の fallback なので、退避先が未所有物件なら
+    // 占領まで進めて手番を無駄にしない（早い退避と同じ規則）。
+    let capture_on_arrival = captures_on_relief_destination(world, player_id);
     site_relief(
         world,
         player_id,
         skip_entities,
         include_active_missions,
         false,
+        capture_on_arrival,
     )
 }
 
@@ -44,7 +48,24 @@ pub(crate) fn decide_early_campaign_site_relief(
         skip_entities,
         include_active_missions,
         require_progress,
+        captures_on_relief_destination(world, player_id),
     )
+}
+
+/// 退避先が占領可能な物件なら、移動と同時に占領を始めるか。
+///
+/// 拡張経路は従来から行う。標準経路のV4も行う（`map_22` のように陸地は狭いが
+/// 総セル数が小規模判定を超える盤面では、生産口を空ける一歩が中立都市への進入に
+/// なるため、`Wait` にすると初動の占領が1手番遅れる）。
+///
+/// V3は対戦評価の基準線なので挙動を変えない。V3も relief 経路には入る
+/// （`turn.rs` の `uses_v3_tactics`）。退避対象には `include_active_missions` に
+/// 関係なく Transport Forming Squad の cargo（歩兵を含みうる）が含まれるため、
+/// 経路を単純に広げるとV3の `Wait` が `Capture` に変わりうる。よって版で明示的に囲う。
+fn captures_on_relief_destination(world: &World, player_id: PlayerId) -> bool {
+    crate::ai::code_path::is_extended()
+        || crate::ai::resolve_player_ai_version(world, player_id)
+            == crate::ai::ai_version::AiVersion::V4
 }
 
 fn site_relief(
@@ -53,8 +74,9 @@ fn site_relief(
     skip_entities: &HashSet<Entity>,
     include_active_missions: bool,
     require_progress: bool,
+    capture_on_arrival: bool,
 ) -> Option<(Entity, AiCommand)> {
-    // 拡張経路では、首都攻略DAGの指令先・セル列と、退避先での占領開始を加える。
+    // 拡張経路では、首都攻略DAGの指令先・セル列を加える。
     // 退避対象の収集・候補順・通常の退避先選択は両経路で共通。
     let is_extended_path = crate::ai::code_path::is_extended();
 
@@ -94,6 +116,7 @@ fn site_relief(
                 &map,
                 &registry,
                 is_extended_path,
+                capture_on_arrival,
             ) {
                 return Some(action);
             }
@@ -316,6 +339,7 @@ fn select_relief_action_for_unit(
     map: &Map,
     registry: &MasterDataRegistry,
     is_extended_path: bool,
+    capture_on_arrival: bool,
 ) -> Option<(Entity, AiCommand)> {
     if skip_entities.contains(&entity)
         || world
@@ -393,11 +417,10 @@ fn select_relief_action_for_unit(
         x: destination.0,
         y: destination.1,
     };
-    // 拡張経路では、退避先が占領可能な物件ならその場で占領を始める。
+    // 退避は生産口を空ける行動であり、退避先が未所有物件なら占領まで進める。
     // 首都攻略DAGの占領許可（capital_route_allows_capture_at）は旧拡張実装も
-    // 確認していない。退避は生産口を空ける行動であり、追加すると拡張経路の
-    // 挙動が変わるため、要否は別途の比較で判断する。
-    let starts_capture = is_extended_path
+    // 確認していないため、ここでも追加しない。
+    let starts_capture = capture_on_arrival
         && stats.can_capture
         && has_capturable_property_at(world, target_pos, player_id);
     let command = if starts_capture {
