@@ -281,7 +281,7 @@ pub(crate) fn stranded_infantry_score(
             &unit.position,
             board.player_id,
             &board.properties,
-            board.enemies.iter().map(|enemy| enemy.0),
+            board.enemies.iter().map(|enemy| enemy.position),
         )
     {
         return 0;
@@ -361,41 +361,46 @@ fn solo_hunt_score(
     let mut best_target_turns: i32 = 999;
     let mut best_target_position = None;
     let mut max_potential = -1.0;
-    for (enemy_position, enemy_type, enemy_value, enemy_hp, ..) in &board.enemies {
+    for enemy in &board.enemies {
+        let enemy_position = enemy.position;
+        let enemy_type = enemy.unit_type;
+        let enemy_value = enemy.strategic_value;
+        let enemy_hp = enemy.hp;
         let turns = distances
-            .turns(stats, position, *enemy_position, stats.max_range)
+            .turns(stats, position, enemy_position, stats.max_range)
             .turns
-            + ship_blocked_penalty(board, unit, *enemy_position);
+            + ship_blocked_penalty(board, unit, enemy_position);
         let base_damage = board
             .damage_chart
-            .get_base_damage(stats.unit_type, *enemy_type)
+            .get_base_damage(stats.unit_type, enemy_type)
             .or_else(|| {
                 board
                     .damage_chart
-                    .get_base_damage_secondary(stats.unit_type, *enemy_type)
+                    .get_base_damage_secondary(stats.unit_type, enemy_type)
             })
             .unwrap_or(0);
         let potential =
-            base_damage as f32 * (*enemy_value as f32 / 100.0) * (2.0 - *enemy_hp as f32 / 100.0);
+            base_damage as f32 * (enemy_value as f32 / 100.0) * (2.0 - enemy_hp as f32 / 100.0);
         if potential > max_potential {
             max_potential = potential;
             best_target_turns = turns as i32;
-            best_target_position = Some(*enemy_position);
+            best_target_position = Some(enemy_position);
         } else if (potential - max_potential).abs() < 0.1 && (turns as i32) < best_target_turns {
             best_target_turns = turns as i32;
-            best_target_position = Some(*enemy_position);
+            best_target_position = Some(enemy_position);
         }
     }
 
     if max_potential <= 0.0 {
         let mut nearest: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
-        for (enemy_position, ..) in &board.enemies {
-            let mut turns = distances.turns(stats, position, *enemy_position, stats.max_range);
-            turns.turns += ship_blocked_penalty(board, unit, *enemy_position);
-            let candidate = (turns, manhattan(position, *enemy_position));
+        for enemy in &board.enemies {
+            let enemy_position = enemy.position;
+            let mut turns = distances.turns(stats, position, enemy_position, stats.max_range);
+            turns.turns += ship_blocked_penalty(board, unit, enemy_position);
+            let candidate = (turns, manhattan(position, enemy_position));
             if nearest.is_none_or(|current| candidate < current) {
                 nearest = Some(candidate);
-                best_target_position = Some(*enemy_position);
+                best_target_position = Some(enemy_position);
             }
         }
         if nearest.is_none_or(|(turns, _)| turns.turns >= 99) {

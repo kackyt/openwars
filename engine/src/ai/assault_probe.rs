@@ -12,11 +12,41 @@ use crate::resources::*;
 use crate::systems::action::{can_unit_move, is_unit_selectable};
 use crate::systems::combat::get_attackable_targets_at;
 use crate::systems::movement::{OccupantInfo, calculate_reachable_tiles};
-use anyhow::{Result, ensure};
 use bevy_ecs::event::EventCursor;
 use bevy_ecs::prelude::*;
 use serde::Serialize;
 use std::cmp::Reverse;
+
+/// 診断分岐の1手番あたりの最大許容命令数。
+pub const MAX_PROBE_INSTRUCTIONS_PER_TURN: usize = 2000;
+
+/// 診断プローブ実行時のエラー。
+#[derive(thiserror::Error, Debug)]
+pub enum AssaultProbeError {
+    #[error("行動済みの部隊を再選択した: {0}")]
+    UnitNotSelectable(String),
+    #[error("診断命令が拒否された: {unit} {origin:?} -> {destination:?}")]
+    CommandRejected {
+        unit: String,
+        origin: GridPosition,
+        destination: GridPosition,
+    },
+    #[error("診断分岐の1手番が{0}命令で終了しない")]
+    InstructionLimitExceeded(usize),
+    #[error("指定案の先頭は基準案（ProbePlan::Baseline）にすること")]
+    MissingBaselinePlan,
+    #[error("診断の自軍手番数は1〜3（指定値: {0}）")]
+    InvalidOwnTurns(u32),
+    #[error("対象のMain手番から開始すること")]
+    InvalidStartingPhase,
+    #[error("分岐の手番境界が不整合: active={active:?}, expected={expected:?}")]
+    TurnBoundaryMismatch {
+        active: PlayerId,
+        expected: PlayerId,
+    },
+    #[error("セーブデータの直列化/復元に失敗: {0}")]
+    Serialization(String),
+}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -472,17 +502,16 @@ fn issue_override(
     actor: Entity,
     position: GridPosition,
     target: Option<Entity>,
-) -> Result<CommandRecord> {
-    ensure!(
-        is_unit_selectable(world, actor),
-        "行動済みの部隊を再選択した"
-    );
-    let origin = *world.get::<GridPosition>(actor).unwrap();
+) -> Result<CommandRecord, AssaultProbeError> {
     let mark = Mark {
         id: world.get::<UnitId>(actor).unwrap().0.to_string(),
         player,
         stats: world.get::<UnitStats>(actor).unwrap().clone(),
     };
+    if !is_unit_selectable(world, actor) {
+        return Err(AssaultProbeError::UnitNotSelectable(mark.id));
+    }
+    let origin = *world.get::<GridPosition>(actor).unwrap();
     let target_id =
         target.and_then(|entity| world.get::<UnitId>(entity).map(|id| id.0.to_string()));
     let start_attacks = audit.attacks.len();
@@ -524,13 +553,13 @@ fn issue_override(
                 .get::<ActionCompleted>(actor)
                 .is_some_and(|done| done.0)
     };
-    ensure!(
-        accepted,
-        "診断命令が拒否された: {} {:?} -> {:?}",
-        mark.id,
-        origin,
-        position
-    );
+    if !accepted {
+        return Err(AssaultProbeError::CommandRejected {
+            unit: mark.id,
+            origin,
+            destination: position,
+        });
+    }
     world.init_resource::<crate::ai::AiActionCooldown>();
     world
         .resource_mut::<crate::ai::AiActionCooldown>()
@@ -562,7 +591,7 @@ fn apply_plan(
     objective: GridPosition,
     plan: ProbePlan,
     horizon: u32,
-) -> Result<Vec<CommandRecord>> {
+) -> Result<Vec<CommandRecord>, AssaultProbeError> {
     let mut records = Vec::new();
     if plan == ProbePlan::Baseline {
         return Ok(records);
@@ -654,17 +683,19 @@ fn finish_turn(
     schedule: &mut Schedule,
     audit: &mut Audit,
     player: PlayerId,
-) -> Result<()> {
+) -> Result<(), AssaultProbeError> {
     let side = active(world);
     // 計算量の上限であり戦略の閾値ではない。超過時は成功扱いにしない。
-    for _ in 0..2000 {
+    for _ in 0..MAX_PROBE_INSTRUCTIONS_PER_TURN {
         if world.resource::<MatchState>().game_over.is_some() || active(world) != side {
             return Ok(());
         }
         crate::ai::execute_ai_turn(world, side);
         audit.apply(world, schedule, player);
     }
-    anyhow::bail!("診断分岐の1手番が2000命令で終了しない")
+    Err(AssaultProbeError::InstructionLimitExceeded(
+        MAX_PROBE_INSTRUCTIONS_PER_TURN,
+    ))
 }
 
 fn metrics(world: &World, player: PlayerId, objective: GridPosition) -> PositionMetrics {
@@ -792,7 +823,7 @@ pub fn compare_assaults(
     player: PlayerId,
     objective: GridPosition,
     own_turns: u32,
-) -> Result<AssaultReport> {
+) -> Result<AssaultReport, AssaultProbeError> {
     compare_plans(
         world,
         master,
@@ -817,20 +848,22 @@ pub fn compare_plans(
     objective: GridPosition,
     own_turns: u32,
     plans: &[ProbePlan],
-) -> Result<AssaultReport> {
-    ensure!(
-        plans.first() == Some(&ProbePlan::Baseline),
-        "先頭は基準案にすること"
-    );
-    ensure!((1..=3).contains(&own_turns), "診断の自軍手番数は1〜3");
-    ensure!(
-        world.resource::<MatchState>().current_phase == Phase::Main && active(world) == player,
-        "対象のMain手番から開始すること"
-    );
-    let saved = crate::serialize::export_save_data(world, map_name)?;
+) -> Result<AssaultReport, AssaultProbeError> {
+    if plans.first() != Some(&ProbePlan::Baseline) {
+        return Err(AssaultProbeError::MissingBaselinePlan);
+    }
+    if !(1..=3).contains(&own_turns) {
+        return Err(AssaultProbeError::InvalidOwnTurns(own_turns));
+    }
+    if world.resource::<MatchState>().current_phase != Phase::Main || active(world) != player {
+        return Err(AssaultProbeError::InvalidStartingPhase);
+    }
+    let saved = crate::serialize::export_save_data(world, map_name)
+        .map_err(|e| AssaultProbeError::Serialization(e.to_string()))?;
     let mut results = Vec::new();
     for &plan in plans {
-        let (mut branch, mut schedule) = crate::serialize::import_save_data(&saved, master)?;
+        let (mut branch, mut schedule) = crate::serialize::import_save_data(&saved, master)
+            .map_err(|e| AssaultProbeError::Serialization(e.to_string()))?;
         let initial = metrics(&branch, player, objective);
         let mut audit = Audit::default();
         audit.remember(&branch);
@@ -848,7 +881,13 @@ pub fn compare_plans(
             if branch.resource::<MatchState>().game_over.is_some() {
                 break;
             }
-            ensure!(active(&branch) == player, "分岐の手番境界が不整合");
+            let current_active = active(&branch);
+            if current_active != player {
+                return Err(AssaultProbeError::TurnBoundaryMismatch {
+                    active: current_active,
+                    expected: player,
+                });
+            }
             finish_turn(&mut branch, &mut schedule, &mut audit, player)?;
             completed += 1;
             if branch.resource::<MatchState>().game_over.is_none() {

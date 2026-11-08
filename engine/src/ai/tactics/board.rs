@@ -236,7 +236,7 @@ impl TacticalBoard {
         let mut positions = self
             .enemies
             .iter()
-            .map(|(position, ..)| (position.x, position.y))
+            .map(|enemy| (enemy.position.x, enemy.position.y))
             .collect::<Vec<_>>();
         positions.sort_unstable();
         positions
@@ -289,7 +289,7 @@ impl TacticalBoard {
     }
 
     pub(crate) fn enemy_positions(&self) -> impl Iterator<Item = GridPosition> + '_ {
-        self.enemies.iter().map(|(position, ..)| *position)
+        self.enemies.iter().map(|enemy| enemy.position)
     }
 }
 
@@ -315,19 +315,19 @@ fn observe_enemies(
         .filter(|(_, faction, _, health, _, transporting, _)| {
             faction.0 != player_id && health.current > 0 && transporting.is_none()
         })
-        .map(|(position, faction, stats, health, cargo, _, ammo)| {
-            (
-                *position,
-                stats.unit_type,
-                strategic_target_value(
+        .map(
+            |(position, faction, stats, health, cargo, _, ammo)| EnemyThreatInfo {
+                position: *position,
+                unit_type: stats.unit_type,
+                strategic_value: strategic_target_value(
                     stats, *position, faction.0, cargo, unit_costs, properties, registry,
                 ),
-                health.current,
-                stats.min_range,
-                stats.max_range,
-                stats.max_movement,
-                ammo.map_or((0, 0), |ammo| (ammo.ammo1, ammo.ammo2)),
-            )
-        })
+                hp: health.current,
+                min_range: stats.min_range,
+                max_range: stats.max_range,
+                max_movement: stats.max_movement,
+                ammo: ammo.map_or((0, 0), |ammo| (ammo.ammo1, ammo.ammo2)),
+            },
+        )
         .collect()
 }

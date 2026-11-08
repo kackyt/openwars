@@ -2,7 +2,42 @@ use crate::components::GridPosition;
 use crate::resources::{DamageChart, Map, UnitType};
 
 /// 脅威評価に必要な敵ユニットの最小スナップショット。
-pub type EnemyThreatInfo = (GridPosition, UnitType, u32, u32, u32, u32, u32, (u32, u32));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnemyThreatInfo {
+    pub position: GridPosition,
+    pub unit_type: UnitType,
+    pub strategic_value: u32,
+    pub hp: u32,
+    pub min_range: u32,
+    pub max_range: u32,
+    pub max_movement: u32,
+    pub ammo: (u32, u32),
+}
+
+impl EnemyThreatInfo {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        position: GridPosition,
+        unit_type: UnitType,
+        strategic_value: u32,
+        hp: u32,
+        min_range: u32,
+        max_range: u32,
+        max_movement: u32,
+        ammo: (u32, u32),
+    ) -> Self {
+        Self {
+            position,
+            unit_type,
+            strategic_value,
+            hp,
+            min_range,
+            max_range,
+            max_movement,
+            ammo,
+        }
+    }
+}
 
 const EXPOSURE_RISK_NUM: i32 = 1;
 const EXPOSURE_RISK_DEN: i32 = 1;
@@ -16,13 +51,13 @@ fn shot_damage(
     chart: &DamageChart,
     registry: &crate::resources::master_data::MasterDataRegistry,
 ) -> u32 {
-    if enemy.3 == 0 {
+    if enemy.hp == 0 {
         return 0;
     }
     let Some((slot, fallback, _)) = crate::systems::combat::select_weapon(
-        enemy.7.0,
-        enemy.7.1,
-        enemy.1.as_str(),
+        enemy.ammo.0,
+        enemy.ammo.1,
+        enemy.unit_type.as_str(),
         target.as_str(),
         distance,
         registry,
@@ -30,12 +65,12 @@ fn shot_damage(
         return 0;
     };
     let base = if slot == 1 {
-        chart.get_base_damage(enemy.1, target)
+        chart.get_base_damage(enemy.unit_type, target)
     } else {
-        chart.get_base_damage_secondary(enemy.1, target)
+        chart.get_base_damage_secondary(enemy.unit_type, target)
     }
     .unwrap_or(fallback);
-    crate::systems::combat::calculate_damage_formula(base, enemy.3, defense, false)
+    crate::systems::combat::calculate_damage_formula(base, enemy.hp, defense, false)
 }
 
 fn expected_loss_value(total_damage: u32, my_cost: u32, my_hp: u32) -> i32 {
@@ -54,12 +89,11 @@ fn indirect_fire_expected_damage(
 ) -> u32 {
     let mut total_damage = 0;
     for enemy in enemy_units {
-        let (enemy_position, _, _, _, min_range, max_range, _, _) = enemy;
-        if *min_range <= 1 {
+        if enemy.min_range <= 1 {
             continue;
         }
-        let distance = map.distance(enemy_position.x, enemy_position.y, tile.0, tile.1);
-        if distance < *min_range || distance > *max_range {
+        let distance = map.distance(enemy.position.x, enemy.position.y, tile.0, tile.1);
+        if distance < enemy.min_range || distance > enemy.max_range {
             continue;
         }
         total_damage += shot_damage(
@@ -86,17 +120,16 @@ fn direct_reach_expected_damage(
 ) -> u32 {
     let mut total_damage = 0;
     for enemy in enemy_units {
-        let (enemy_position, _, _, _, min_range, max_range, max_movement, _) = enemy;
         // 間接攻撃ユニットは移動後に射撃できないため、到達圏の計算から除外する。
-        if *min_range > 1 {
+        if enemy.min_range > 1 {
             continue;
         }
-        let distance = map.distance(enemy_position.x, enemy_position.y, tile.0, tile.1);
-        if distance > max_movement + max_range {
+        let distance = map.distance(enemy.position.x, enemy.position.y, tile.0, tile.1);
+        if distance > enemy.max_movement + enemy.max_range {
             continue;
         }
         // 現在の直接攻撃到達圏の概算は維持し、移動で接近した後の距離で武器を選ぶ。
-        let firing_distance = distance.saturating_sub(*max_movement).max(1);
+        let firing_distance = distance.saturating_sub(enemy.max_movement).max(1);
         total_damage += shot_damage(
             enemy,
             my_unit_type,
@@ -267,7 +300,7 @@ mod tests {
         let registry = crate::resources::master_data::MasterDataRegistry::load().unwrap();
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::HeavySpGun, UnitType::Tank, 92);
-        let enemy = [(
+        let enemy = [EnemyThreatInfo::new(
             GridPosition { x: 0, y: 0 },
             UnitType::HeavySpGun,
             16500,
@@ -304,7 +337,7 @@ mod tests {
         );
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::HeavySpGun, UnitType::Tank, 92);
-        let enemy = (
+        let enemy = EnemyThreatInfo::new(
             GridPosition { x: 0, y: 0 },
             UnitType::HeavySpGun,
             16500,
@@ -340,7 +373,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::Tank, UnitType::Infantry, 80);
         chart.insert_secondary_damage(UnitType::Tank, UnitType::Infantry, 30);
-        let mut enemy = (
+        let mut enemy = EnemyThreatInfo::new(
             GridPosition { x: 0, y: 0 },
             UnitType::Tank,
             6000,
@@ -360,18 +393,18 @@ mod tests {
             shot_damage(&enemy, UnitType::Infantry, 2, 20, &chart, &registry),
             0
         );
-        enemy.7 = (0, 0);
+        enemy.ammo = (0, 0);
         assert_eq!(
             shot_damage(&enemy, UnitType::Infantry, 1, 20, &chart, &registry),
             0
         );
-        enemy.7 = (6, 9);
+        enemy.ammo = (6, 9);
         assert_eq!(
             shot_damage(&enemy, UnitType::Infantry, 1, 20, &chart, &registry),
             crate::systems::combat::calculate_damage_formula(80, 60, 20, false)
         );
         // 武器が対応しない航空機は、チャートに値があっても射撃不能。
-        enemy.1 = UnitType::HeavySpGun;
+        enemy.unit_type = UnitType::HeavySpGun;
         chart.insert_damage(UnitType::HeavySpGun, UnitType::Bomber, 99);
         assert_eq!(
             shot_damage(&enemy, UnitType::Bomber, 4, 0, &chart, &registry),
@@ -390,7 +423,7 @@ mod tests {
         let registry = crate::resources::master_data::MasterDataRegistry::load().unwrap();
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::Artillery, UnitType::Infantry, 50);
-        let enemy = [(
+        let enemy = [EnemyThreatInfo::new(
             GridPosition { x: 0, y: 0 },
             UnitType::Artillery,
             6000,
@@ -442,7 +475,7 @@ mod tests {
         let mut chart = DamageChart::new();
         chart.insert_damage(UnitType::Tank, UnitType::Tank, 50);
         // 移動力4・射程1の敵戦車は格子距離5まで届く。
-        let enemy = [(
+        let enemy = [EnemyThreatInfo::new(
             GridPosition { x: 0, y: 0 },
             UnitType::Tank,
             7000,
@@ -490,7 +523,7 @@ mod tests {
         chart.insert_damage(UnitType::Artillery, UnitType::Infantry, 50);
         chart.insert_damage(UnitType::Tank, UnitType::Infantry, 60);
         let enemy = [
-            (
+            EnemyThreatInfo::new(
                 GridPosition { x: 0, y: 0 },
                 UnitType::Artillery,
                 6000,
@@ -500,7 +533,7 @@ mod tests {
                 5,
                 (6, 9),
             ),
-            (
+            EnemyThreatInfo::new(
                 GridPosition { x: 4, y: 0 },
                 UnitType::Tank,
                 7000,

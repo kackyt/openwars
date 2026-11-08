@@ -204,7 +204,7 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
     let memory = world.get_resource_or_insert_with(
         crate::ai::v4::capital_route::force_demand::RoutePostureMemory::default,
     );
-    match scan.route_posture.clone() {
+    match &scan.route_posture {
         Some(decision) => {
             if std::env::var_os("OPENWARS_CONCENTRATE_DEBUG").is_some() {
                 eprintln!(
@@ -212,7 +212,10 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
                     player_id.0, turn, decision.main, decision.orders
                 );
             }
-            memory.into_inner().by_player.insert(player_id, decision);
+            memory
+                .into_inner()
+                .by_player
+                .insert(player_id, decision.clone());
         }
         None => {
             if memory.by_player.contains_key(&player_id) {

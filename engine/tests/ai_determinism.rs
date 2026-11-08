@@ -126,7 +126,6 @@ fn standard_map_25_replays_identically() {
 }
 
 #[test]
-#[ignore = "長時間のAIシミュレーション・リプレイ再現性試験"]
 fn small_map_replays_identically() {
     assert_replays_identically("map_1", 1, AiVersion::V4, AiVersion::V200, 8);
 }

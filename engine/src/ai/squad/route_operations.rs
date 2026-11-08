@@ -792,4 +792,147 @@ mod tests {
         assert!(!manager.route_operation_members.contains_key(&removed));
         assert_eq!(manager.route_operation_members.get(&other), Some(&target));
     }
+
+    #[test]
+    fn enemy_units_filters_out_immobile_units() {
+        let mut world = World::new();
+        let mut mobile_stats = UnitStats::mock();
+        mobile_stats.max_movement = 4;
+        let mut immobile_stats = UnitStats::mock();
+        immobile_stats.max_movement = 0;
+
+        // 敵ユニット (移動可能)
+        world.spawn((
+            Faction(PlayerId(2)),
+            GridPosition { x: 2, y: 3 },
+            mobile_stats.clone(),
+        ));
+        // 敵ユニット (移動不可)
+        world.spawn((
+            Faction(PlayerId(2)),
+            GridPosition { x: 4, y: 5 },
+            immobile_stats,
+        ));
+        // 自軍ユニット
+        world.spawn((
+            Faction(PlayerId(1)),
+            GridPosition { x: 1, y: 1 },
+            mobile_stats,
+        ));
+
+        let enemies = enemy_units(&world, PlayerId(1));
+        assert_eq!(enemies.len(), 1);
+        assert_eq!(enemies[0], (GridPosition { x: 2, y: 3 }, 4));
+    }
+
+    #[test]
+    fn launches_advances_when_no_enemies_exist() {
+        let mut world = World::new();
+        let map = Map::new(
+            10,
+            10,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let mut stats = UnitStats::mock();
+        stats.max_movement = 3;
+        let unit = world
+            .spawn((Faction(PlayerId(1)), GridPosition { x: 1, y: 1 }, stats))
+            .id();
+
+        let order = RouteOrder {
+            key_point: GridPosition { x: 5, y: 5 },
+            defend: false,
+            staging: GridPosition { x: 3, y: 3 },
+            force: 10_000,
+        };
+
+        let result = launches(&world, &map, PlayerId(1), &order, &[unit]);
+        assert!(result);
+    }
+
+    #[test]
+    fn launches_advances_when_friendly_faster_than_enemy() {
+        let mut world = World::new();
+        let map = Map::new(
+            10,
+            10,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        let mut friendly_stats = UnitStats::mock();
+        friendly_stats.max_movement = 4;
+        let friendly = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 5, y: 4 }, // 距離1 -> 1手番
+                friendly_stats,
+            ))
+            .id();
+
+        let mut enemy_stats = UnitStats::mock();
+        enemy_stats.max_movement = 1;
+        world.spawn((
+            Faction(PlayerId(2)),
+            GridPosition { x: 5, y: 9 }, // 距離4 -> 4手番
+            enemy_stats,
+        ));
+
+        let order = RouteOrder {
+            key_point: GridPosition { x: 5, y: 5 },
+            defend: false,
+            staging: GridPosition { x: 5, y: 3 },
+            force: 10_000,
+        };
+
+        let result = launches(&world, &map, PlayerId(1), &order, &[friendly]);
+        assert!(result);
+    }
+
+    #[test]
+    fn carry_over_assigns_members_to_closest_order() {
+        let mut world = World::new();
+        let map = Map::new(
+            10,
+            10,
+            crate::resources::Terrain::Plains,
+            crate::resources::GridTopology::Square,
+        );
+        world.insert_resource(map);
+
+        let unit_stats = UnitStats::mock();
+        let unit = world
+            .spawn((
+                Faction(PlayerId(1)),
+                GridPosition { x: 2, y: 2 },
+                unit_stats,
+            ))
+            .id();
+
+        let mut manager = SquadManager::default();
+        // 前の手番で (2, 3) の要衝作戦に属していた
+        manager
+            .route_operation_members
+            .insert(unit, GridPosition { x: 2, y: 3 });
+
+        let orders = [
+            RouteOrder {
+                key_point: GridPosition { x: 2, y: 2 }, // 距離1
+                defend: false,
+                staging: GridPosition { x: 1, y: 1 },
+                force: 10_000,
+            },
+            RouteOrder {
+                key_point: GridPosition { x: 8, y: 8 }, // 距離遠い
+                defend: false,
+                staging: GridPosition { x: 7, y: 7 },
+                force: 10_000,
+            },
+        ];
+
+        let plan = carry_over(&world, &manager, &orders, &[unit]);
+        assert_eq!(plan.members[0], vec![unit]);
+        assert!(plan.members[1].is_empty());
+        assert!(plan.free.is_empty());
+    }
 }

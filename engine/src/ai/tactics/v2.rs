@@ -790,8 +790,8 @@ fn is_assault_target(board: &TacticalBoard, unit: &UnitTactics, position: GridPo
         return false;
     };
     board.enemies.iter().any(|enemy| {
-        enemy.0 == position
-            && (enemy.4 > 1
+        enemy.position == position
+            && (enemy.min_range > 1
                 || board
                     .map
                     .distance(objective.x, objective.y, position.x, position.y)

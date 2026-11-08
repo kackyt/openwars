@@ -4468,7 +4468,7 @@ fn select_landing_candidate(
         if faction.0 == cargo_faction {
             continue;
         }
-        enemy_threats.push((
+        enemy_threats.push(crate::ai::threat::EnemyThreatInfo::new(
             *position,
             stats.unit_type,
             stats.cost,

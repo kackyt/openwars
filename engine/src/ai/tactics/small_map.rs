@@ -973,16 +973,15 @@ fn should_tactical_merge(
     }
     let tactical = &board.tactical;
     let enemy_within = |extra_reach: u32| {
-        tactical
-            .enemies
-            .iter()
-            .any(|(enemy, _, _, hp, _, _, movement, _)| {
-                *hp > 0
-                    && tactical
-                        .map
-                        .distance(tile.position.x, tile.position.y, enemy.x, enemy.y)
-                        <= *movement + extra_reach
-            })
+        tactical.enemies.iter().any(|enemy| {
+            enemy.hp > 0
+                && tactical.map.distance(
+                    tile.position.x,
+                    tile.position.y,
+                    enemy.position.x,
+                    enemy.position.y,
+                ) <= enemy.max_movement + extra_reach
+        })
     };
     let survive_by_merging = enemy_within(1) && state.hp <= 40 && total_hp >= 60;
     let near_threatened_front = enemy_within(0);
