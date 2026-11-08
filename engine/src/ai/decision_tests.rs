@@ -420,15 +420,37 @@ mod tests {
     }
 
     #[test]
-    fn factory_relief_starts_capture_only_on_extended_path() {
-        // 退避先(3,0)が中立都市のとき、通常経路は移動Waitのまま、
-        // 拡張経路は退避と同時に占領を始める（F01の経路差を固定する）。
-        for (path, expects_capture) in [
-            (crate::ai::code_path::CodePath::MainCompatible, false),
-            (crate::ai::code_path::CodePath::Extended, true),
+    fn factory_relief_starts_capture_on_v4_and_extended_paths() {
+        // 退避先(3,0)が中立都市のとき、拡張経路のほか標準経路のV4も
+        // 退避と同時に占領を始める（F01の経路差ではなく、生産口を空ける一歩が
+        // 中立物件への進入になる場合は手番を無駄にしない）。
+        // V3は対戦評価の基準線なので、従来どおり移動Waitのままにする。
+        use crate::ai::ai_version::AiVersion;
+        for (version, path, expects_capture) in [
+            (
+                AiVersion::V4,
+                crate::ai::code_path::CodePath::MainCompatible,
+                true,
+            ),
+            (
+                AiVersion::V4,
+                crate::ai::code_path::CodePath::Extended,
+                true,
+            ),
+            (
+                AiVersion::V3,
+                crate::ai::code_path::CodePath::MainCompatible,
+                false,
+            ),
         ] {
             let _guard = crate::ai::code_path::enter(path);
             let (mut world, player, attacker) = stalled_attack_world(true);
+            world.insert_resource({
+                let mut settings = crate::ai::ai_version::PlayerAiSettings::new();
+                settings.set_version(player, version);
+                settings.set_version(PlayerId(2), version);
+                settings
+            });
             let (entity, command) =
                 decide_forming_campaign_site_relief(&mut world, player, &HashSet::default(), true)
                     .expect("停滞したAttack unitは工場を退避する");
@@ -440,7 +462,7 @@ mod tests {
             } else {
                 matches!(command, AiCommand::Wait { target_pos: pos } if pos == target_pos)
             };
-            assert!(is_expected, "{path:?}: {command:?}");
+            assert!(is_expected, "{version:?}/{path:?}: {command:?}");
         }
     }
 
