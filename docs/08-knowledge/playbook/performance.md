@@ -1,12 +1,12 @@
 ---
 title: "PLAYBOOK - Performance"
 category: "performance"
-version: "1.1.0"
+version: "1.2.0"
 status: "approved"
 created: "2026-08-15"
-updated: "2026-10-25"
+updated: "2026-11-08"
 owner: "@t_kak"
-ace_entry_count: 10
+ace_entry_count: 11
 tags: [ace, playbook, performance]
 references:
   - docs/08-knowledge/PLAYBOOK.md
@@ -213,3 +213,22 @@ references:
 **Context**: PR #105 の島嶼作戦（`island_campaign.rs`）において、海を挟んだ島嶼戦で輸送部隊が増加すると全探索の組み合わせ爆発によりAI思考が停止していた。これを増加路法による容量付き二部マッチングへリファクタリングし、高速化を達成した。またレビューにおいてスロット割り当て時の `assigned_counts` 更新漏れが指摘・修正された。
 
 **Action**: 多ユニット×多タスクの容量制約付きアサイン問題では、指数バックトラッキングを避け、増加路法（Augmenting Path）を用いた二部マッチングアルゴリズムを採用する。その際、ノード選択時に輸送ユニット側の割当済みスロットカウンタが確実にインクリメントされる状態追跡をテストで保証する。
+
+<a id="ace-108-2"></a>
+
+### ACE-108-2: Bevy ECS 不変参照（&World）下での複数エンティティ走査の単一イテレーション集約とアロケーション排除
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | performance |
+| Origin     | PR #108 |
+| Date       | 2026-11-08 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: Bevy ECS（0.15等）において `World::query` / `query_filtered` は内部キャッシュ初期化のために `&mut World` を要求するため、読み取り専用の戦術評価（`&World`）では利用できない。このような不変借用の制約下では、無理にシグネチャを可変に変更して借用衝突を引き起こすのではなく、複数回に分散していた `world.iter_entities()` を1回の走査に統合し、必要な複数種別のエンティティや値を `HashSet` やタプル等で同時に抽出・集約することで、O(N) 走査回数削減と中間メモリ割り当ての排除を達成する。
+
+**Context**: PR #108 のコードレビューにおいて、`assault_decision.rs`, `route_operations.rs`, `assault_probe.rs` 等で `world.iter_entities()` が4回連続でループされたり、プロパティごとにネストされて O(N^2) となる箇所が指摘された。レビューアからは `world.query` への置換が提案されたが、ドメイン関数のシグネチャが `&World`（不変参照）であり他リソースとの借用競合を防ぐため `&mut World` に変更できない制約があった。そこで4回走査を1回走査へ統合し、中間 `Vec` を排除し、`HashSet` による O(1) 判定へ最適化した（コミット `a1b6ce7`）。
+
+**Action**: `&World` 不変参照下で ECS クエリが `&mut World` を要求して使えない読み取り専用システムでは、シグネチャを不用意に変えて借用競合を起こすのではなく、複数の `world.iter_entities()` を単一ループに統合して必要なコンポーネントを一度に走査・分類するパターンを適用する。

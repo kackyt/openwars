@@ -1,11 +1,11 @@
 ---
 title: "PLAYBOOK"
-version: "1.22.0"
+version: "1.23.0"
 status: "approved"
 created: "2026-06-06"
-updated: "2026-10-25"
+updated: "2026-11-08"
 owner: "@t_kak"
-ace_entry_count: 50
+ace_entry_count: 53
 tags: [ace, playbook, knowledge-management]
 references:
   - docs/ACE_FRAMEWORK.md
@@ -164,10 +164,10 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 
 | カテゴリ | サブファイル | エントリ数 | 主な内容 |
 | -------- | ------------ | ---------- | -------- |
-| `architecture` | [Architecture](./playbook/architecture.md) | 25 件 | 設計判断、構造上の決定事項、状態管理 |
-| `performance` | [Performance](./playbook/performance.md) | 10 件 | パフォーマンス最適化、キャッシュ、計算量削減 |
+| `architecture` | [Architecture](./playbook/architecture.md) | 26 件 | 設計判断、構造上の決定事項、状態管理 |
+| `performance` | [Performance](./playbook/performance.md) | 11 件 | パフォーマンス最適化、キャッシュ、計算量削減 |
 | `coding` | [Coding](./playbook/coding.md) | 5 件 | コーディングパターン、言語固有・型安全のベストプラクティス |
-| `testing` | [Testing](./playbook/testing.md) | 5 件 | テスト戦略、テストパターン、モック・シミュレーション設計 |
+| `testing` | [Testing](./playbook/testing.md) | 6 件 | テスト戦略、テストパターン、モック・シミュレーション設計 |
 | `tooling` | [Tooling](./playbook/tooling.md) | 4 件 | ツール設定、ログ出力・可視化、開発環境・スキル |
 | `security` | [Security](./playbook/security.md) | 0 件 | セキュリティ対策、脆弱性防止、入力検証 |
 | `devops` | [Devops](./playbook/devops.md) | 0 件 | CI/CD、デプロイ、ビルドパイプライン |
@@ -229,10 +229,20 @@ Playbook が 800 行を超えた場合、以下のように分割する：
 | [ACE-104-2](./playbook/testing.md#ace-104-2) | イベントログ精査による直感的仮説の反証とボトルネック特定 | `testing` | PR #104 | `active` | [詳細](./playbook/testing.md#ace-104-2) |
 | [ACE-105-1](./playbook/performance.md#ace-105-1) | 輸送ユニット割当における指数全探索から増加路法二部マッチングへの置換とスロット更新 | `performance` | PR #105 | `active` | [詳細](./playbook/performance.md#ace-105-1) |
 | [ACE-105-2](./playbook/architecture.md#ace-105-2) | 待機・編成中（Forming）ユニットに対する足元拠点占領ガードによる作戦フェーズ停止の防止 | `architecture` | PR #105 | `active` | [詳細](./playbook/architecture.md#ace-105-2) |
+| [ACE-108-1](./playbook/testing.md#ace-108-1) | 対局ログの特定局面からの分岐シミュレーション（Branch Sim）による局所AI判断の高速A/B検証 | `testing` | PR #108 | `active` | [詳細](./playbook/testing.md#ace-108-1) |
+| [ACE-108-2](./playbook/performance.md#ace-108-2) | Bevy ECS 不変参照（&World）下での複数エンティティ走査の単一イテレーション集約とアロケーション排除 | `performance` | PR #108 | `active` | [詳細](./playbook/performance.md#ace-108-2) |
+| [ACE-108-3](./playbook/architecture.md#ace-108-3) | 隘路・狭隘地形における実経路コストと前線攻撃枠数に基づく兵力生産制約 | `architecture` | PR #108 | `active` | [詳細](./playbook/architecture.md#ace-108-3) |
 
 ---
 
 ## Changelog
+
+### [1.23.0] - 2026-11-08
+
+#### 追加
+
+- PR #108 より知見抽出: ACE-108-1 (testing), ACE-108-2 (performance), ACE-108-3 (architecture)
+- カウンター更新: ACE-104-2 (testing) helpful+1, ACE-81-2 (architecture) helpful+1
 
 ### [1.22.0] - 2026-10-25
 

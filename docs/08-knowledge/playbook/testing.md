@@ -1,12 +1,12 @@
 ---
 title: "PLAYBOOK - Testing"
 category: "testing"
-version: "1.1.0"
+version: "1.2.0"
 status: "approved"
 created: "2026-08-15"
-updated: "2026-10-22"
+updated: "2026-11-08"
 owner: "@t_kak"
-ace_entry_count: 5
+ace_entry_count: 6
 tags: [ace, playbook, testing]
 references:
   - docs/08-knowledge/PLAYBOOK.md
@@ -109,7 +109,7 @@ references:
 | Category   | testing |
 | Origin     | PR #104 |
 | Date       | 2026-10-22 |
-| Helpful    | 0 |
+| Helpful    | 1 |
 | Harmful    | 0 |
 | Status     | active |
 
@@ -118,3 +118,22 @@ references:
 **Context**: PR #104 において、首都攻略で攻撃回数が頭打ちになる原因として「入口の渋滞」「爆撃機の待機」が疑われ、爆撃機優先生産や入口集中攻撃を試したが撃破数は向上せず取り下げられた。その後、`unit_attacked` イベントの追跡により「爆撃機は待機しておらず前線で奮戦・撃墜されていた」「攻撃可能なマスは十分に空いており、原因は敵の生産口からの毎ターン補充と占領の不実行だった」と判明した。
 
 **Action**: AIの行動不良や膠着をデバッグする際は、推測に基づくパラメータ調整や新機能追加に飛びつかず、イベントログやプローブから「何が何回発生しているか」の実測値を抽出して仮説を検証（反証）する。また、効果が実証されない施策は仮説ごと即座に取り下げ、コードベースの肥大化を防ぐ。
+
+<a id="ace-108-1"></a>
+
+### ACE-108-1: 対局ログの特定局面からの分岐シミュレーション（Branch Sim）による局所AI判断の高速A/B検証
+
+| フィールド | 値 |
+| ---------- | --- |
+| Category   | testing |
+| Origin     | PR #108 |
+| Date       | 2026-11-08 |
+| Helpful    | 0 |
+| Harmful    | 0 |
+| Status     | active |
+
+**Insight**: ターン制戦略ゲームのAI評価において、全ターン（50T等）のフル対戦シミュレーションは計算コストが高く、他の乱数・中盤展開ノイズに埋もれやすい。実戦ログ（JSONL）の特定局面からゲーム状態を完全復元し、該当局面からの数手番のみを分岐実行するシミュレーション基盤（Branch Sim）を構築することで、隘路突破や攻勢判断などの局所的な意思決定変化を決定論的かつ数秒でA/B検証できる。
+
+**Context**: PR #108 において、map_20（隘路・橋）でのスタックや砲台輸送連携、攻勢転換の動作を評価・チューニングする際、フル対戦シミュレーションを毎回回すのでは時間と検証サイクルがかかりすぎていた。そこで対局ログの特定ターンから状態を復元し、同一局面から新旧AIの判断を分岐させてA/B比較するシミュレータ（`scripts/run_branch_sim.py`, `scripts/compare_branch_sim.py`, `engine/tests/branch_sim.rs`）を導入し、ピンポイントな回帰テストと挙動検証を実現した。
+
+**Action**: AIの特定フェーズ（接敵、隘路突破、輸送等）の行動改善を行う際は、フルゲームシミュレーションに頼る前に、対局ログから特定手番の状態を再現・分岐実行できる局所シミュレーションテスト（Branch Sim / Scenario Probe）を作成し、高速な検証フィードバックループ（Inner Loop）を確立する。
