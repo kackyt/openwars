@@ -334,15 +334,7 @@ pub(crate) fn is_unit_stranded(
     pos: &GridPosition,
     player_id: PlayerId,
     properties: &[(GridPosition, crate::resources::Terrain, Option<PlayerId>)],
-    enemy_units: &[(
-        GridPosition,
-        crate::resources::UnitType,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    )],
+    enemy_positions: impl IntoIterator<Item = GridPosition>,
 ) -> bool {
     if let Some(island_map) = world.get_resource::<crate::ai::islands::IslandMap>()
         && let Some(my_island) = island_map.get_island_at(pos)
@@ -356,8 +348,8 @@ pub(crate) fn is_unit_stranded(
         }
 
         let mut local_enemies = false;
-        for (e_pos, _, _, _, _, _, _) in enemy_units {
-            if my_island.tiles.contains(e_pos) {
+        for e_pos in enemy_positions {
+            if my_island.tiles.contains(&e_pos) {
                 local_enemies = true;
                 break;
             }

@@ -145,9 +145,28 @@ pub(super) fn evaluate_rolling_plan(
         player_id,
         input.policy,
     );
-    let Some(combat_input) = rolling_input else {
+    let Some(mut combat_input) = rolling_input else {
         return false;
     };
+    if input.policy == ProductionPolicy::Standard
+        && std::env::var("OPENWARS_COMMIT").is_ok()
+        && let Some(previous) = continuation.as_ref()
+    {
+        // 前の手番の計画が、1手番の収入では買えない購入を今手番に予定して資金を
+        // 残していたなら、その購入を今手番に必ず行う。計画を毎手番作り直すと、
+        // 貯めた目的の購入が来手番へ送られ続け、資金が永久に使われないためである。
+        combat_input.committed_purchases = previous
+            .purchases
+            .iter()
+            .copied()
+            .filter(|purchase| {
+                purchase.build_turn == 0 && purchase.cost > combat_input.income_per_turn
+            })
+            .collect();
+    }
+    if input.policy == ProductionPolicy::Standard {
+        super::production_ablation::record(&combat_input, turn, player_id, operation_anchor);
+    }
     let Some(selected) = choose_rolling_plan(
         input,
         &operations[op_index],
@@ -183,6 +202,34 @@ pub(super) fn evaluate_rolling_plan(
         operation_anchor,
         input.policy,
     );
+    if crate::ai::features::prediction_ledger_enabled() {
+        // 当手番の購入だけを、予測した射撃・与被害価値と共に記録する。
+        plan_trace.unit_predictions.retain(|prediction| {
+            prediction.operation_kind != operation_kind || prediction.anchor != operation_anchor
+        });
+        for predicted in
+            rolling_plan::predict_unit_outcomes(&combat_input, &selected.plan.purchases)
+        {
+            if predicted.purchase.build_turn != 0 {
+                continue;
+            }
+            plan_trace.unit_predictions.push(UnitPredictionTrace {
+                plan_id: selected.plan_id,
+                revision: selected.revision,
+                operation_kind,
+                anchor: operation_anchor,
+                unit_type: predicted.purchase.unit_type,
+                facility: predicted.purchase.facility,
+                cost: predicted.purchase.cost,
+                shots: predicted.ledger.shots,
+                dealt_value: predicted.ledger.dealt_value,
+                taken_value: predicted.ledger.taken_value,
+                first_shot_turn: predicted.ledger.first_shot_turn,
+                death_turn: predicted.ledger.death_turn,
+                simulated_turns: predicted.simulated_turns,
+            });
+        }
+    }
     if selected.plan_id.is_none() {
         if input.policy.issues_best_effort() {
             rolling_plans.insert(op_index, selected);
@@ -600,10 +647,13 @@ fn commit_slot_order(
     } = *order;
     let SlotRequest { op_index, .. } = request;
     let rolling_plan = rolling_plans.get(&op_index);
+    // 計画が輸送車の分まで確保した購入額のうち、砲台そのものの実単価だけをここで確保する。
+    // 輸送車は確定直後に実単価で別施設へ買う（下の `allocate_artillery_carriers`）。
+    let carrier_reserve = carrier_surcharge(candidate.unit_type, candidate.cost, input.scan);
     if allocation
         .try_claim(
             candidate.facility,
-            candidate.cost,
+            candidate.cost.saturating_sub(carrier_reserve),
             operation_priority_rank(&operations[op_index], input.policy),
         )
         .is_err()
@@ -630,6 +680,10 @@ fn commit_slot_order(
         contract_registry,
     );
     record_slot_order(input, state, order, deployment);
+    if carrier_reserve > 0 {
+        // 確保した資金が他の枠に使われる前に、今買った砲台へ輸送車を付ける。
+        allocate_artillery_carriers(input, state);
+    }
     true
 }
 fn record_slot_order(
@@ -686,6 +740,11 @@ fn record_slot_order(
             &candidate,
         );
     }
+    // 発注する命令とtraceは実単価で記録する（輸送車の分の上乗せは含めない）。
+    let issued_cost =
+        candidate
+            .cost
+            .saturating_sub(carrier_surcharge(candidate.unit_type, candidate.cost, scan));
     plan_trace.steps.push(ProductionStepTrace {
         operation_kind,
         operation_anchor,
@@ -699,7 +758,7 @@ fn record_slot_order(
         remaining_funds_before,
         decision: ProductionDecision::Produced {
             unit_type: candidate.unit_type,
-            cost: candidate.cost,
+            cost: issued_cost,
             facility: candidate.facility,
         },
     });
@@ -730,7 +789,7 @@ fn record_slot_order(
             unit_type: candidate.unit_type,
         },
         role: effective_slot_kind,
-        cost: candidate.cost,
+        cost: issued_cost,
         purpose,
         deployment,
         capture_intent,
@@ -856,6 +915,12 @@ fn choose_rolling_plan(
     } = *input;
     let operation_kind = operation.kind;
     let operation_anchor = operation.anchor;
+    let selection_trace = super::plan_selection_trace::snapshot(
+        input,
+        operation,
+        combat_input,
+        continuation.as_ref(),
+    );
     // 首都攻略の編成中は、固定購入列が今も実行可能ならその再評価だけを行う。
     // 継続すると分かっている案の全beam searchを先に実行して捨てない。
     // ただし物件制御の前線作戦では毎ターンの動的最新盤面から合同探索を行う。
@@ -876,6 +941,7 @@ fn choose_rolling_plan(
                 .flatten()
         });
     let candidate_plan = reusable_candidate.or_else(|| plan_force_package(combat_input))?;
+    let candidate_order = None;
     let conflicted_facilities = evaluated_continuation
         .as_ref()
         .map(|(previous, evaluated)| {
@@ -892,7 +958,7 @@ fn choose_rolling_plan(
             )
         })
         .unwrap_or_default();
-    let selected = plan_registry.select_for_operation(
+    let selected = plan_registry.select_for_operation_with_comparison(
         player_id,
         turn,
         operation_kind,
@@ -905,6 +971,8 @@ fn choose_rolling_plan(
         candidate_plan,
         combat_input.hard_deadline,
         conflicted_facilities,
+        candidate_order,
     );
+    super::plan_selection_trace::record(selection_trace, &selected, combat_input);
     Some(selected)
 }

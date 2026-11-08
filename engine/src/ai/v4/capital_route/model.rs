@@ -151,7 +151,7 @@ pub(in crate::ai::v4) struct CapitalRouteNodeOperation {
 /// 前後のMilestone座標をそのまま同じ地域へ入れると、map_25のような長い回廊で
 /// 自軍首都・中央戦線・敵首都が一つのAreaになり、後方部隊だけでNodeをDominantと
 /// 誤判定する。拠点をNodeへ対応付ける半径とそろえ、実際の近傍セルだけを扱う。
-pub(in crate::ai::v4) const CAPITAL_ROUTE_REGION_RADIUS: u32 = 3;
+pub(crate) const CAPITAL_ROUTE_REGION_RADIUS: u32 = 3;
 
 #[derive(Resource, Debug, Default)]
 pub(crate) struct CapitalRouteNodeOperationRegistry {

@@ -279,7 +279,13 @@ pub(crate) fn decide_ai_action(
                 || stats.unit_type == crate::resources::UnitType::Mech;
             if is_infantry
                 && !is_combat_ineffective
-                && is_unit_stranded(world, &pos, player_id, &properties, &enemy_units)
+                && is_unit_stranded(
+                    world,
+                    &pos,
+                    player_id,
+                    &properties,
+                    enemy_units.iter().map(|enemy| enemy.0),
+                )
             {
                 let mut min_coast_dist: i32 = 999;
 

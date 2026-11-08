@@ -43,7 +43,22 @@ pub(in crate::ai::v4) fn plan_production_with_registry(
         return (state.commands, state.plan_trace);
     }
     assign_committed_combat(input, &mut state);
+    plan_selection_trace::record_operations(input, &state, plan_registry);
+    let ferries_artillery = input.policy == ProductionPolicy::Standard;
+    if ferries_artillery {
+        // 運ぶ手段の無い既存の砲台へ、作戦枠より先に補給輸送車を付ける。
+        allocate_artillery_carriers(input, &mut state);
+    }
     allocate_operation_slots(input, &mut state, plan_registry, contract_registry);
+    if ferries_artillery {
+        // この手番に計画が買った砲台へ、残額で補給輸送車を付ける。
+        allocate_artillery_carriers(input, &mut state);
+    }
+    if input.policy == ProductionPolicy::Standard
+        && crate::ai::v4::ground_lift::ground_lift_enabled()
+    {
+        allocate_ground_lift_carriers(input, &mut state);
+    }
     let surplus = if input.policy.allocates_surplus() {
         let budget = allocate_immediate_reinforcements(input, &mut state, plan_registry);
         allocate_surplus_mobilization(input, &mut state, &budget);
@@ -161,6 +176,7 @@ fn assign_committed_combat(input: &ProductionInputs<'_>, state: &mut ProductionS
         let Some(unit) = scan
             .my_units
             .iter()
+            .chain(&scan.ferried_units)
             .find(|unit| unit.entity == Some(entity))
         else {
             continue;
@@ -248,6 +264,7 @@ fn finalize_turn_production(
         input.policy.optimizes_facilities(),
     );
 
+    plan_selection_trace::record_orders(input, &commands);
     plan_registry.reconcile_unseen_plans(player_id, turn, &seen_plan_ids);
     let remaining_funds = allocation.remaining_funds();
     plan_trace.leftover_funds = remaining_funds;
@@ -313,12 +330,20 @@ pub(in crate::ai::v4) fn plan_production(
 
 mod slot_allocation;
 use slot_allocation::*;
+mod plan_selection_trace;
+mod production_ablation;
 
 mod immediate_combat;
 use immediate_combat::*;
 
 mod mobilization;
 use mobilization::*;
+
+mod ground_lift_carriers;
+use ground_lift_carriers::*;
+
+mod artillery_carriers;
+use artillery_carriers::*;
 
 fn production_operation_trace(
     op: &Operation,

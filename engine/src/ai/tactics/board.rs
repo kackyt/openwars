@@ -26,6 +26,8 @@ pub(crate) struct TacticalBoard {
     pub(crate) uses_v3_tactics: bool,
     /// 敵の直接攻撃圏で地形防御の効果を位置取りに加えるか（V4）。
     pub(crate) weighs_direct_threat_terrain: bool,
+    /// Squad目標への接近を実経路の残り移動コストで比べるか（V4）。
+    pub(crate) approaches_squad_target_by_path: bool,
     pub(crate) map: Map,
     pub(crate) registry: MasterDataRegistry,
     pub(crate) damage_chart: DamageChart,
@@ -196,6 +198,7 @@ impl TacticalBoard {
         let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
         let uses_v3_tactics = ai_version.uses_v3_tactics();
         let weighs_direct_threat_terrain = ai_version.weighs_direct_threat_terrain();
+        let approaches_squad_target_by_path = ai_version.approaches_squad_target_by_path();
         let map = world.resource::<Map>().clone();
         let registry = world.resource::<MasterDataRegistry>().clone();
         let action_targets = AiTacticalSnapshot::from_world(world, &registry, map.topology);
@@ -215,6 +218,7 @@ impl TacticalBoard {
             player_id,
             uses_v3_tactics,
             weighs_direct_threat_terrain,
+            approaches_squad_target_by_path,
             map,
             registry,
             damage_chart,
@@ -232,7 +236,7 @@ impl TacticalBoard {
         let mut positions = self
             .enemies
             .iter()
-            .map(|(position, ..)| (position.x, position.y))
+            .map(|enemy| (enemy.position.x, enemy.position.y))
             .collect::<Vec<_>>();
         positions.sort_unstable();
         positions
@@ -285,7 +289,7 @@ impl TacticalBoard {
     }
 
     pub(crate) fn enemy_positions(&self) -> impl Iterator<Item = GridPosition> + '_ {
-        self.enemies.iter().map(|(position, ..)| *position)
+        self.enemies.iter().map(|enemy| enemy.position)
     }
 }
 
@@ -305,23 +309,25 @@ fn observe_enemies(
             &Health,
             Option<&crate::components::CargoCapacity>,
             Option<&crate::components::Transporting>,
+            Option<&crate::components::Ammo>,
         )>()
         .iter(world)
-        .filter(|(_, faction, _, health, _, transporting)| {
+        .filter(|(_, faction, _, health, _, transporting, _)| {
             faction.0 != player_id && health.current > 0 && transporting.is_none()
         })
-        .map(|(position, faction, stats, health, cargo, _)| {
-            (
-                *position,
-                stats.unit_type,
-                strategic_target_value(
+        .map(
+            |(position, faction, stats, health, cargo, _, ammo)| EnemyThreatInfo {
+                position: *position,
+                unit_type: stats.unit_type,
+                strategic_value: strategic_target_value(
                     stats, *position, faction.0, cargo, unit_costs, properties, registry,
                 ),
-                health.current,
-                stats.min_range,
-                stats.max_range,
-                stats.max_movement,
-            )
-        })
+                hp: health.current,
+                min_range: stats.min_range,
+                max_range: stats.max_range,
+                max_movement: stats.max_movement,
+                ammo: ammo.map_or((0, 0), |ammo| (ammo.ammo1, ammo.ammo2)),
+            },
+        )
         .collect()
 }

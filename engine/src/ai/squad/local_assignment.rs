@@ -135,6 +135,10 @@ fn assign_secure(
         &capture,
         connectivity,
     );
+    let assigned_capture: HashSet<_> = responsibilities
+        .iter()
+        .flat_map(|responsibility| responsibility.members.iter().copied())
+        .collect();
     scope.assign(
         world,
         manager,
@@ -143,7 +147,14 @@ fn assign_secure(
         responsibilities,
         &[MissionType::Capture],
     );
-    let combat = local_entities(world, assignment, &assignment.combat_entities);
+    let combat = assignment
+        .combat_entities
+        .iter()
+        .chain(assignment.capture_entities.iter())
+        .copied()
+        .filter(|entity| !assigned_capture.contains(entity))
+        .filter(|entity| cargo_is_landed_on_assignment_island(world, assignment, *entity))
+        .collect::<Vec<_>>();
     let combat_responsibilities =
         campaign_combat_responsibilities(world, player_id, assignment, &combat, connectivity);
     scope.assign(
@@ -174,6 +185,10 @@ fn assign_offense(
         &capture,
         connectivity,
     );
+    let assigned_capture: HashSet<_> = capture_responsibilities
+        .iter()
+        .flat_map(|responsibility| responsibility.members.iter().copied())
+        .collect();
     scope.assign(
         world,
         manager,
@@ -187,7 +202,9 @@ fn assign_offense(
     let combat = assignment
         .combat_entities
         .iter()
+        .chain(assignment.capture_entities.iter())
         .copied()
+        .filter(|entity| !assigned_capture.contains(entity))
         .filter(|entity| {
             cargo_is_landed_on_assignment_island(world, assignment, *entity)
                 || entity_can_self_deploy_to_assignment_with_connectivity(

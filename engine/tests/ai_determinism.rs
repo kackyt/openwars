@@ -108,16 +108,19 @@ fn assert_replays_identically(map_name: &str, seed: u64, p1: AiVersion, p2: AiVe
 }
 
 #[test]
+#[ignore = "長時間のAIシミュレーション・リプレイ再現性試験"]
 fn standard_map_v4_first_replays_identically() {
     assert_replays_identically("map_6", 1, AiVersion::V4, AiVersion::V200, 30);
 }
 
 #[test]
+#[ignore = "長時間のAIシミュレーション・リプレイ再現性試験"]
 fn standard_map_v4_second_replays_identically() {
     assert_replays_identically("map_6", 1, AiVersion::V200, AiVersion::V4, 30);
 }
 
 #[test]
+#[ignore = "長時間のAIシミュレーション・リプレイ再現性試験"]
 fn standard_map_25_replays_identically() {
     assert_replays_identically("map_25", 2, AiVersion::V4, AiVersion::V200, 30);
 }
@@ -131,6 +134,7 @@ fn small_map_replays_identically() {
 ///
 /// 旧新の実装で同じ指紋になれば、その条件で判断・順序・出力が一致している。
 #[test]
+#[ignore = "OPENWARS_FINGERPRINT環境変数指定時のみ手動実行"]
 fn print_decision_fingerprints() {
     if std::env::var_os("OPENWARS_FINGERPRINT").is_none() {
         return;

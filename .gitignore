@@ -18,5 +18,15 @@ saves/
 trace_*.jsonl
 scratch/
 
+# シミュレーション・対局分析用の一時ファイル・スクリプト
+/analyze_*.py
+/check_*.py
+/aggregate_*.py
+/compare_*.py
+/battle*.jsonl
+/analysis_*
+/run_eval_*.py
+/split_benchmark_*.py
+
 # ローカルのベンチ・計測成果物（Git管理外）
 .tmp/

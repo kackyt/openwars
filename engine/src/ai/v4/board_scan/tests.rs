@@ -95,6 +95,28 @@ fn readonly_rows_keep_dense_query_order_across_sparse_archetypes() {
 }
 
 #[test]
+fn standard_snapshot_retains_own_capital_position() {
+    let registry = MasterDataRegistry::load().unwrap();
+    let (mut world, _) = crate::setup::initialize_world_from_master_data_with_topology(
+        &registry,
+        "map_20",
+        GridTopology::Hex,
+    )
+    .unwrap();
+    let player = PlayerId(2);
+    let expected = world.iter_entities().find_map(|entity| {
+        let property = entity.get::<Property>()?;
+        (property.terrain == Terrain::Capital && property.owner_id == Some(player))
+            .then(|| *entity.get::<GridPosition>().unwrap())
+    });
+    assert!(expected.is_some());
+    let queries = BoardScanQueries::prepare(&mut world);
+    let scan =
+        BoardScan::collect(&world, player, None, &queries, ProductionPolicy::Standard).unwrap();
+    assert_eq!(scan.capital_position, expected);
+}
+
+#[test]
 fn small_map_snapshot_requires_preparation_and_never_initializes_strategy() {
     let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
     let registry = MasterDataRegistry::load().unwrap();

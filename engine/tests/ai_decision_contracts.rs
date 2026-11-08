@@ -6,6 +6,7 @@
 //! 戦略変更（S）を入れた後も同じ契約で検証できる。
 //!
 //! - 1手番の購入案は同じ施設を二度使わず、合計費用が配分開始時の資金を超えない。
+//! - 購入案の各費用は兵種の実単価と一致する（別の購入の分を上乗せしない）。
 //! - 計画した購入案は、発行直前の検証で取り消されない限り、同じ兵種で生産として適用される。
 //! - 候補なし・計画なしで見送った枠は、実在した要求（要求量>0）に対する判断として記録される。
 //! - 発行直前の検証で取り消した購入案は、通常の対局では発生しない。
@@ -123,6 +124,16 @@ fn check_turn_contracts(world: &World, observation: &TurnObservation) -> Vec<Str
             | ProductionDecision::Deferred { .. }
             | ProductionDecision::Reserved { .. } => continue,
         };
+        // 発注する購入額は兵種の実単価でなければならない。砲台と輸送車の組の値段のように、
+        // 別の購入の分を上乗せした額を命令へ載せると、合計が二重に数えられる。
+        if let Some(stats) = world.resource::<UnitRegistry>().0.get(&unit_type)
+            && stats.cost != cost
+        {
+            violations.push(format!(
+                "{context}: {unit_type:?} の購入額 {cost} が実単価 {} と異なる",
+                stats.cost
+            ));
+        }
         if !facilities.insert(facility) {
             violations.push(format!(
                 "{context}: 施設 ({},{}) を同じ手番で二度使う購入案",

@@ -51,7 +51,7 @@ pub(super) fn planned_counter_damage(
 
 /// 現在射程内ならその距離、射程外なら接近時に最初に使える最長射程を選ぶ。
 /// 最短射程の内側にいる間接砲だけは、離脱後に使える最短距離を選ぶ。
-fn preferred_attack_distance(
+pub(super) fn preferred_attack_distance(
     master_data: &MasterDataRegistry,
     damage_chart: &DamageChart,
     attacker: &UnitStats,

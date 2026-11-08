@@ -443,6 +443,9 @@ pub(crate) fn issued(world: &mut World, entity: Entity, command: &AiCommand) {
     value["origin"] = json!(origin.map(|pos| [pos.x, pos.y]));
     value["requested_position"] = json!([target_pos.x, target_pos.y]);
     value["intended_move"] = json!(origin.is_some_and(|pos| pos != *target_pos));
+    if std::env::var_os("OPENWARS_WAIT_PROBE_PRINT").is_some() {
+        eprintln!("WAITPROBE {value}");
+    }
     p.issued = Some(value);
 }
 
@@ -499,6 +502,11 @@ pub(crate) fn unit_context(
         "mission":squad.map(|s|format!("{:?}",s.plan.mission_type)),"phase":squad.map(|s|format!("{:?}",s.plan.phase)),
         "departure_authorized":campaign.map(|c|c.departure_authorized),
         "squad_target":squad_target.map(|p|[p.x,p.y]),"campaign_target":campaign.and_then(|c|c.target).map(|p|[p.x,p.y]),
+        // 判断時点の敵間接砲を保存する。ターン末盤面とはHP・残弾が異なるため、予実照合に使う。
+        "enemy_indirect_fire": board.enemies.iter().filter(|enemy| enemy.min_range > 1).map(|enemy| json!({
+            "position":[enemy.position.x, enemy.position.y], "unit_type":enemy.unit_type.as_str(), "hp":enemy.hp,
+            "min_range":enemy.min_range, "max_range":enemy.max_range, "ammo":[enemy.ammo.0, enemy.ammo.1]
+        })).collect::<Vec<_>>(),
         "squad_goal":squad_target.map(|p|goal_facts(world,board,p)),
         "campaign_goal":campaign.and_then(|c|c.target).map(|p|goal_facts(world,board,p))})
 }

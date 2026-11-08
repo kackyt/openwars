@@ -5,6 +5,10 @@ description: >-
   Use this agent to run Gate 0 (cargo test) and Gate 1 (short action trace on key seed) for fast fail-fast screening.
 claudecode:
   model: haiku
+antigravity-ide:
+  model: flash
+antigravity-cli:
+  model: flash
 ---
 
 あなたの役割は、仮説に基づき修正されたコードに対して Gate 0（単体・局面テスト）と Gate 1（代表seedの短縮トレース）を実行し、**「狙った行動変化が起きているか」** を高速に検証・判定（Fail-Fast）することです。

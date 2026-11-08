@@ -26,3 +26,4 @@ wasm-bindgen-futures = "0.4.42"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1.10"
+

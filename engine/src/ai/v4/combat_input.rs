@@ -24,6 +24,10 @@ struct CombatInputs<'a> {
 /// 構築途中の入力。対象・既存戦力・購入候補をこの順で確定する。
 struct CombatDraft {
     enemies: Vec<EnemyPlanUnit>,
+    /// 標準経路のCaptureで、占領した拠点を保持できたかを判定する手番。
+    hold_window: Option<u32>,
+    /// `enemies` と同じ添字で、保持期限までに作戦地点へ届く敵か。
+    hold_contestants: Vec<bool>,
     hard_deadline: Option<u32>,
     capture_completion_turn: Option<u32>,
     required_capture_survivors: usize,
@@ -81,12 +85,63 @@ fn collect_combat_targets(input: &CombatInputs<'_>, ctx: &mut ReachCtx) -> Optio
         ProductionPolicy::Standard => enemies.extend(op.unavoidable_reinforcements.iter().cloned()),
         _ => {}
     }
+    let hold_window = (input.policy == ProductionPolicy::Standard
+        && matches!(op.kind, OperationKind::Capture | OperationKind::Defense))
+    .then(|| capture_hold_window(op, capture_completion_turn));
+    if hold_window.is_some() && std::env::var("OPENWARS_THEATRE").is_ok() {
+        // 実験: 同じ陸塊の残りの敵も計画へ加える。保持の判定には使わず、保持できる案の
+        // 中で戦域全体をどれだけ削れるかを比べるのに使う。
+        let island_map = crate::ai::islands::IslandMap::analyze(&scan.map);
+        let anchor_island = island_map.get_island_at(&op.anchor).map(|island| island.id);
+        let known = enemies
+            .iter()
+            .filter_map(|enemy| enemy.entity)
+            .collect::<HashSet<_>>();
+        for unit in &scan.enemy_units {
+            if unit.entity.is_some_and(|entity| known.contains(&entity))
+                || island_map.get_island_at(&unit.pos).map(|island| island.id) != anchor_island
+            {
+                continue;
+            }
+            let terrain = scan
+                .map
+                .get_terrain(unit.pos.x, unit.pos.y)
+                .unwrap_or(Terrain::Plains);
+            enemies.push(EnemyPlanUnit {
+                entity: unit.entity,
+                stats: unit.stats.clone(),
+                position: unit.pos,
+                hp: unit.hp,
+                defense_bonus: scan.master_data.get_terrain_defense_bonus(terrain),
+                available_turn: 0,
+            });
+        }
+    }
+    // 標準経路のCaptureは「到達できる敵の全滅」ではなく「取って保持する」作戦である。
+    // 占領完了から保持期間までに作戦地点へ届く敵だけを、保持の判定に使う相手にする。
+    // 届かない敵も計画からは外さない。保持できる案の中で、前線全体をどれだけ削れるかを
+    // 比べるのに使い、局地の最小限の購入で残りの資金を遊ばせない。
+    let hold_contestants = hold_window.map_or_else(Vec::new, |window| {
+        enemies
+            .iter()
+            .map(|enemy| {
+                enemy.available_turn.saturating_add(eta_turns(
+                    &scan.map,
+                    &enemy.position,
+                    &op.anchor,
+                    enemy.stats.max_movement,
+                )) <= window
+            })
+            .collect()
+    });
     if enemies.is_empty() {
         return None;
     }
 
     Some(CombatDraft {
         enemies,
+        hold_window,
+        hold_contestants,
         hard_deadline,
         capture_completion_turn,
         required_capture_survivors,
@@ -110,7 +165,7 @@ fn collect_existing_force(input: &CombatInputs<'_>, ctx: &mut ReachCtx, draft: &
     let capture_completion_turn = draft.capture_completion_turn;
     let required_capture_survivors = draft.required_capture_survivors;
     let mut existing_units = Vec::new();
-    for unit in &scan.my_units {
+    for unit in scan.my_units.iter().chain(&scan.ferried_units) {
         if input.policy == ProductionPolicy::Standard && unit.stats.max_cargo > 0 {
             continue;
         }
@@ -139,7 +194,7 @@ fn collect_existing_force(input: &CombatInputs<'_>, ctx: &mut ReachCtx, draft: &
                         &scan.master_data,
                         (unit.pos.x, unit.pos.y),
                         (enemy.position.x, enemy.position.y),
-                        unit.stats.movement_type,
+                        engagement_movement(input, &unit.stats),
                         unit.stats.max_range,
                     ))
                 .then_some(index)
@@ -220,6 +275,15 @@ fn collect_production_options(
         &scan.master_data,
         planning_horizon,
         |facility, stats| {
+            // 計画内のどの敵にも損害を与えられない兵種（地上敵しかいない盤面の対空戦車等）は、
+            // 作戦地点へ合流できても戦闘に寄与せず、敵の攻撃を吸うだけの駒になる。
+            if stats.max_cargo == 0
+                && !enemies.iter().any(|enemy| {
+                    best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type) > 0
+                })
+            {
+                return false;
+            }
             let can_engage = enemies.iter().any(|enemy| {
                 best_damage(&scan.damage_chart, stats.unit_type, enemy.stats.unit_type) > 0
                     && ctx.can_reach_engagement_envelope(
@@ -227,7 +291,7 @@ fn collect_production_options(
                         &scan.master_data,
                         (facility.x, facility.y),
                         (enemy.position.x, enemy.position.y),
-                        stats.movement_type,
+                        engagement_movement(input, stats),
                         stats.max_range,
                     )
             });
@@ -250,6 +314,25 @@ fn collect_production_options(
     options.retain(|option| {
         option.purchase.build_turn > 0 || !used_facilities.contains(&option.purchase.facility)
     });
+    // 当手番（build_turn == 0）の購入案は、作戦の利用可能資金以下のものに絞る。
+    options.retain(|option| {
+        option.purchase.build_turn > 0 || option.purchase.cost <= input.remaining_funds
+    });
+    // 運ぶ砲台は補給輸送車と組で使うので、計画は組の値段で評価して資金も組の分だけ確保する。
+    // 補給輸送車は生産の段で、同じ手番に砲台の隣の施設へ確保した資金で買う。
+    if input.policy == ProductionPolicy::Standard
+        && let Some((_, carrier)) = scan
+            .available_types
+            .iter()
+            .find(|(_, stats)| crate::ai::v4::artillery_ferry::is_artillery_carrier(stats))
+    {
+        for option in options
+            .iter_mut()
+            .filter(|option| crate::ai::v4::artillery_ferry::is_ferried_gun(&option.stats))
+        {
+            option.purchase.cost = option.stats.cost.saturating_add(carrier.cost);
+        }
+    }
     for option in &mut options {
         option.engageable_enemy_indices = enemies
             .iter()
@@ -270,7 +353,7 @@ fn collect_production_options(
                         &scan.master_data,
                         (option.purchase.facility.x, option.purchase.facility.y),
                         (enemy.position.x, enemy.position.y),
-                        option.stats.movement_type,
+                        engagement_movement(input, &option.stats),
                         option.stats.max_range,
                     ))
                 .then_some(index)
@@ -301,6 +384,8 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
     } = *input;
     let CombatDraft {
         enemies,
+        hold_window,
+        hold_contestants,
         hard_deadline,
         capture_completion_turn,
         required_capture_survivors,
@@ -311,6 +396,15 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
     } = draft;
     let (deadline_target_index, interdiction_deadlines, hard_deadline) =
         combat_interdiction_contracts(input, &enemies, hard_deadline);
+    // 戦力節約で守る進軍路なら、そこへ使ってよい生産額。
+    let economy_budget = (op.kind == OperationKind::Defense)
+        .then(|| {
+            scan.economy_anchors
+                .iter()
+                .find(|(anchor, _)| *anchor == op.anchor)
+                .map(|(_, budget)| *budget)
+        })
+        .flatten();
     Some(RollingPlanInput {
         map: scan.map.clone(),
         master_data: scan.master_data.clone(),
@@ -333,11 +427,33 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
         production_attack_projections,
         deadline_target_index,
         interdiction_deadlines,
-        current_funds: remaining_funds,
+        // 戦力節約の守りは、評価で割り振った互角分までしか使わない。
+        current_funds: economy_budget.map_or(remaining_funds, |budget| remaining_funds.min(budget)),
         income_per_turn: scan.my_income,
         hard_deadline,
         capture_completion_turn,
         required_capture_survivors,
+        hold_window,
+        hold_contestants,
+        committed_purchases: Vec::new(),
+        artillery_carrier: (input.policy == ProductionPolicy::Standard)
+            .then(|| {
+                scan.available_types
+                    .iter()
+                    .find(|(_, stats)| crate::ai::v4::artillery_ferry::is_artillery_carrier(stats))
+                    .map(|(_, stats)| stats.clone())
+            })
+            .flatten(),
+        spare_artillery_carriers: spare_artillery_carriers(scan),
+        carrier_facilities_now: carrier_facilities(scan, &scan.free_facilities)
+            .filter(|facility| !input.used_facilities.contains(facility))
+            .collect(),
+        carrier_facilities_later: carrier_facilities(scan, &scan.production_facilities).collect(),
+        owned_cities: scan.owned_cities.clone(),
+        positional: input.policy == ProductionPolicy::Standard,
+        deploy_anchor: Some(op.anchor),
+        defensive_emplacement: op.kind == OperationKind::Defense,
+        economy_of_force: economy_budget.is_some(),
         delay_cost_per_turn: op.facts.target_property_count.max(1).saturating_mul(1_000),
         search_beam_width: if op.kind == OperationKind::Capture {
             32
@@ -353,6 +469,76 @@ fn finish_combat_input(input: &CombatInputs<'_>, draft: CombatDraft) -> Option<R
         exact_property_control: input.policy.uses_joint_capture()
             && !op.property_controls.is_empty(),
     })
+}
+
+/// 補給輸送車を生産できる施設。
+fn carrier_facilities<'a>(
+    scan: &'a BoardScan,
+    facilities: &'a [(GridPosition, Terrain)],
+) -> impl Iterator<Item = GridPosition> + 'a {
+    let carrier = scan
+        .available_types
+        .iter()
+        .find(|(_, stats)| crate::ai::v4::artillery_ferry::is_artillery_carrier(stats))
+        .map(|(unit_type, _)| *unit_type);
+    facilities
+        .iter()
+        .filter(move |(_, terrain)| {
+            carrier.is_some_and(|carrier| scan.can_produce(*terrain, carrier))
+        })
+        .map(|(position, _)| *position)
+}
+
+/// 砲台を積んでいない既存の補給輸送車の数。実際の輸送車の追加生産
+/// （`production_pipeline::artillery_carriers`）と同じく、盤上の砲台と満載の輸送車の数を
+/// 輸送車の総数から引く。これを超えて買う砲台には、新しい輸送車と施設が要る。
+fn spare_artillery_carriers(scan: &BoardScan) -> usize {
+    let carriers = scan
+        .my_units
+        .iter()
+        .filter(|unit| crate::ai::v4::artillery_ferry::is_artillery_carrier(&unit.stats))
+        .collect::<Vec<_>>();
+    let guns = scan
+        .my_units
+        .iter()
+        .filter(|unit| crate::ai::v4::artillery_ferry::is_ferried_gun(&unit.stats))
+        .count();
+    let loaded = carriers
+        .iter()
+        .filter(|carrier| carrier.free_cargo == 0)
+        .count();
+    carriers.len().saturating_sub(guns + loaded)
+}
+
+/// 交戦できるかを測る移動タイプ。自力でほとんど動けない砲台は、運ぶ輸送部隊の足で測る。
+fn engagement_movement(input: &CombatInputs<'_>, stats: &UnitStats) -> MovementType {
+    if input.policy == ProductionPolicy::Standard
+        && crate::ai::v4::artillery_ferry::is_ferried_gun(stats)
+        && let Some((_, carrier)) = input
+            .scan
+            .available_types
+            .iter()
+            .find(|(_, carrier)| crate::ai::v4::artillery_ferry::is_artillery_carrier(carrier))
+    {
+        return carrier.movement_type;
+    }
+    stats.movement_type
+}
+
+/// 占領した拠点を敵の奪回から守り切れたかを判定する、占領完了後の手番数。
+const CAPTURE_HOLD_TURNS: u32 = 2;
+
+/// 標準経路のCaptureで保持を判定する手番。占領完了の予測が無ければ、
+/// 前線への展開と占領にかかる手番から見積もる。
+fn capture_hold_window(op: &Operation, capture_completion_turn: Option<u32>) -> u32 {
+    capture_completion_turn
+        .unwrap_or_else(|| {
+            op.facts
+                .deploy_lead_time
+                .saturating_add(CAPTURE_COMPLETION_TURNS)
+        })
+        .saturating_add(CAPTURE_HOLD_TURNS)
+        .clamp(1, DEFAULT_SEARCH_TURNS)
 }
 
 fn standard_protected_units(

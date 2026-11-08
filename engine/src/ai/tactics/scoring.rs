@@ -4,7 +4,9 @@
 //! 占領を10000点、撃破を5000点などの目安で加減する。行動の優先度（[`ActionPriority`]）は
 //! scoreより先に比べる別軸である。
 
-use super::approach::{ApproachDistances, approach_bonus, manhattan, nearest_approach_bonus};
+use super::approach::{
+    ApproachDistances, approach_bonus, manhattan, nearest_approach_bonus, path_approach_bonus,
+};
 use super::board::TacticalBoard;
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -106,21 +108,34 @@ pub(crate) fn v3_positioning_score(
     defense_bonus: u32,
 ) -> i32 {
     let stats = &unit.stats;
+    v3_positioning_score_accepting_exposure(board, unit, position, defense_bonus)
+        - crate::ai::threat::exposure_penalty(
+            &board.map,
+            (position.x, position.y),
+            stats.unit_type,
+            stats.cost,
+            unit.hp,
+            stats.min_range,
+            defense_bonus,
+            &board.enemies,
+            &board.damage_chart,
+            &board.registry,
+        )
+}
+
+/// [`v3_positioning_score`] から敵の脅威圏への露出の減点（#50）を除いたもの。
+/// 攻勢中（GO）の直接攻撃unitが、被弾を受け入れて前進するときに使う。
+pub(crate) fn v3_positioning_score_accepting_exposure(
+    board: &TacticalBoard,
+    unit: &UnitState,
+    position: GridPosition,
+    defense_bonus: u32,
+) -> i32 {
+    let stats = &unit.stats;
     let mut score = 0;
     if unit.hp < 70 && unit.threat_nearby {
         score += defense_bonus as i32 * (100 - unit.hp as i32) * 2;
     }
-    score -= crate::ai::threat::exposure_penalty(
-        &board.map,
-        (position.x, position.y),
-        stats.unit_type,
-        stats.cost,
-        unit.hp,
-        stats.min_range,
-        defense_bonus,
-        &board.enemies,
-        &board.damage_chart,
-    );
     if stats.min_range > 1 && !unit.combat_ineffective && !board.enemies.is_empty() {
         let nearest_enemy = board
             .enemy_positions()
@@ -167,6 +182,7 @@ pub(crate) fn direct_threat_terrain_score(
         defense_bonus,
         &board.enemies,
         &board.damage_chart,
+        &board.registry,
     )
     .min(DIRECT_THREAT_TERRAIN_CAP)
 }
@@ -181,6 +197,18 @@ pub(crate) fn squad_target_approach_score(
     let stats = &unit.stats;
     let turns = distances.turns(stats, position, target, stats.max_range);
     approach_bonus(turns.turns, manhattan(position, target), stats.max_movement)
+}
+
+/// Squad目標への実経路での接近（V4）。射程に捉えるまでの経路の残り移動コストで比べる。
+pub(crate) fn squad_target_path_approach_score(
+    unit: &UnitState,
+    position: GridPosition,
+    target: GridPosition,
+    distances: &mut ApproachDistances,
+) -> i32 {
+    let stats = &unit.stats;
+    let turns = distances.turns(stats, position, target, stats.max_range);
+    path_approach_bonus(turns, manhattan(position, target), stats.max_movement)
 }
 
 /// campaignの非占領unitにとってのSquad目標は、全員が重なる駐留マスではなく、
@@ -253,7 +281,7 @@ pub(crate) fn stranded_infantry_score(
             &unit.position,
             board.player_id,
             &board.properties,
-            &board.enemies,
+            board.enemies.iter().map(|enemy| enemy.position),
         )
     {
         return 0;
@@ -333,41 +361,46 @@ fn solo_hunt_score(
     let mut best_target_turns: i32 = 999;
     let mut best_target_position = None;
     let mut max_potential = -1.0;
-    for (enemy_position, enemy_type, enemy_value, enemy_hp, ..) in &board.enemies {
+    for enemy in &board.enemies {
+        let enemy_position = enemy.position;
+        let enemy_type = enemy.unit_type;
+        let enemy_value = enemy.strategic_value;
+        let enemy_hp = enemy.hp;
         let turns = distances
-            .turns(stats, position, *enemy_position, stats.max_range)
+            .turns(stats, position, enemy_position, stats.max_range)
             .turns
-            + ship_blocked_penalty(board, unit, *enemy_position);
+            + ship_blocked_penalty(board, unit, enemy_position);
         let base_damage = board
             .damage_chart
-            .get_base_damage(stats.unit_type, *enemy_type)
+            .get_base_damage(stats.unit_type, enemy_type)
             .or_else(|| {
                 board
                     .damage_chart
-                    .get_base_damage_secondary(stats.unit_type, *enemy_type)
+                    .get_base_damage_secondary(stats.unit_type, enemy_type)
             })
             .unwrap_or(0);
         let potential =
-            base_damage as f32 * (*enemy_value as f32 / 100.0) * (2.0 - *enemy_hp as f32 / 100.0);
+            base_damage as f32 * (enemy_value as f32 / 100.0) * (2.0 - enemy_hp as f32 / 100.0);
         if potential > max_potential {
             max_potential = potential;
             best_target_turns = turns as i32;
-            best_target_position = Some(*enemy_position);
+            best_target_position = Some(enemy_position);
         } else if (potential - max_potential).abs() < 0.1 && (turns as i32) < best_target_turns {
             best_target_turns = turns as i32;
-            best_target_position = Some(*enemy_position);
+            best_target_position = Some(enemy_position);
         }
     }
 
     if max_potential <= 0.0 {
         let mut nearest: Option<(crate::ai::turn_distance::TurnDistance, i32)> = None;
-        for (enemy_position, ..) in &board.enemies {
-            let mut turns = distances.turns(stats, position, *enemy_position, stats.max_range);
-            turns.turns += ship_blocked_penalty(board, unit, *enemy_position);
-            let candidate = (turns, manhattan(position, *enemy_position));
+        for enemy in &board.enemies {
+            let enemy_position = enemy.position;
+            let mut turns = distances.turns(stats, position, enemy_position, stats.max_range);
+            turns.turns += ship_blocked_penalty(board, unit, enemy_position);
+            let candidate = (turns, manhattan(position, enemy_position));
             if nearest.is_none_or(|current| candidate < current) {
                 nearest = Some(candidate);
-                best_target_position = Some(*enemy_position);
+                best_target_position = Some(enemy_position);
             }
         }
         if nearest.is_none_or(|(turns, _)| turns.turns >= 99) {
@@ -635,6 +668,10 @@ pub(crate) enum ActionPriority {
     FavorableLocalTarget,
     /// 作戦対象そのものとの相性もよい攻撃。
     FavorableStrategicTarget,
+    /// GO中の突破対象・敵砲への直接攻撃。通常の局地戦より優先する。
+    AssaultStrike,
+    /// 共有した突破対象への支援射撃。直接部隊より先に敵を削り、進出路を開く。
+    AssaultSupportFire,
     /// 敵の有効な生産可能マスを占位し、敵の戦力補充を物理的に遮断する行動。
     /// 自軍の生産口を開けるProductionSiteReliefの攻勢的鏡像であり、
     /// 敵の補充速度を物理的に削ぐことで全滅勝利を確定させる。

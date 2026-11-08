@@ -16,12 +16,14 @@ use crate::ai::v4::board_scan::BoardScan;
 use crate::ai::v4::property_control::PlannedCaptureUnit;
 use crate::ai::v4::property_control::PropertyControlObjective;
 
+pub(crate) mod artillery_ferry;
 pub mod campaign_execution;
 mod candidate;
 mod combat_input;
 mod combat_profile;
 pub mod deployment;
 pub(crate) mod forming_capture;
+pub(crate) mod ground_lift;
 pub mod logistics_plan;
 pub(crate) mod maritime;
 mod mission_input;
@@ -84,7 +86,7 @@ use trace::{
     CampaignTurnForecastTrace, EnemyProductionForecastTrace, ProductionDecision,
     ProductionDemandTrace, ProductionOperationTrace, ProductionPlanTrace, ProductionStepTrace,
     ProductionTraceDiagnostics, ReinforcementContingencyTrace, RollingCombatPlanTrace,
-    RollingPurchaseTrace, RollingTargetTrace, UnfilledSlotTrace,
+    RollingPurchaseTrace, RollingTargetTrace, UnfilledSlotTrace, UnitPredictionTrace,
 };
 
 use candidate::*;

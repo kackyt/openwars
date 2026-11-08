@@ -25,7 +25,9 @@ use crate::ai::runtime::production_queue::issue_production_command;
 use crate::ai::runtime::production_queue::take_next_queued_production_command;
 use crate::ai::runtime::state::AiActionCooldown;
 use crate::ai::runtime::state::AiTurnProgress;
-use crate::ai::tactics::relief::decide_forming_campaign_site_relief;
+use crate::ai::tactics::relief::{
+    decide_early_campaign_site_relief, decide_forming_campaign_site_relief,
+};
 use crate::ai::tactics::small_map::squad_executor::decide_squad_action_v4;
 use crate::ai::tactics::v2::decide_action as decide_ai_action_v2;
 
@@ -100,11 +102,14 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
     crate::ai::wait_probe::stage(world, "early_production_relief");
     // 未完成の島嶼輸送パッケージが生産施設上でFormingすると、不足している次の
     // 輸送役を自分で生産不能にする。任務所属は維持したまま隣接待機地へ一歩だけ退避する。
+    // 運ぶ砲台は燃料1で、工場から1歩どかすと輸送車へ乗れなくなる。隣で待つ補給輸送車も
+    // どかすと乗り込みが遅れる。どちらも退避の対象から外す。
+    let relief_skip = relief_skip_entities(world, &step);
     if step.uses_v3_tactics
-        && let Some((entity, command)) = decide_forming_campaign_site_relief(
+        && let Some((entity, command)) = decide_early_campaign_site_relief(
             world,
             player_id,
-            &step.acted,
+            &relief_skip,
             step.early_relief_includes_active_missions(),
         )
     {
@@ -131,6 +136,24 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
             crate::ai::v4::forming_capture::decide_forming_capture(world, player_id, &step.acted)
     {
         return Some(issue_unit_command(world, entity, command));
+    }
+    // 補給輸送車が砲台を撃てる位置へ運び、撃つ敵が居なくなれば積み直して前へ運ぶ（V4）。
+    if step.is_v4
+        && step.tactics == TurnTactics::Standard
+        && let Some((entity, command)) =
+            crate::ai::v4::artillery_ferry::decide_artillery_ferry(world, player_id, &step.acted)
+    {
+        trace_loaded_carrier_command(world, entity, "ferry", &format!("{command:?}"));
+        return Some(issue_transport_command(world, entity, command));
+    }
+    // 両首都が同じ陸塊の盤面では、装甲車が後方の重歩兵を前線の奥の敵の近くまで運ぶ（V4）。
+    if step.is_v4
+        && step.tactics == TurnTactics::Standard
+        && crate::ai::v4::ground_lift::ground_lift_enabled()
+        && let Some((entity, command)) =
+            crate::ai::v4::ground_lift::decide_ground_lift(world, player_id, &step.acted)
+    {
+        return Some(issue_transport_command(world, entity, command));
     }
     // 揚陸した装甲車は、載せてきた歩兵を拠点の近くへ運んで降ろす（V4）。
     if step.is_v4
@@ -169,12 +192,24 @@ pub(crate) fn execute_turn_step(world: &mut World, player_id: PlayerId) -> Optio
         // 先に通常行動を試した後のfallbackなので、前線へ進めるunitの移動距離は奪わない。
         crate::ai::wait_probe::stage(world, "late_production_relief");
         if let Some((entity, command)) =
-            decide_forming_campaign_site_relief(world, player_id, &step.acted, true)
+            decide_forming_campaign_site_relief(world, player_id, &relief_skip, true)
         {
             return Some(issue_unit_command(world, entity, command));
         }
     }
     issue_production_or_end_turn(world, &step)
+}
+
+/// 生産施設からの退避で動かさないunit。行動済みに加え、運ぶ砲台と補給輸送車を含む。
+fn relief_skip_entities(world: &mut World, step: &TurnStep) -> HashSet<Entity> {
+    let mut skip = step.acted.clone();
+    if step.is_v4 && step.tactics == TurnTactics::Standard {
+        skip.extend(crate::ai::v4::artillery_ferry::own_ferry_units(
+            world,
+            step.player_id,
+        ));
+    }
+    skip
 }
 
 fn has_queued_production(world: &World, step: &TurnStep) -> bool {
@@ -391,6 +426,7 @@ fn mark_acted(world: &mut World, entities: impl IntoIterator<Item = Entity>) {
 /// unit命令を適用して行動済みにし、ログ用の命令文字列を返す。
 fn issue_unit_command(world: &mut World, entity: Entity, command: AiCommand) -> String {
     let command_text = format!("{:?}", command);
+    trace_loaded_carrier_command(world, entity, "unit", &command_text);
 
     execute_ai_command(world, entity, command);
     mark_acted(world, [entity]);
@@ -401,6 +437,7 @@ fn issue_unit_command(world: &mut World, entity: Entity, command: AiCommand) -> 
 /// 両方を記録し、行動済みのcargoを遊兵として数えない。ただしUnload systemは未行動cargoが
 /// 残る間は輸送役を行動完了にしないため、最後のcargoを降ろすまで輸送役は行動済みにしない。
 fn issue_transport_command(world: &mut World, entity: Entity, command: AiCommand) -> String {
+    trace_loaded_carrier_command(world, entity, "transport", &format!("{:?}", command));
     let (dropped_cargo, transport_keeps_dropping) = match &command {
         AiCommand::Drop { cargo_entity, .. } => (
             Some(*cargo_entity),
@@ -508,4 +545,26 @@ fn end_turn(world: &mut World, player_id: PlayerId) {
     if let Some(mut events) = world.get_resource_mut::<Events<crate::events::NextPhaseCommand>>() {
         events.send(crate::events::NextPhaseCommand);
     }
+}
+
+/// 砲台を積んだ輸送部隊への命令を標準エラーへ出す診断（`OPENWARS_FERRY_DROP_DIAG`、既定では無効）。
+/// 「誰が輸送車を動かしたか」を、発行経路（`via`）つきで追うために使う。
+fn trace_loaded_carrier_command(world: &mut World, entity: Entity, via: &str, command: &str) {
+    if std::env::var_os("OPENWARS_FERRY_DROP_DIAG").is_none() {
+        return;
+    }
+    let loaded = world
+        .query::<&crate::components::Transporting>()
+        .iter(world)
+        .any(|transporting| transporting.0 == entity);
+    if !loaded {
+        return;
+    }
+    let turn = world
+        .get_resource::<crate::resources::MatchState>()
+        .map_or(0, |state| state.current_turn_number.0);
+    eprintln!(
+        "CARRIER-CMD T{turn} e={} via={via} cmd={command}",
+        entity.to_bits()
+    );
 }

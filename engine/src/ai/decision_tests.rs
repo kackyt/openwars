@@ -2448,6 +2448,12 @@ mod tests {
 
             // 敵軍: 重自走砲 (射程3-5) at x=9 -> 脅威ゾーンは x in [4,6]
             world.spawn((
+                crate::components::Ammo {
+                    ammo1: 6,
+                    max_ammo1: 6,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
                 Faction(PlayerId(2)),
                 HasMoved(true),
                 ActionCompleted(true),
@@ -2525,6 +2531,12 @@ mod tests {
 
             // 敵軍: 軽戦車 (直接 射程1, 移動4) at x=9 -> 移動+攻撃到達圏は距離5以内 (x>=4)
             world.spawn((
+                crate::components::Ammo {
+                    ammo1: 6,
+                    max_ammo1: 6,
+                    ammo2: 9,
+                    max_ammo2: 9,
+                },
                 Faction(PlayerId(2)),
                 HasMoved(true),
                 ActionCompleted(true),

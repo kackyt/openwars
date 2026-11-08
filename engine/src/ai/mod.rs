@@ -1,4 +1,8 @@
 pub mod ai_version;
+/// 盤面を進めずに前進候補を調べる診断。
+pub mod assault_decision;
+/// 通常AIへ接続しない、局地攻略の実エンジン分岐比較。
+pub mod assault_probe;
 /// main互換実装と拡張実装の経路選択
 pub mod code_path;
 pub mod demand;
@@ -6,6 +10,7 @@ pub(crate) mod deterministic_parallel;
 pub(crate) mod engagement;
 pub mod engine;
 pub mod eval;
+pub mod features;
 /// 遊兵（任務なし・任務があるのに動けないユニット）の計測
 pub mod idle_audit;
 pub mod island_campaign;

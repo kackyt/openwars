@@ -8,6 +8,6 @@
     "build:wasm": "wasm-pack build engine --target web --release --out-dir ../web/src/wasm"
   },
   "devDependencies": {
-    "rulesync": "^14.0.1"
+    "rulesync": "^43.3.0"
   }
 }

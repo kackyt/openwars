@@ -273,23 +273,27 @@ pub(super) fn campaign_assignment_capture_responsibilities(
                 target,
                 members: vec![member],
             });
-        } else if let Some(responsibility) =
-            responsibilities.iter_mut().min_by_key(|responsibility| {
-                (
-                    campaign_member_distance_to_position(
-                        world,
-                        member,
-                        responsibility.target,
-                        connectivity,
+        } else if !spread_over_land_routes || responsibilities.iter().any(|r| r.members.len() < 2) {
+            if let Some(responsibility) = responsibilities
+                .iter_mut()
+                .filter(|r| !spread_over_land_routes || r.members.len() < 2)
+                .min_by_key(|responsibility| {
+                    (
+                        campaign_member_distance_to_position(
+                            world,
+                            member,
+                            responsibility.target,
+                            connectivity,
+                        )
+                        .unwrap_or(usize::MAX),
+                        responsibility.target.y,
+                        responsibility.target.x,
                     )
-                    .unwrap_or(usize::MAX),
-                    responsibility.target.y,
-                    responsibility.target.x,
-                )
-            })
-        {
-            // 未担当施設が尽きてもEntityを無所属へ落とさず、最寄りの既存責務へ増員する。
-            responsibility.members.push(member);
+                })
+            {
+                // 未担当施設が尽きても余裕があれば最寄りの既存責務へ増員する（同一陸地では最大2体まで）。
+                responsibility.members.push(member);
+            }
         }
     }
     responsibilities

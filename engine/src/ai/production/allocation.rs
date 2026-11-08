@@ -93,6 +93,21 @@ impl AllocationState {
         self.facility_owners.insert(facility, owner_rank);
         Ok(())
     }
+
+    /// 確保済みの施設を、資金はそのままで未使用の別施設へ付け替える。
+    pub fn move_claim(
+        &mut self,
+        from: GridPosition,
+        to: GridPosition,
+    ) -> Result<(), ReservationError> {
+        if self.is_facility_used(&to) || !self.used_facilities.remove(&from) {
+            return Err(ReservationError::FacilityConflict);
+        }
+        let owner_rank = self.facility_owners.remove(&from).unwrap_or(0);
+        self.used_facilities.insert(to);
+        self.facility_owners.insert(to, owner_rank);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +129,20 @@ mod tests {
         assert_eq!(state.facility_owner(&pos(1, 1)), Some(4));
         assert_eq!(state.facility_owner(&pos(2, 2)), None);
         assert_eq!(state.free_facility_count(&facilities), 1);
+    }
+
+    #[test]
+    fn move_claim_keeps_funds_and_owner() {
+        let mut state = AllocationState::new(5000);
+        state.try_claim(pos(1, 1), 3000, 2).unwrap();
+        state.try_claim(pos(3, 3), 1000, 1).unwrap();
+        // 使用中の施設や未確保の施設からは付け替えない。
+        assert!(state.move_claim(pos(1, 1), pos(3, 3)).is_err());
+        assert!(state.move_claim(pos(2, 2), pos(4, 4)).is_err());
+        state.move_claim(pos(1, 1), pos(2, 2)).unwrap();
+        assert_eq!(state.remaining_funds(), 1000);
+        assert!(!state.is_facility_used(&pos(1, 1)));
+        assert_eq!(state.facility_owner(&pos(2, 2)), Some(2));
     }
 
     #[test]

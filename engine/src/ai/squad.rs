@@ -2155,31 +2155,67 @@ fn campaign_combat_responsibilities(
 ///
 /// 各memberは自分から最も近い前進先へ向かう（同距離なら `advance_targets` の優先順）。
 /// どの前進先へも到達できないmemberは `remaining` に残す。
-fn campaign_advance_responsibilities(
+pub(super) fn campaign_advance_responsibilities(
     world: &World,
     remaining: &mut Vec<Entity>,
     advance_targets: &[GridPosition],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
-    if advance_targets.is_empty() {
+    campaign_advance_responsibilities_with_limit(
+        world,
+        remaining,
+        advance_targets,
+        connectivity,
+        None,
+    )
+}
+
+/// 目標ごとの受入上限（`max_members_per_target`）を指定可能な前進防御責務の割り当て。
+///
+/// 目標施設に本当に近い部隊を優先して各目標へ配分し、満員になった目標はスキップする。
+/// これにより、後方施設への部隊集中滞留を防ぎ、余剰部隊を前線進軍用として `remaining` に残す。
+pub(super) fn campaign_advance_responsibilities_with_limit(
+    world: &World,
+    remaining: &mut Vec<Entity>,
+    advance_targets: &[GridPosition],
+    connectivity: &mut TerrainConnectivity,
+    max_members_per_target: Option<usize>,
+) -> Vec<CampaignResponsibility> {
+    if advance_targets.is_empty() || remaining.is_empty() {
         return Vec::new();
     }
+    // 各memberと各targetの(距離, target_index, member)ペアを収集し、距離順にソートする。
+    let mut member_target_pairs = Vec::new();
+    for member in remaining.iter().copied() {
+        for (index, target) in advance_targets.iter().enumerate() {
+            if let Some(distance) =
+                campaign_member_distance_to_position(world, member, *target, connectivity)
+            {
+                member_target_pairs.push((distance, index, member));
+            }
+        }
+    }
+    member_target_pairs
+        .sort_by_key(|(distance, index, member)| (*distance, *index, member.to_bits()));
+
     let mut members_by_target: Vec<Vec<Entity>> = vec![Vec::new(); advance_targets.len()];
-    remaining.retain(|member| {
-        let nearest = advance_targets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, target)| {
-                campaign_member_distance_to_position(world, *member, *target, connectivity)
-                    .map(|distance| (distance, index))
-            })
-            .min();
-        let Some((_, index)) = nearest else {
-            return true;
-        };
-        members_by_target[index].push(*member);
-        false
-    });
+    let mut assigned = HashSet::default();
+
+    for (_distance, index, member) in member_target_pairs {
+        if assigned.contains(&member) {
+            continue;
+        }
+        if let Some(limit) = max_members_per_target {
+            if members_by_target[index].len() >= limit {
+                continue;
+            }
+        }
+        members_by_target[index].push(member);
+        assigned.insert(member);
+    }
+
+    remaining.retain(|member| !assigned.contains(member));
+
     advance_targets
         .iter()
         .zip(members_by_target)
@@ -2617,6 +2653,89 @@ fn prepare_campaign_local_assignment_scoped(
         | IslandCampaignDecision::Contest
         | IslandCampaignDecision::Reinforce => {
             let capture = local_entities(&assignment.capture_entities);
+            // 進軍路の配分案（V4）を遂行中なら、各進軍路を要衝と所属部隊を持つ作戦として
+            // 遂行する。占領は要衝の周りと中立の施設に絞り、戦闘部隊と、占領先の無い占領役は
+            // 進軍路作戦へ所属させる（所属は前の手番から引き継ぎ、他の割当へ引き抜かない）。
+            let posture_orders = (crate::ai::resolve_player_ai_version(world, player_id)
+                == crate::ai::ai_version::AiVersion::V4)
+                .then(|| {
+                    objective_allocation::posture_orders(world, player_id, assignment.island_id)
+                })
+                .flatten();
+            if let Some(orders) = &posture_orders {
+                let capture_responsibilities = campaign_assignment_capture_responsibilities(
+                    world,
+                    player_id,
+                    assignment,
+                    &capture,
+                    connectivity,
+                );
+                let (mut capture_responsibilities, released) =
+                    objective_allocation::restrict_captures_to_key_points(
+                        world,
+                        capture_responsibilities,
+                        orders,
+                    );
+                let released = objective_allocation::assign_uncovered_route_captures(
+                    world,
+                    &mut capture_responsibilities,
+                    released,
+                    orders,
+                );
+                let combat = assignment
+                    .combat_entities
+                    .iter()
+                    .copied()
+                    .filter(|entity| {
+                        cargo_is_landed_on_assignment_island(world, assignment, *entity)
+                            || entity_can_self_deploy_to_assignment_with_connectivity(
+                                world,
+                                assignment,
+                                *entity,
+                                connectivity,
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                let units = combat.iter().chain(&released).copied().collect::<Vec<_>>();
+                let plan = route_operations::carry_over(world, manager, orders, &units);
+                let (route_responsibilities, route_members) = route_operations::responsibilities(
+                    world,
+                    player_id,
+                    assignment.island_id,
+                    orders,
+                    plan,
+                    connectivity,
+                );
+                // 占領へ回った占領役も所属から外すため、島の占領役も候補に含める。
+                let candidates = units.iter().chain(&capture).copied().collect::<Vec<_>>();
+                route_operations::record_membership(
+                    world,
+                    manager,
+                    orders,
+                    &candidates,
+                    &route_members,
+                );
+                scope.assign(
+                    world,
+                    manager,
+                    player_id,
+                    assignment.island_id,
+                    capture_responsibilities,
+                    &[MissionType::Capture],
+                );
+                scope.assign(
+                    world,
+                    manager,
+                    player_id,
+                    assignment.island_id,
+                    route_responsibilities,
+                    &[MissionType::Attack, MissionType::Defense],
+                );
+                scope.synchronize_departure(world, manager, player_id, assignment, connectivity);
+                synchronize_campaign_phases(world, manager, player_id, assignment);
+                route_operations::authorize_departures(manager, player_id, &route_members);
+                return;
+            }
             let capture_responsibilities = campaign_assignment_capture_responsibilities(
                 world,
                 player_id,
@@ -4338,12 +4457,18 @@ fn select_landing_candidate(
         .cloned();
 
     let mut enemy_threats = Vec::new();
-    let mut enemy_query = world.query::<(&GridPosition, &Faction, &UnitStats, Option<&Health>)>();
-    for (position, faction, stats, health) in enemy_query.iter(world) {
+    let mut enemy_query = world.query::<(
+        &GridPosition,
+        &Faction,
+        &UnitStats,
+        Option<&Health>,
+        Option<&crate::components::Ammo>,
+    )>();
+    for (position, faction, stats, health, ammo) in enemy_query.iter(world) {
         if faction.0 == cargo_faction {
             continue;
         }
-        enemy_threats.push((
+        enemy_threats.push(crate::ai::threat::EnemyThreatInfo::new(
             *position,
             stats.unit_type,
             stats.cost,
@@ -4351,6 +4476,7 @@ fn select_landing_candidate(
             stats.min_range,
             stats.max_range,
             stats.max_movement,
+            ammo.map_or((0, 0), |ammo| (ammo.ammo1, ammo.ammo2)),
         ));
     }
 
@@ -4420,6 +4546,7 @@ fn select_landing_candidate(
                     terrain_defense,
                     &enemy_threats,
                     chart,
+                    &registry,
                 )
             });
             let transport_distance = map.distance(
@@ -8938,7 +9065,7 @@ mod tests {
         world.insert_resource(registry);
         world.insert_resource(island_map);
         let mut damage_chart = crate::resources::DamageChart::new();
-        damage_chart.insert_damage(UnitType::Artillery, UnitType::Infantry, 50);
+        damage_chart.insert_damage(UnitType::LightSpGun, UnitType::Infantry, 50);
         world.insert_resource(damage_chart);
 
         let player = PlayerId(1);
@@ -8985,10 +9112,17 @@ mod tests {
         world.entity_mut(cargo).insert(Transporting(transport));
         world.spawn((
             Faction(PlayerId(2)),
+            crate::components::Ammo {
+                ammo1: 6,
+                max_ammo1: 6,
+                ammo2: 0,
+                max_ammo2: 0,
+            },
             GridPosition { x: 1, y: 2 },
             UnitStats {
-                unit_type: UnitType::Artillery,
-                movement_type: MovementType::Artillery,
+                // 実マスターでも射程2〜3の軽自走砲を使い、残弾を明示する。
+                unit_type: UnitType::LightSpGun,
+                movement_type: MovementType::Tank,
                 min_range: 2,
                 max_range: 3,
                 max_movement: 5,
@@ -11146,6 +11280,7 @@ mod local_assignment;
 // 標準V4の施設を目的とする戦闘割当。
 mod objective_allocation;
 mod planning_policy;
+mod route_operations;
 
 // 再編本体と通常／拡張hookの差分契約。
 // 未追跡のテスト資産のため、ファイルが存在する場合だけ build.rs がcfgを立てる。

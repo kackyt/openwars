@@ -111,6 +111,18 @@ pub(super) fn input() -> RollingPlanInput {
         search_beam_width: SEARCH_BEAM_WIDTH,
         prioritize_deadline_interdiction: false,
         exact_property_control: false,
+        hold_window: None,
+        hold_contestants: Vec::new(),
+        committed_purchases: Vec::new(),
+        artillery_carrier: None,
+        spare_artillery_carriers: 0,
+        carrier_facilities_now: Vec::new(),
+        carrier_facilities_later: Vec::new(),
+        owned_cities: Vec::new(),
+        positional: false,
+        deploy_anchor: None,
+        defensive_emplacement: false,
+        economy_of_force: false,
     }
 }
 
@@ -215,6 +227,7 @@ fn infeasible_plan_spends_an_idle_current_slot_before_late_purchases() {
         capture_blocking_enemy_index: None,
     });
     let state = SearchState {
+        ferried_guns: 0,
         option_indices: vec![0],
         used_slots: HashSet::from_iter([ProductionSlot {
             facility: GridPosition { x: 0, y: 0 },
@@ -843,6 +856,7 @@ fn opening_package_rejects_an_affordable_idle_factory() {
     let second_facility = GridPosition { x: 1, y: 0 };
     let facilities = vec![(first_facility, vec![0]), (second_facility, vec![1])];
     let first_only = SearchState {
+        ferried_guns: 0,
         option_indices: vec![0],
         used_slots: HashSet::from_iter([ProductionSlot {
             facility: first_facility,
@@ -852,6 +866,7 @@ fn opening_package_rejects_an_affordable_idle_factory() {
         cost: 7_500,
     };
     let both_facilities = SearchState {
+        ferried_guns: 0,
         option_indices: vec![0, 1],
         used_slots: HashSet::from_iter([
             ProductionSlot {
@@ -1098,6 +1113,7 @@ fn property_frontier_preserves_fast_screen_profile_before_damage_rank() {
         HashSet::from_iter([GridPosition { x: 2, y: 0 }, GridPosition { x: 3, y: 0 }]);
     let mut states = (0..MANY_FACTORY_PROPERTY_STATE_LIMIT)
         .map(|index| SearchState {
+            ferried_guns: 0,
             option_indices: vec![index],
             used_slots: HashSet::default(),
             used_capture_targets: two_capture_lanes.clone(),
@@ -1105,6 +1121,7 @@ fn property_frontier_preserves_fast_screen_profile_before_damage_rank() {
         })
         .collect::<Vec<_>>();
     states.push(SearchState {
+        ferried_guns: 0,
         option_indices: vec![fast_index],
         used_slots: HashSet::default(),
         used_capture_targets: HashSet::from_iter([
@@ -1181,12 +1198,14 @@ fn small_map_frontier_keeps_earlier_capture_over_stronger_late_capture() {
     input.production_attack_projections = vec![vec![None], vec![None]];
 
     let slow_state = SearchState {
+        ferried_guns: 0,
         option_indices: vec![0],
         used_slots: HashSet::default(),
         used_capture_targets: HashSet::from_iter([target]),
         cost: 2_000,
     };
     let fast_state = SearchState {
+        ferried_guns: 0,
         option_indices: vec![1],
         used_slots: HashSet::default(),
         used_capture_targets: HashSet::from_iter([target]),

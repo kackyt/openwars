@@ -1,11 +1,21 @@
 //! 小規模V4生産が読む盤面snapshot。
 
-use super::capital_route::force_demand::split_bridge_route_objectives;
-use crate::ai::v4::capital_route::node_operation::capital_route_assault_authorized_from_dag;
+use super::capital_route::force_demand::{
+    PostureBudgets, PostureValues, ROUTE_CONTEST_WINDOW, RoutePostureDecision, RoutePostureMemory,
+    RouteRegion, concentrate_route_efforts, defend_outmatched_routes, region_holder,
+    split_bridge_route_objectives, split_route_front_objectives,
+};
+use crate::ai::v4::capital_route::node_operation::{
+    capital_route_assault_authorized_from_dag, capital_route_front_properties,
+};
 use crate::ai::v4::capital_route::topology::{
     armored_entry_bridge_gates, same_land_capital_front_reached,
 };
 use crate::ai::v4::trace::campaign_scope_audit_enabled;
+use crate::resources::MovementType;
+
+/// 進軍路の配分案を比べるとき、拠点や首都の収入を何ターン分の価値とみなすか。
+const PROPERTY_VALUE_TURNS: u32 = 10;
 
 use crate::ai::islands::{IslandId, IslandMap};
 use crate::ai::v4::{
@@ -271,21 +281,7 @@ impl BoardScan {
             && let (Some(home), Some(capital)) = (capital_pos, enemy_capital)
         {
             let gates = armored_entry_bridge_gates(&map, &master_data, home, capital);
-            let unit_targets = world
-                .get_resource::<crate::ai::squad::SquadManager>()
-                .map(|manager| {
-                    manager
-                        .squads
-                        .iter()
-                        .filter(|squad| squad.plan.owner_id == Some(player_id))
-                        .flat_map(|squad| {
-                            squad.plan.target.into_iter().flat_map(move |target| {
-                                squad.members.iter().map(move |entity| (*entity, target))
-                            })
-                        })
-                        .collect::<HashMap<_, _>>()
-                })
-                .unwrap_or_default();
+            let unit_targets = squad_unit_targets(world, player_id);
             campaign_objectives = split_bridge_route_objectives(
                 &map,
                 campaign_objectives,
@@ -425,6 +421,9 @@ impl BoardScan {
             master_data,
             damage_chart,
             current_turn,
+            economy_anchors: Vec::new(),
+            route_posture: None,
+            owned_cities: Vec::new(),
             opening_policy: Some(opening_policy),
             funds,
             capital_position: capital_pos,
@@ -432,6 +431,7 @@ impl BoardScan {
             production_facilities,
             available_types,
             my_units,
+            ferried_units: Vec::new(),
             enemy_units,
             owned_airport_count,
             property_entities,
@@ -485,6 +485,13 @@ pub(in crate::ai::v4) struct BoardScan {
     pub(in crate::ai::v4) master_data: Arc<MasterDataRegistry>,
     pub(in crate::ai::v4) damage_chart: Arc<DamageChart>,
     pub(in crate::ai::v4) current_turn: u32,
+    /// 自軍の都市（砲台の補給先）。標準経路だけが求める。
+    pub(in crate::ai::v4) owned_cities: Vec<GridPosition>,
+    /// 戦力節約で守る進軍路のDefense作戦地点と、そこへ使ってよい生産額（評価で割り振った
+    /// 互角分）。保持できる最も安い編成を買い、保持できなくてもこの額までしか使わない。
+    pub(in crate::ai::v4) economy_anchors: Vec<(GridPosition, u32)>,
+    /// 遂行する進軍路の配分案（[`crate::ai::v4::RoutePostureMemory`]へ持ち越す）。
+    pub(in crate::ai::v4) route_posture: Option<RoutePostureDecision>,
     /// テスト用の直接構築では未指定を標準側として扱う。実盤面走査では必ず設定する。
     pub(in crate::ai::v4) opening_policy: Option<OpeningProductionPolicy>,
     pub(in crate::ai::v4) funds: u32,
@@ -496,6 +503,8 @@ pub(in crate::ai::v4) struct BoardScan {
     pub(in crate::ai::v4) production_facilities: Vec<(GridPosition, Terrain)>,
     pub(in crate::ai::v4) available_types: Vec<(UnitType, UnitStats)>,
     pub(in crate::ai::v4) my_units: Vec<UnitSnapshot>,
+    /// 補給輸送車に積載中の自軍砲台（盤面占有はしないが、既存戦力・進軍路戦力には含める）。
+    pub(in crate::ai::v4) ferried_units: Vec<UnitSnapshot>,
     pub(in crate::ai::v4) enemy_units: Vec<UnitSnapshot>,
     /// 首都の生産範囲内にある所有空港総数（占有中を含む）
     pub(in crate::ai::v4) owned_airport_count: u32,
@@ -642,6 +651,37 @@ impl BoardScan {
                 }
             }
         }
+        let mut ferried_units = Vec::new();
+        for UnitRow {
+            entity,
+            faction,
+            stats,
+            health,
+            transporting,
+            ..
+        } in unit_rows(world, queries)
+        {
+            let Some(carrier_entity) = transporting.map(|t| t.0) else {
+                continue;
+            };
+            if faction.0 != player_id || !crate::ai::v4::artillery_ferry::is_ferried_gun(stats) {
+                continue;
+            }
+            if let Some(carrier) = my_units
+                .iter()
+                .find(|u| u.entity == Some(carrier_entity))
+                .filter(|u| crate::ai::v4::artillery_ferry::is_artillery_carrier(&u.stats))
+            {
+                ferried_units.push(UnitSnapshot {
+                    entity: Some(entity),
+                    pos: carrier.pos,
+                    hp: health.map_or(100, |h| h.current),
+                    free_cargo: 0,
+                    stats: stats.clone(),
+                });
+            }
+        }
+        ferried_units.sort_unstable_by_key(|unit| unit.entity.map(Entity::to_bits));
 
         // --- 拠点の走査 ---
         let mut capital_pos = None;
@@ -748,6 +788,149 @@ impl BoardScan {
         let home_island = capital_pos
             .and_then(|position| island_map.get_island_at(&position))
             .map(|island| island.id);
+        // 戦力節約で守る進軍路の地点（OPENWARS_CONCENTRATEのときだけ埋まる）。
+        let mut economy_anchors = Vec::new();
+        let mut route_posture = None;
+        // 同一陸塊の首都戦役では、島単位の一つのCapture目標を首都ルートの進軍路ごとに分け、
+        // 生産の作戦を配置側の前線（進軍路）と揃える。敵首都は首都作戦が担う。
+        if home_island.is_some()
+            && home_island == enemy_capital_island
+            && let Some(island) = home_island
+            && let Some(fronts) = capital_route_front_properties(world, player_id, island)
+        {
+            let route_properties = fronts
+                .into_iter()
+                .map(|properties| {
+                    properties
+                        .into_iter()
+                        .filter(|position| Some(*position) != enemy_capital)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            if campaign_scope_audit_enabled() {
+                eprintln!(
+                    "ROUTE_SPLIT_AUDIT player={:?} routes={:?} before={:?}",
+                    player_id,
+                    route_properties,
+                    campaign_objectives
+                        .iter()
+                        .map(|o| (o.kind, o.anchor, o.objective_properties.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let unit_targets = squad_unit_targets(world, player_id);
+            campaign_objectives = split_route_front_objectives(
+                &map,
+                campaign_objectives,
+                &route_properties,
+                &my_units,
+                &unit_targets,
+            );
+            let own_positions = owned_properties
+                .iter()
+                .map(|(position, _)| *position)
+                .collect::<Vec<_>>();
+            let budget_turns = 1;
+            // 占領役（最も安い占領可能な地上兵）の足で、移動コストを加味した実ターンを測る。
+            let capturer = available_types
+                .iter()
+                .filter(|(_, stats)| {
+                    stats.can_capture
+                        && stats.cost > 0
+                        && !matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
+                })
+                .min_by_key(|(unit_type, stats)| (stats.cost, unit_type.as_str()))
+                .map(|(_, stats)| stats.clone());
+            if let Some(capturer) = capturer {
+                // 拠点は拠点あたりの収入を、敵首都は敵の総収入を、数ターン分の価値とみなす。
+                let property_count = u32::try_from(owned_properties.len().max(1)).unwrap_or(1);
+                let values = PostureValues {
+                    property: (my_income / property_count).saturating_mul(PROPERTY_VALUE_TURNS),
+                    capital: enemy_income.saturating_mul(PROPERTY_VALUE_TURNS),
+                    own_capital: my_income.saturating_mul(PROPERTY_VALUE_TURNS),
+                    capturer: capturer.cost,
+                };
+                // 見積もり期間内に生産から戦場へ届く額（期間の最終手番の生産は間に合わない）。
+                let window_income_turns = ROUTE_CONTEST_WINDOW.saturating_sub(1);
+                let budgets = PostureBudgets {
+                    own: funds.saturating_add(my_income.saturating_mul(window_income_turns)),
+                    enemy: enemy_income.saturating_mul(window_income_turns),
+                };
+                let mut cache = crate::ai::turn_distance::ActionTurnDistanceCache::default();
+                let mut turns = |from: GridPosition, to: GridPosition| {
+                    crate::ai::v4::property_control::capture_arrival_turns(
+                        &map,
+                        &master_data,
+                        (from.x, from.y),
+                        (to.x, to.y),
+                        capturer.movement_type,
+                        capturer.max_movement,
+                        capturer.max_fuel,
+                        player_id,
+                        &mut cache,
+                    )
+                };
+                // 首都ルートDAGの地域（ノード作戦の拠点群）と、その保持者。
+                let regions = route_regions(world, queries, player_id, island);
+                let region_state = regions
+                    .iter()
+                    .map(|region| (region.anchor, region.holder))
+                    .collect::<Vec<_>>();
+                // 地域の保持者が決めたときのままなら、決めた案を遂行する。
+                let decided = world
+                    .get_resource::<RoutePostureMemory>()
+                    .and_then(|memory| memory.by_player.get(&player_id))
+                    .filter(|decision| decision.regions == region_state)
+                    .cloned();
+                let all_own_units = my_units
+                    .iter()
+                    .chain(&ferried_units)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let efforts = concentrate_route_efforts(
+                    &map,
+                    campaign_objectives,
+                    &all_own_units,
+                    &enemy_units,
+                    &own_positions,
+                    &regions,
+                    (capital_pos, enemy_capital),
+                    budgets,
+                    values,
+                    decided.as_ref(),
+                    &mut turns,
+                );
+                campaign_objectives = efforts.objectives;
+                economy_anchors = efforts.economy_anchors;
+                route_posture = efforts.posture.map(|main| RoutePostureDecision {
+                    main,
+                    regions: region_state,
+                    orders: efforts.orders,
+                });
+            }
+            // 配分案で各進軍路の攻守を決めた場合は、それに従う。
+            if route_posture.is_none() {
+                let all_own_units = my_units
+                    .iter()
+                    .chain(&ferried_units)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                campaign_objectives = defend_outmatched_routes(
+                    &map,
+                    campaign_objectives,
+                    &all_own_units,
+                    &enemy_units,
+                    &own_positions,
+                    funds.saturating_add(my_income.saturating_mul(budget_turns)),
+                    // 敵の見込み生産を比較に入れるかは実験中（OPENWARS_ROUTE_ENEMY_BUDGET）。
+                    if std::env::var_os("OPENWARS_ROUTE_ENEMY_BUDGET").is_some() {
+                        enemy_income.saturating_mul(budget_turns)
+                    } else {
+                        0
+                    },
+                );
+            }
+        }
         let completed_route_island = logistics_plan.as_ref().and_then(|plan| {
             plan.route_islands
                 .iter()
@@ -848,8 +1031,15 @@ impl BoardScan {
 
         Some(BoardScan {
             current_turn: 0,
+            economy_anchors,
+            route_posture,
+            owned_cities: owned_properties
+                .iter()
+                .filter(|(_, terrain)| *terrain == Terrain::City)
+                .map(|(position, _)| *position)
+                .collect(),
             opening_policy: None,
-            capital_position: None,
+            capital_position: capital_pos,
             property_entities: HashMap::default(),
             neutral_properties: Vec::new(),
             enemy_production_forecast: Default::default(),
@@ -861,6 +1051,7 @@ impl BoardScan {
             production_facilities,
             available_types,
             my_units,
+            ferried_units,
             enemy_units,
             owned_airport_count,
             open_properties,
@@ -1012,6 +1203,53 @@ fn unit_rows<'a>(
 }
 
 /// 首都走査と施設走査が同じ順序の不変行を共有する。
+/// 首都ルートDAGのノード作戦が受け持つ地域（占領対象の拠点群）と、その保持者。
+/// 代表点の順に並べ、決めた配分案を見直す契機（地域の保持者の変化）の比較に使う。
+fn route_regions(
+    world: &World,
+    queries: &BoardScanQueries,
+    player_id: PlayerId,
+    island: IslandId,
+) -> Vec<RouteRegion> {
+    let Some(registry) = world
+        .get_resource::<crate::ai::v4::capital_route::model::CapitalRouteNodeOperationRegistry>(
+    ) else {
+        return Vec::new();
+    };
+    let owners = property_rows(world, queries)
+        .map(|row| (*row.pos, row.prop.owner_id))
+        .collect::<HashMap<_, _>>();
+    let mut regions = registry
+        .operations
+        .values()
+        .filter(|operation| {
+            operation.id.topology.player_id == player_id
+                && operation.id.topology.island_id == island
+                && !operation.capture_targets.is_empty()
+        })
+        .map(|operation| {
+            let owner_of = |target: &GridPosition| owners.get(target).copied().flatten();
+            let owned = operation
+                .capture_targets
+                .iter()
+                .filter(|target| owner_of(target) == Some(player_id))
+                .count();
+            let enemy_owned = operation
+                .capture_targets
+                .iter()
+                .filter(|target| owner_of(target).is_some_and(|owner| owner != player_id))
+                .count();
+            RouteRegion {
+                anchor: operation.anchor,
+                properties: u32::try_from(operation.capture_targets.len()).unwrap_or(u32::MAX),
+                holder: region_holder(owned, enemy_owned, operation.capture_targets.len()),
+            }
+        })
+        .collect::<Vec<_>>();
+    regions.sort_unstable_by_key(|region| (region.anchor.y, region.anchor.x));
+    regions
+}
+
 #[derive(Clone, Copy)]
 struct PropertyRow<'a> {
     entity: Entity,
@@ -1027,6 +1265,26 @@ fn property_rows<'a>(
         .properties
         .iter_manual(world)
         .map(|(entity, pos, prop)| PropertyRow { entity, pos, prop })
+}
+
+/// 自軍Squadの各構成員が向かっている目標地点。作戦を進軍路へ分けるとき、
+/// 既に出発した占領役を元の進軍路の作戦へ残すために使う。
+fn squad_unit_targets(world: &World, player_id: PlayerId) -> HashMap<Entity, GridPosition> {
+    world
+        .get_resource::<crate::ai::squad::SquadManager>()
+        .map(|manager| {
+            manager
+                .squads
+                .iter()
+                .filter(|squad| squad.plan.owner_id == Some(player_id))
+                .flat_map(|squad| {
+                    squad.plan.target.into_iter().flat_map(move |target| {
+                        squad.members.iter().map(move |entity| (*entity, target))
+                    })
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

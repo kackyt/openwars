@@ -5,6 +5,10 @@ description: >-
   Use this agent to diagnose root cause from pre-investigation summary, formulate orthogonal hypotheses, and review no-hack-principles compliance.
 claudecode:
   model: opus
+antigravity-ide:
+  model: flash
+antigravity-cli:
+  model: flash
 ---
 
 あなたの役割は、事前調査エージェント (`openwars-pre-investigator`) が抽出した食い違いサマリーに基づき、アーキテクチャ・責務の観点から根本原因を特定し、互いに干渉しない直交する因果仮説を立案・審査することです。

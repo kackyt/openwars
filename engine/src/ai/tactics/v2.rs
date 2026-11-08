@@ -11,7 +11,8 @@ use super::scoring::{
     assess_merge, attack_serves_campaign, blocks_own_production, capture_or_hunt_score,
     direct_threat_terrain_score, empty_transport_return_score, reference_point_approach_score,
     reference_reach, repair_site_at, solo_enemy_approach_score, squad_target_approach_score,
-    stranded_infantry_score, terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
+    squad_target_path_approach_score, stranded_infantry_score, terrain_defense_bonus,
+    v3_positioning_score, v3_positioning_score_accepting_exposure, wait_recovery_score,
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -32,6 +33,10 @@ use crate::systems::movement::calculate_reachable_tiles;
 use bevy_ecs::prelude::*;
 use serde_json::json;
 
+mod assault_capture;
+mod assault_support;
+#[cfg(test)]
+mod assault_tests;
 #[cfg(test)]
 mod capture_blockade_tests;
 #[cfg(test)]
@@ -68,13 +73,70 @@ pub(crate) fn decide_action(
         .then(|| EnemyProductionBlockade::observe(&board));
     // 占領の実行（敵首都・割当物件）を前面の戦闘より優先する（V4）。
     let executes_capture = ai_version == crate::ai::ai_version::AiVersion::V4;
+    // 敵首都への攻勢（GO）中なら、その目標の敵首都（V4）。
+    let assault_objective = executes_capture
+        .then(|| crate::ai::assault_decision::assault_objective(world, player_id))
+        .flatten();
+    // 前衛と間接火力で同じ突破対象を共有する。命令を適用するたびに選び直す。
+    let assault_target = assault_objective
+        .and_then(|objective| assault_support::select_target(world, &board, objective));
     let mut probe_call = ProbeCall::start(world, player_id);
     let best = with_turn_distances(world, &board, |world, distances| {
         let mut best = BestUnitAction::default();
+        // 行動済みも含め、元の占領担当を予約して未担当の歩兵だけを分担する。
+        let mut capture_claims = HashSet::default();
+        if assault_objective.is_some() {
+            for entity in world.iter_entities() {
+                if entity
+                    .get::<crate::components::Faction>()
+                    .is_some_and(|f| f.0 == player_id)
+                    && entity
+                        .get::<crate::components::UnitStats>()
+                        .is_some_and(|s| s.can_capture)
+                    && let Some(state) = UnitState::observe(world, &board, entity.id())
+                    && let Some(target) = assault_capture::retained_target(&board, &state)
+                {
+                    capture_claims.insert(target);
+                }
+            }
+        }
         for entity in movable_units {
-            let Some(unit) = UnitTactics::observe(world, &board, entity) else {
+            let Some(mut unit) = UnitTactics::observe(world, &board, entity, assault_objective)
+            else {
+                if std::env::var_os("OPENWARS_TACTIC_DEBUG").is_some() {
+                    eprintln!("TACTIC P{:?} {:?} skipped(observe)", player_id, entity);
+                }
                 continue;
             };
+            assault_capture::assign_unclaimed(
+                &board,
+                &mut unit,
+                blockade.as_ref(),
+                &mut capture_claims,
+                distances,
+            );
+            unit.assault_target = assault_target.map(|(target, _)| target);
+            if unit.assault_objective.is_some()
+                && unit.state.stats.min_range > 1
+                && let Some((_, position)) = assault_target
+            {
+                unit.squad_target = Some(position);
+            }
+            if std::env::var_os("OPENWARS_TACTIC_DEBUG").is_some() {
+                eprintln!(
+                    "TACTIC P{:?} {:?} {:?} at=({},{}) target={:?} solo={} hold={} mission={:?} campaign_target={:?}",
+                    player_id.0,
+                    entity,
+                    unit.state.stats.unit_type,
+                    unit.state.position.x,
+                    unit.state.position.y,
+                    unit.squad_target,
+                    unit.is_solo,
+                    unit.campaign.as_ref().is_some_and(|c| c.holds_position()),
+                    board.squads.mission(entity),
+                    unit.campaign.as_ref().and_then(|c| c.target),
+                );
+            }
             let mut probe = probe_call
                 .as_ref()
                 .map(|call| call.unit(entity, unit.state.stats.unit_type));
@@ -112,6 +174,45 @@ pub(crate) fn decide_action(
     if let (Some(call), Some((rank, entity, command))) = (probe_call, best.evaluated_choice()) {
         call.finish(world, entity, command, rank);
     }
+    if std::env::var_os("OPENWARS_PRIORITY_DIAG").is_some()
+        && let Some((rank, entity, command)) = best.evaluated_choice()
+    {
+        // 選ばれた行動の優先度・任務・兵種・命令の種類を記録する診断（既定では無効）。
+        let kind = world
+            .get::<crate::components::UnitStats>(entity)
+            .map_or("?", |stats| stats.unit_type.as_str());
+        let command_text = format!("{command:?}");
+        let command_kind = command_text.split([' ', '{', '(']).next().unwrap_or("?");
+        // 分隊の目標から敵首都までの距離（目標が敵首都方面を向いているかの確認）。
+        let enemy_capital = world
+            .iter_entities()
+            .filter_map(|e| {
+                let property = e.get::<crate::components::Property>()?;
+                (property.terrain == crate::resources::Terrain::Capital
+                    && property.owner_id.is_some_and(|owner| owner != player_id))
+                .then(|| e.get::<GridPosition>().copied())
+                .flatten()
+            })
+            .min_by_key(|position| (position.y, position.x));
+        let target_to_capital = board.squads.target(entity).zip(enemy_capital).map_or(
+            "-".to_owned(),
+            |(target, capital)| {
+                board
+                    .map
+                    .distance(target.x, target.y, capital.x, capital.y)
+                    .to_string()
+            },
+        );
+        eprintln!(
+            "PRIO P{:?} priority={:?} mission={:?} type={} cmd={} tgt_to_cap={}",
+            player_id,
+            rank.0,
+            board.squads.mission(entity),
+            kind,
+            command_kind,
+            target_to_capital
+        );
+    }
     best.choose(world, &board)
 }
 
@@ -126,26 +227,45 @@ struct UnitTactics {
     has_offensive_mission: bool,
     /// Squad目標を持たない単独行動。
     is_solo: bool,
+    /// 攻勢（GO）中の戦闘部隊が共有する敵首都。HPでは解除しない。
+    assault_objective: Option<GridPosition>,
+    /// 前衛と間接火力が共有する突破対象。
+    assault_target: Option<Entity>,
 }
 
 impl UnitTactics {
     /// 必要な状態が欠けているunit、またはcampaign所属に具体Squadが無いunit
     /// （作戦再構築へ戻す）は、この手番の候補にしない。
-    fn observe(world: &World, board: &TacticalBoard, entity: Entity) -> Option<Self> {
+    fn observe(
+        world: &World,
+        board: &TacticalBoard,
+        entity: Entity,
+        assault_objective: Option<GridPosition>,
+    ) -> Option<Self> {
         let state = UnitState::observe(world, board, entity)?;
+        // 被弾後も攻勢目標を維持する。間接兵器も支援役として参加する。
+        // 弾薬・射撃可否は合法手の生成とダメージ評価で確認する。
+        let assault_objective = assault_objective.filter(|_| state.stats.max_range > 0);
         let deployment_target = world
             .get_resource::<crate::ai::v4::deployment::V4DeploymentRegistry>()
             .and_then(|registry| registry.attack_target(entity));
         let campaign =
             campaign_action_context(world, board.player_id, entity, &board.squads.manager).ok()?;
-        let squad_target = board.squads.target(entity);
-        let has_offensive_mission = board.squads.mission(entity).is_some_and(|mission| {
-            matches!(
-                mission,
-                MissionType::Attack | MissionType::Capture | MissionType::Transport
-            )
-        });
-        let is_solo = board.squads.is_solo_fallback(entity) || squad_target.is_none();
+        // 歩兵は占領中の物件と元の割当を維持する。首都への上書きは戦闘担当だけ。
+        let squad_target = if assault_objective.is_some() && state.stats.can_capture {
+            assault_capture::retained_target(board, &state)
+        } else {
+            assault_objective.or(board.squads.target(entity))
+        };
+        let has_offensive_mission = assault_objective.is_some()
+            || board.squads.mission(entity).is_some_and(|mission| {
+                matches!(
+                    mission,
+                    MissionType::Attack | MissionType::Capture | MissionType::Transport
+                )
+            });
+        let is_solo = assault_objective.is_none()
+            && (board.squads.is_solo_fallback(entity) || squad_target.is_none());
         Some(Self {
             state,
             deployment_target,
@@ -153,6 +273,8 @@ impl UnitTactics {
             squad_target,
             has_offensive_mission,
             is_solo,
+            assault_objective,
+            assault_target: None,
         })
     }
 
@@ -165,10 +287,12 @@ impl UnitTactics {
     /// 移動先候補。護衛・集結待ちのSquadは、現在位置での攻撃・占領・待機だけを残す。
     fn candidate_tiles(&self, board: &TacticalBoard) -> std::collections::BTreeSet<(usize, usize)> {
         let unit = &self.state;
-        if self
-            .campaign
-            .as_ref()
-            .is_some_and(|context| context.holds_position())
+        // 攻勢中は、護衛・集結待ちで留まらない。
+        if self.assault_objective.is_none()
+            && self
+                .campaign
+                .as_ref()
+                .is_some_and(|context| context.holds_position())
         {
             return std::iter::once((unit.position.x, unit.position.y)).collect();
         }
@@ -270,7 +394,7 @@ fn best_action_for_unit(
         let detailed = probe.as_ref().is_some_and(|p| p.detailed);
         let (mut base_score, score_parts) =
             tile_score(world, board, unit, position, distances, detailed);
-        let tile_blockade = blockade
+        let mut tile_blockade = blockade
             .map(|blockade| {
                 blockade.assess(
                     board,
@@ -280,6 +404,13 @@ fn best_action_for_unit(
                 )
             })
             .unwrap_or_default();
+        // GO中の直接部隊は、敵生産口の占位でも被弾を許容する。
+        if unit.assault_objective.is_some()
+            && state.stats.min_range <= 1
+            && blockade.is_some_and(|blockade| blockade.sites.contains(&position))
+        {
+            tile_blockade.holds_site = true;
+        }
         // 占位を続けられる敵生産口は、止められる補充の価値だけ位置の価値を上げる。
         if tile_blockade.holds_site {
             base_score += tile_blockade.site_value as i32;
@@ -370,8 +501,13 @@ fn tile_score(
     let terrain = defense_bonus as i32 * 10;
     let mut score = terrain;
     let positioning = if board.uses_v3_tactics {
-        v3_positioning_score(board, state, position, defense_bonus)
-            + direct_threat_terrain_score(board, state, position, defense_bonus)
+        // 攻勢中の直接攻撃unitは、敵の脅威圏への露出を理由に前進を止めない。
+        let positioning = if unit.assault_objective.is_some() && state.stats.min_range <= 1 {
+            v3_positioning_score_accepting_exposure(board, state, position, defense_bonus)
+        } else {
+            v3_positioning_score(board, state, position, defense_bonus)
+        };
+        positioning + direct_threat_terrain_score(board, state, position, defense_bonus)
     } else {
         0
     };
@@ -380,7 +516,17 @@ fn tile_score(
     if !unit.is_solo
         && let Some(target) = unit.squad_target
     {
-        squad_approach = if unit.treats_target_as_reference() {
+        squad_approach = if unit.assault_objective.is_some() && state.stats.min_range <= 1 {
+            let turns = distances.turns(&state.stats, position, target, 0);
+            super::approach::path_approach_bonus(
+                turns,
+                super::approach::manhattan(position, target),
+                state.stats.max_movement,
+            )
+        } else if board.approaches_squad_target_by_path {
+            // V4は参照点・目標地点のどちらも、射程に捉えるまでの実経路で接近を比べる。
+            squad_target_path_approach_score(state, position, target, distances)
+        } else if unit.treats_target_as_reference() {
             reference_point_approach_score(state, position, target, distances)
         } else {
             squad_target_approach_score(state, position, target, distances)
@@ -466,7 +612,9 @@ fn consider_capture(
                 && *terrain == crate::resources::Terrain::Capital
                 && owner.is_some_and(|owner| owner != board.player_id)
         });
+    let go_capture = unit.assault_objective.is_some() && unit.state.stats.can_capture;
     let outside_campaign = !is_enemy_capital
+        && !go_capture
         && unit.campaign.as_ref().is_some_and(|context| {
             !campaign_mission_allows_capture(&context.mission_type)
                 || !campaign_position_is_on_target_island(world, context, tile.position)
@@ -480,10 +628,11 @@ fn consider_capture(
     // 占領任務の割当物件そのものの占領も、前面の戦闘より優先する（小規模マップと同じ）。
     let executes_assigned_capture = executes_capture
         && unit.squad_target == Some(tile.position)
-        && unit
-            .campaign
-            .as_ref()
-            .is_some_and(|context| context.mission_type == MissionType::Capture);
+        && (go_capture
+            || unit
+                .campaign
+                .as_ref()
+                .is_some_and(|context| context.mission_type == MissionType::Capture));
     let priority = if is_enemy_capital || executes_assigned_capture {
         ActionPriority::CaptureExecution
     } else {
@@ -515,12 +664,18 @@ fn consider_attacks(
     mut probe: Option<&mut UnitProbe>,
 ) {
     for target in tile.actions.attackable_targets.iter().copied() {
-        if !attack_serves_campaign(
-            world,
-            unit.campaign.as_ref(),
-            unit.deployment_target,
-            target,
-        ) {
+        if !assault_capture::needs_attack(world, board, unit, target) {
+            continue;
+        }
+        // 攻勢中のunitは作戦の標的に限らず、盤面の敵を攻撃できる。
+        if unit.assault_objective.is_none()
+            && !attack_serves_campaign(
+                world,
+                unit.campaign.as_ref(),
+                unit.deployment_target,
+                target,
+            )
+        {
             if let Some(trace) = probe.as_deref_mut() {
                 trace.reject(
                     "attack_campaign_constraint",
@@ -552,30 +707,36 @@ fn consider_attacks(
             }
             continue;
         };
-        let Some(priority) =
-            attack_priority(unit, target, exchange.is_favorable_matchup()).map(|priority| {
-                if tile.blockade.holds_site {
-                    priority.max(ActionPriority::EnemyProductionBlockade)
-                } else {
-                    priority
-                }
-            })
-        else {
+        let Some(priority) = attack_priority(
+            board,
+            unit,
+            target,
+            world.get::<GridPosition>(target).copied(),
+            exchange.is_favorable_matchup(),
+        )
+        .map(|priority| {
+            if tile.blockade.holds_site {
+                priority.max(ActionPriority::EnemyProductionBlockade)
+            } else {
+                priority
+            }
+        }) else {
             if let Some(trace) = probe.as_deref_mut() {
                 trace.reject("attack_priority_rejected",tile.position,||json!({"target_id":target.to_bits(),"damage":exchange.expected_damage,"counter_damage":exchange.expected_counter_damage,"favorable":exchange.is_favorable_matchup()}));
             }
             continue;
         };
+        let attack_score = attack.score;
         observe_offer(
             probe.as_deref_mut(),
             unit,
             tile,
             "Attack",
             Some(target),
-            (priority, tile.base_score + attack.score),
-            attack.score,
+            (priority, tile.base_score + attack_score),
+            attack_score,
         );
-        best.offer((priority, tile.base_score + attack.score), || {
+        best.offer((priority, tile.base_score + attack_score), || {
             AiCommand::Attack {
                 target_pos: tile.position,
                 target_entity: target,
@@ -588,15 +749,29 @@ fn consider_attacks(
 /// 上陸cargoはSquad再編の境界でCapture・Transport・Attackのいずれにもなり得るため、
 /// その差で必要攻撃を非決定的に枝刈りしてはならない。作戦上の必要性がない不利交換はNone。
 fn attack_priority(
+    board: &TacticalBoard,
     unit: &UnitTactics,
     target: Entity,
+    target_position: Option<GridPosition>,
     favorable_matchup: bool,
 ) -> Option<ActionPriority> {
-    let is_strategic_target = unit
-        .deployment_target
-        .map_or(unit.has_offensive_mission, |deployment| {
-            deployment == target
+    if unit.assault_objective.is_some()
+        && (unit.assault_target == Some(target)
+            || target_position.is_some_and(|position| is_assault_target(board, unit, position)))
+    {
+        return Some(if unit.state.stats.min_range > 1 {
+            ActionPriority::AssaultSupportFire
+        } else {
+            ActionPriority::AssaultStrike
         });
+    }
+    let is_strategic_target = target_position
+        .is_some_and(|position| is_assault_target(board, unit, position))
+        || unit
+            .deployment_target
+            .map_or(unit.has_offensive_mission, |deployment| {
+                deployment == target
+            });
     let has_strategic_mission = unit.deployment_target.is_some() || unit.has_offensive_mission;
     match (is_strategic_target, favorable_matchup) {
         (true, true) => Some(ActionPriority::FavorableStrategicTarget),
@@ -607,6 +782,21 @@ fn attack_priority(
         (false, false) => None,
         (false, true) => Some(ActionPriority::Normal),
     }
+}
+
+/// 攻勢中の作戦対象: 敵の間接兵器と、敵首都の生産圏にいる敵。
+fn is_assault_target(board: &TacticalBoard, unit: &UnitTactics, position: GridPosition) -> bool {
+    let Some(objective) = unit.assault_objective else {
+        return false;
+    };
+    board.enemies.iter().any(|enemy| {
+        enemy.position == position
+            && (enemy.min_range > 1
+                || board
+                    .map
+                    .distance(objective.x, objective.y, position.x, position.y)
+                    <= crate::systems::production::PRODUCTION_RANGE as u32)
+    })
 }
 
 /// 待機。campaign所属unitは、作戦目標から（経路長で）遠ざかる移動で待機しない。
@@ -661,7 +851,13 @@ fn consider_wait(
         {
             return false;
         }
-        context.target.is_none_or(|target| {
+        // 攻勢中は、作戦の目標ではなく敵首都から遠ざかるかで判定する。
+        let target = if unit.assault_objective.is_some() && state.stats.can_capture {
+            unit.squad_target
+        } else {
+            unit.assault_objective.or(context.target)
+        };
+        target.is_none_or(|target| {
             // 参照点の周囲で働ける範囲までは「離れた」と扱わない。範囲外への後退は従来どおり拒否。
             let range = if unit.treats_target_as_reference() {
                 reference_reach(&state.stats)
@@ -696,8 +892,17 @@ fn consider_wait(
         }
         return;
     }
+    let advances_capture = unit.assault_objective.is_some()
+        && state.stats.can_capture
+        && unit.squad_target.is_some_and(|target| {
+            tile.position == target
+                || distances.turns(&state.stats, tile.position, target, 0)
+                    < distances.turns(&state.stats, state.position, target, 0)
+        });
     let priority = if holds_blockade {
         ActionPriority::EnemyProductionBlockade
+    } else if advances_capture {
+        ActionPriority::CaptureAdvance
     } else {
         ActionPriority::Normal
     };
