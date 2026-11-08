@@ -95,7 +95,11 @@ impl SmallMapBoard {
     fn observe(world: &World, tactical: TacticalBoard) -> Self {
         let player_id = tactical.player_id;
         let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
-        let own_production = OwnProductionSites::observe(&tactical);
+        let funds = world
+            .get_resource::<crate::resources::Players>()
+            .and_then(|players| players.0.iter().find(|p| p.id == player_id))
+            .map_or(0, |p| p.funds);
+        let own_production = OwnProductionSites::observe(&tactical, funds);
         let blockade = ai_version
             .uses_enemy_production_blockade()
             .then(|| EnemyProductionBlockade::observe(&tactical));
@@ -133,10 +137,18 @@ struct OwnProductionSites {
     /// 全生産施設が自軍unitで埋まっている。各行動後に再評価されるこの契約で1体を押し出し、
     /// 最低1つの後続生産口を回復する（1つでも空きがあれば通常の戦術行動を優先する）。
     gridlocked: bool,
+    /// 今ターンに空いている生産枠数（自軍生産施設のうち未占有のもの）。
+    free_slots: usize,
+    /// 今ターンに購入し得る最大ユニット数（所持金 ÷ 最安ユニット価格）。
+    /// 「枠が足りないか」を固定の定数ではなく、資金と価格の需給で判定するための値。
+    demand_slots: usize,
 }
 
+/// ユニットの最安コスト。全兵種の下限であり、資金から購入可能な最大頭数を導く。
+const CHEAPEST_UNIT_COST: u32 = 1_000;
+
 impl OwnProductionSites {
-    fn observe(board: &TacticalBoard) -> Self {
+    fn observe(board: &TacticalBoard, funds: u32) -> Self {
         let capitals = board
             .properties
             .iter()
@@ -160,18 +172,27 @@ impl OwnProductionSites {
             })
             .map(|(position, ..)| (position.x, position.y))
             .collect::<HashSet<_>>();
-        let gridlocked = !positions.is_empty()
-            && positions
-                .iter()
-                .all(|position| board.occupancy.contains_key(position));
+        let free_slots = positions
+            .iter()
+            .filter(|position| !board.occupancy.contains_key(position))
+            .count();
+        let gridlocked = !positions.is_empty() && free_slots == 0;
         Self {
             positions,
             gridlocked,
+            free_slots,
+            demand_slots: (funds / CHEAPEST_UNIT_COST) as usize,
         }
     }
 
     fn contains(&self, tile: (usize, usize)) -> bool {
         self.positions.contains(&tile)
+    }
+
+    /// 今手番の資金で買える頭数に対して生産枠が不足しているか。
+    /// 固定の枠数ではなく、資金と単価の需給だけで判定する。
+    fn is_supply_short(&self) -> bool {
+        self.free_slots < self.demand_slots
     }
 }
 
@@ -800,7 +821,26 @@ fn consider_attacks(
         } else {
             priority
         };
-        let rank = (priority, tile.base_score + attack.score);
+        let mut attack_score = tile.base_score + attack.score;
+        let on_own_facility = board
+            .own_production
+            .contains((tile.position.x, tile.position.y));
+        if unit.starts_on_own_production && !unit.state.combat_ineffective {
+            // 自軍生産施設から手番を開始した健全ユニットの射撃位置選択:
+            // 以下の3条件がすべて満たされたとき、施設外への移動射撃を優先して後続の生産枠を空ける。
+            // ① 経済的必要性: 今手番の資金に対して空き枠が不足している（is_supply_short）
+            // ② 戦術的生存性: 施設外に出ても反撃で撃破されず、価値交換で大損しない
+            // ③ 火力の同等性: 施設外でも有効な攻撃が可能（assess_attack を通過済み）
+            let survives_and_favorable = exchange.expected_counter_damage < unit.state.hp
+                && !exchange.loses_more_value_than_it_deals();
+            if board.own_production.is_supply_short() && survives_and_favorable && !on_own_facility
+            {
+                // 工場の地形防御差（平地との差約150点）を上回る生産枠解放ボーナスを与え、
+                // 施設外に出て撃つ選択を優先する。
+                attack_score += 500;
+            }
+        }
+        let rank = (priority, attack_score);
         if tile.is_stationary && best_stationary_attack.is_none_or(|(best, _)| rank > best) {
             *best_stationary_attack = Some((rank, target));
         }
