@@ -592,6 +592,7 @@ impl OpenWarsAiServer {
                     active_player_id.0,
                     step,
                     &units_before,
+                    action_taken.as_deref(),
                 ));
                 step += 1;
 

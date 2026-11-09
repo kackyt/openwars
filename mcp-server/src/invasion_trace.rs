@@ -3,6 +3,7 @@ use bevy_ecs::prelude::*;
 use engine::collections::HashMap;
 use serde::Serialize;
 
+use engine::ai::features::campaign_front_audit_enabled;
 use engine::ai::idle_audit::IdleAuditDiagnostics;
 use engine::ai::island_campaign::{
     IslandCampaignAssessment, IslandCampaignAssignment, IslandCampaignDecision,
@@ -20,8 +21,8 @@ use engine::ai::v4::trace::{ProductionDecision, ProductionTraceDiagnostics};
 use engine::ai::v4::victory_roadmap::VictoryRoadmapRegistry;
 use engine::components::{CargoCapacity, Faction, GridPosition, Health, PlayerId, UnitStats};
 use engine::events::{
-    PropertyCaptureProgressedEvent, UnitAttackedEvent, UnitLoadedEvent, UnitProducedEvent,
-    UnitUnloadedEvent,
+    PropertyCaptureProgressedEvent, UnitAttackedEvent, UnitLoadedEvent, UnitMergedEvent,
+    UnitProducedEvent, UnitUnloadedEvent,
 };
 use engine::resources::UnitType;
 
@@ -119,6 +120,21 @@ pub enum InvasionEvent {
         damage_value_dealt: i64,
         counter_value_received: i64,
     },
+    /// 明示的に有効化した前線消耗診断。ゲームの侵攻イベントとは別のtypeで保存する。
+    CampaignFrontlineAudit {
+        turn: u32,
+        player_id: u32,
+        step: usize,
+        /// 境界変化を起こしたステップのAI行動。撃破・後退・未派遣の判別に使う。
+        action: Option<String>,
+        front_y_min: usize,
+        front_y_max: usize,
+        boundary_changes: Vec<FrontlineUnitTransition>,
+        front_units_before: Vec<FrontlineUnitSnapshot>,
+        front_units_after: Vec<FrontlineUnitSnapshot>,
+        enemy_units_before: Vec<FrontlineUnitSnapshot>,
+        enemy_units_after: Vec<FrontlineUnitSnapshot>,
+    },
     /// 明示的に有効化したWait診断。ゲームの侵攻イベントとは別のtypeで保存する。
     AiWaitProbe {
         turn: u32,
@@ -138,6 +154,40 @@ pub enum InvasionEvent {
         remaining_capture_points: u32,
         completed: bool,
     },
+}
+
+/// 前線帯の境界をまたいだ、あるいは被弾した1体の変化。
+#[derive(Debug, Serialize)]
+pub struct FrontlineUnitTransition {
+    pub player_id: u32,
+    pub unit_id: u64,
+    pub unit_type: String,
+    pub cost: u32,
+    pub can_capture: bool,
+    pub max_cargo: u32,
+    pub before_x: Option<usize>,
+    pub before_y: Option<usize>,
+    pub before_hp: Option<u32>,
+    pub after_x: Option<usize>,
+    pub after_y: Option<usize>,
+    pub after_hp: Option<u32>,
+    /// ステップ中にこのユニットが受けた被弾価値と反撃価値の合計。
+    pub received: i64,
+    pub counter_received: i64,
+    /// 合併で別Entityへ統合された可能性。消失理由の誤判定を避けるための手掛かり。
+    pub merged: bool,
+}
+
+/// 前線帯に存在する1体の観測値。境界をまたがない移動でも残数を照合できる。
+#[derive(Debug, Serialize)]
+pub struct FrontlineUnitSnapshot {
+    pub player_id: u32,
+    pub unit_id: u64,
+    pub unit_type: String,
+    pub cost: u32,
+    pub hp: u32,
+    pub x: usize,
+    pub y: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -759,6 +809,8 @@ pub struct InvasionTraceCollector {
     attacked_cursor: EventCursor<UnitAttackedEvent>,
     produced_cursor: EventCursor<UnitProducedEvent>,
     capture_cursor: EventCursor<PropertyCaptureProgressedEvent>,
+    /// 診断ONのときだけ合併Entityを読み、前線の消失を撃破と誤判定しない。
+    merged_cursor: Option<EventCursor<UnitMergedEvent>>,
 }
 
 impl InvasionTraceCollector {
@@ -771,6 +823,8 @@ impl InvasionTraceCollector {
             capture_cursor: world
                 .resource::<Events<PropertyCaptureProgressedEvent>>()
                 .get_cursor(),
+            merged_cursor: campaign_front_audit_enabled()
+                .then(|| world.resource::<Events<UnitMergedEvent>>().get_cursor()),
         }
     }
 
@@ -782,8 +836,16 @@ impl InvasionTraceCollector {
         player_id: u32,
         step: usize,
         units_before: &HashMap<u64, UnitTraceSnapshot>,
+        action: Option<&str>,
     ) -> Vec<InvasionEvent> {
         let units_after = snapshot_units(world);
+        let front_audit = campaign_front_audit_enabled();
+        // 診断OFFでも環境変数の読取りを繰り返さない。判定には一切関与しない。
+        let (front_y_min, front_y_max) = front_audit
+            .then(engine::ai::features::campaign_front_audit_band)
+            .unwrap_or((0, 0));
+        // 攻撃の防御側被弾と攻撃側反撃をID単位に集計する。診断OFFなら一切作らない。
+        let mut step_damage: HashMap<u64, (i64, i64)> = HashMap::default();
         let mut result = Vec::new();
         if let Some(mut probe) = engine::ai::wait_probe::take_issued(world) {
             let unit_id = probe["unit_id"].as_u64().unwrap_or_default();
@@ -894,6 +956,18 @@ impl InvasionTraceCollector {
             let Some(defender_before) = units_before.get(&event.defender.to_bits()) else {
                 continue;
             };
+            let damage_value_dealt =
+                calculate_damage_value(defender_before, units_after.get(&event.defender.to_bits()));
+            let counter_value_received =
+                calculate_damage_value(attacker_before, units_after.get(&event.attacker.to_bits()));
+            // 診断ON時だけ、同じ攻撃をID単位の前線消耗へ集計する。
+            // 既存のUnitAttackedイベントにも同じ値を出すため読み取りはここ1回だけ。
+            if front_audit {
+                let counter = &mut step_damage.entry(event.attacker.to_bits()).or_default().1;
+                *counter = counter.saturating_add(counter_value_received);
+                let received = &mut step_damage.entry(event.defender.to_bits()).or_default().0;
+                *received = received.saturating_add(damage_value_dealt);
+            }
             result.push(InvasionEvent::UnitAttacked {
                 turn,
                 player_id,
@@ -904,14 +978,8 @@ impl InvasionTraceCollector {
                 defender_id: event.defender.to_bits(),
                 defender_player_id: defender_before.player_id,
                 defender_unit_type: defender_before.unit_type.as_str().to_string(),
-                damage_value_dealt: calculate_damage_value(
-                    defender_before,
-                    units_after.get(&event.defender.to_bits()),
-                ),
-                counter_value_received: calculate_damage_value(
-                    attacker_before,
-                    units_after.get(&event.attacker.to_bits()),
-                ),
+                damage_value_dealt,
+                counter_value_received,
             });
         }
 
@@ -938,6 +1006,106 @@ impl InvasionTraceCollector {
                 completed: event.completed,
             });
         }
+        // 診断ON時だけ、前線帯の境界をまたいだ個体と被弾・反撃・合併を結び付ける。
+        // 既存の侵攻イベントやAIの判定は変更せず、後続の解析だけが参照する。
+        if front_audit {
+            let merged = self
+                .merged_cursor
+                .as_mut()
+                .map(|cursor| {
+                    cursor
+                        .read(world.resource::<Events<UnitMergedEvent>>())
+                        .map(|event| event.source_entity.to_bits())
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
+
+            let front = |units: &HashMap<u64, UnitTraceSnapshot>,
+                         side: u32|
+             -> Vec<FrontlineUnitSnapshot> {
+                let mut rows = units
+                    .iter()
+                    .filter(|(_, unit)| {
+                        unit.player_id == side
+                            && (front_y_min..=front_y_max).contains(&unit.position.y)
+                    })
+                    .map(|(id, unit)| FrontlineUnitSnapshot {
+                        player_id: unit.player_id,
+                        unit_id: *id,
+                        unit_type: unit.unit_type.as_str().to_owned(),
+                        cost: unit.cost,
+                        hp: unit.health,
+                        x: unit.position.x,
+                        y: unit.position.y,
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(|row| row.unit_id);
+                rows
+            };
+            let in_band =
+                |unit: &UnitTraceSnapshot| (front_y_min..=front_y_max).contains(&unit.position.y);
+            let mut touched = Vec::new();
+            for id in units_before
+                .keys()
+                .chain(units_after.keys())
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+            {
+                let before = units_before.get(&id);
+                let after = units_after.get(&id);
+                // 敵手番の攻撃で自軍前線が減るため、手番側に限らず両勢力を記録する。
+                let Some(unit) = before.or(after) else {
+                    continue;
+                };
+                // 前線の境界をまたいだ個体と、前線内で被弾・反撃を受けた個体だけを残す。
+                // 前線外の攻撃は「被弾」として数えず、消耗の過大計上を避ける。
+                let was_in_band = before.is_some_and(in_band);
+                let is_in_band = after.is_some_and(in_band);
+                let crosses = was_in_band != is_in_band;
+                let received = if was_in_band || is_in_band {
+                    step_damage.get(&id).copied().unwrap_or_default()
+                } else {
+                    (0, 0)
+                };
+                if !crosses && received == (0, 0) && !merged.contains(&id) {
+                    continue;
+                }
+                touched.push(FrontlineUnitTransition {
+                    player_id: unit.player_id,
+                    unit_id: id,
+                    unit_type: unit.unit_type.as_str().to_owned(),
+                    cost: unit.cost,
+                    can_capture: unit.can_capture,
+                    max_cargo: unit.max_cargo,
+                    before_x: before.map(|unit| unit.position.x),
+                    before_y: before.map(|unit| unit.position.y),
+                    before_hp: before.map(|unit| unit.health),
+                    after_x: after.map(|unit| unit.position.x),
+                    after_y: after.map(|unit| unit.position.y),
+                    after_hp: after.map(|unit| unit.health),
+                    received: received.0,
+                    counter_received: received.1,
+                    merged: merged.contains(&id),
+                });
+            }
+            touched.sort_by_key(|row| row.unit_id);
+            if !touched.is_empty() {
+                result.push(InvasionEvent::CampaignFrontlineAudit {
+                    turn,
+                    player_id,
+                    step,
+                    action: action.map(str::to_owned),
+                    front_y_min,
+                    front_y_max,
+                    boundary_changes: touched,
+                    front_units_before: front(units_before, player_id),
+                    front_units_after: front(&units_after, player_id),
+                    enemy_units_before: front(units_before, 3 - player_id),
+                    enemy_units_after: front(&units_after, 3 - player_id),
+                });
+            }
+        }
+
         result
     }
 }
@@ -1936,7 +2104,7 @@ mod tests {
             // このテストはcollect_stepの結合を検証するため、適用後snapshotの位置だけを与える。
             *world.get_mut::<GridPosition>(unit).unwrap() = after;
             let turn = world.resource::<MatchState>().current_turn_number.0;
-            let events = collector.collect_step(&mut world, turn, 1, 7, &before);
+            let events = collector.collect_step(&mut world, turn, 1, 7, &before, None);
             let value = serde_json::to_value(&events).unwrap();
             let probe = value
                 .as_array()
@@ -1950,7 +2118,7 @@ mod tests {
             assert_eq!(probe["probe"]["selection_stage"], "untraced");
             assert!(
                 collector
-                    .collect_step(&mut world, turn, 1, 8, &before)
+                    .collect_step(&mut world, turn, 1, 8, &before, None)
                     .is_empty(),
                 "前stepの診断を再利用しない"
             );
