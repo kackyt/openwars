@@ -415,6 +415,11 @@ impl CampaignAnalysisSnapshot {
                 && property.property.owner_id == Some(player_id)
         });
         if has_foothold {
+            // 診断: 前線帯の目標数で占領要求がどう縮小したかを記録する。
+            // 判定には関与せず、環境変数が指定された時だけ stderr へ出す。
+            let front_audit = crate::ai::features::campaign_front_audit_enabled();
+            let before =
+                front_audit.then_some((requirement.capture_units, requirement.total_budget));
             // 同一陸塊の全未所有施設ではなく、今手番に選んだ前線帯だけを同時要求する。
             // 後方の施設は前線取得後に毎手番再評価するため、将来分の占領兵費用を
             // 現在作戦へ先取りしない。
@@ -429,6 +434,22 @@ impl CampaignAnalysisSnapshot {
                 .total_budget
                 .saturating_sub(released_capture_units.saturating_mul(1_000));
             assessment.required_budget = requirement.total_budget;
+            if let Some((before_units, before_budget)) = before {
+                let positions = capture_target_positions
+                    .iter()
+                    .map(|position| format!("({},{})", position.x, position.y))
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "CAMPAIGN_LIMIT_AUDIT player={:?} targets={} units={}->{} budget={}->{} released={}",
+                    player_id,
+                    positions.join("|"),
+                    before_units,
+                    requirement.capture_units,
+                    before_budget,
+                    requirement.total_budget,
+                    released_capture_units,
+                );
+            }
         }
     }
 

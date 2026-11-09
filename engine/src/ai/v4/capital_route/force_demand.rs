@@ -1,5 +1,6 @@
 //! 陸続きルートの兵力需要と突破実績。
 
+use crate::ai::features::campaign_scope_audit_enabled;
 use crate::ai::v4::capital_route::model::{
     RouteBreakthroughKey, RouteBreakthroughRegistry, RouteForceDemand,
 };
@@ -9,7 +10,6 @@ use crate::ai::v4::capital_route::topology::{
     movement_step_distances, same_land_armored_route_gates, same_land_route_fronts,
     terrain_component_membership,
 };
-use crate::ai::v4::trace::campaign_scope_audit_enabled;
 use crate::ai::v4::{
     CampaignPlanningObjective, Entity, Faction, GridPosition, HashMap, HashSet, Health, Map,
     MasterDataRegistry, MovementType, OperationKind, PlayerId, Property, Terrain, UnitRegistry,

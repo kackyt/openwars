@@ -1,3 +1,4 @@
+use crate::ai::features::campaign_scope_audit_enabled;
 use crate::ai::v4::enemy_forecast::{
     EXPECTED_REINFORCEMENT_WAVES, EnemyReinforcementEnvelope, ReinforcementScenario,
     projected_enemy_reinforcement_envelope,
@@ -6,7 +7,6 @@ use crate::ai::v4::property_control::{
     EARLY_PROPERTY_CONTROL_HORIZON, capture_race_behind, enemy_capture_completion_offset,
     select_property_control_plan,
 };
-use crate::ai::v4::trace::campaign_scope_audit_enabled;
 use crate::ai::v4::*;
 
 #[allow(unused_imports)]

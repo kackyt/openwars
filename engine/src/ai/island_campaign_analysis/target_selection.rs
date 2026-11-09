@@ -164,25 +164,38 @@ pub(super) fn candidate_capture_target_positions(
         Vec::new()
     };
 
+    // 同一陸塊で複数の進軍軸（上段・下段等）がある場合、各ルートの最寄り拠点を
+    // 独立に保持する。単一前線で一括切断すると、片方のルートの占領が消滅する。
+    let nearest_route = |position: GridPosition| {
+        route_fronts
+            .iter()
+            .enumerate()
+            .min_by_key(|(route, front)| {
+                (
+                    map.distance(position.x, position.y, front.x, front.y),
+                    *route,
+                )
+            })
+            .map_or(0, |(route, _)| route)
+    };
     // 既に足場がある陸塊では、最短前線とその隣接帯だけを同時実行対象にする。
     // 全未所有施設は毎手番再観測するため捨てず、前線取得後に次の帯へ昇格する。
     // 足場のない島は輸送波の目的目的一覧を縮めると再上陸が遅れるため従来どおり保持する。
     if !origins.is_empty() {
+        // 診断: 前線帯フィルタの入力（全目標と距離・進軍軸）と、除外された物件を記録する。
+        // 判定には一切関与せず、環境変数が指定された時だけ stderr へ出す。
+        let front_audit = crate::ai::features::campaign_front_audit_enabled();
+        let before_filter = front_audit.then(|| {
+            targets
+                .iter()
+                .map(|position| {
+                    let route = nearest_route(*position);
+                    let distance = target_priority(*position).1;
+                    (*position, route, distance)
+                })
+                .collect::<Vec<_>>()
+        });
         if route_fronts.len() >= 2 {
-            // 同一陸塊で複数の進軍軸（上段・下段等）がある場合、各ルートの最寄り拠点を
-            // 独立に保持する。単一前線で一括切断すると、片方のルートの占領が消滅する。
-            let nearest_route = |position: GridPosition| {
-                route_fronts
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(route, front)| {
-                        (
-                            map.distance(position.x, position.y, front.x, front.y),
-                            *route,
-                        )
-                    })
-                    .map_or(0, |(route, _)| route)
-            };
             let mut min_distance_by_route: crate::collections::HashMap<usize, u32> =
                 crate::collections::HashMap::default();
             for target in &targets {
@@ -204,6 +217,35 @@ pub(super) fn candidate_capture_target_positions(
         {
             targets
                 .retain(|target| target_priority(*target).1 <= nearest_distance.saturating_add(2));
+        }
+        if let Some(before) = before_filter {
+            let removed = before
+                .iter()
+                .filter(|(position, _, _)| !targets.contains(position))
+                .map(|(position, route, distance)| {
+                    format!("({},{}) r{} d{}", position.x, position.y, route, distance)
+                })
+                .collect::<Vec<_>>();
+            let kept_detail = before
+                .iter()
+                .filter(|(position, _, _)| targets.contains(position))
+                .map(|(position, route, distance)| {
+                    format!("({},{}) r{} d{}", position.x, position.y, route, distance)
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "CAMPAIGN_FRONT_AUDIT player={:?} primary=({},{}) routes={:?} origins={} kept={} removed={}",
+                player_id,
+                primary_target.x,
+                primary_target.y,
+                route_fronts
+                    .iter()
+                    .map(|front| (front.x, front.y))
+                    .collect::<Vec<_>>(),
+                origins.len(),
+                kept_detail.join("|"),
+                removed.join("|"),
+            );
         }
     }
     if let Some(index) = targets
