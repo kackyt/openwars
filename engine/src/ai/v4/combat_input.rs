@@ -1,8 +1,8 @@
+use crate::ai::features::campaign_scope_audit_enabled;
 use crate::ai::v4::property_control::{
     EARLY_PROPERTY_CONTROL_HORIZON, PropertyControlApproach, enemy_capture_completion_offset,
     player_order, property_durability,
 };
-use crate::ai::v4::trace::campaign_scope_audit_enabled;
 use crate::ai::v4::*;
 
 #[allow(unused_imports)]

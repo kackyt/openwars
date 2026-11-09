@@ -5,13 +5,13 @@ use super::capital_route::force_demand::{
     RouteRegion, concentrate_route_efforts, defend_outmatched_routes, region_holder,
     split_bridge_route_objectives, split_route_front_objectives,
 };
+use crate::ai::features::campaign_scope_audit_enabled;
 use crate::ai::v4::capital_route::node_operation::{
     capital_route_assault_authorized_from_dag, capital_route_front_properties,
 };
 use crate::ai::v4::capital_route::topology::{
     armored_entry_bridge_gates, same_land_capital_front_reached,
 };
-use crate::ai::v4::trace::campaign_scope_audit_enabled;
 use crate::resources::MovementType;
 
 /// 進軍路の配分案を比べるとき、拠点や首都の収入を何ターン分の価値とみなすか。
