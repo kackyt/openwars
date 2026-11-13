@@ -13,10 +13,10 @@
 use super::approach::{ApproachDistances, nearest_approach_bonus, with_turn_distances};
 use super::board::{SquadRoles, TacticalBoard, movable_units_and_occupancy};
 use super::scoring::{
-    BestAction, BestUnitAction, CAPTURE_SCORE, Rank, assess_attack, assess_merge,
-    attack_serves_campaign, capture_or_hunt_score, empty_transport_return_score, repair_site_at,
-    solo_enemy_approach_score, squad_target_approach_score, stranded_infantry_score,
-    terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
+    BestAction, CAPTURE_SCORE, Rank, assess_attack, assess_merge, attack_serves_campaign,
+    capture_or_hunt_score, empty_transport_return_score, repair_site_at, solo_enemy_approach_score,
+    squad_target_approach_score, stranded_infantry_score, terrain_defense_bonus,
+    v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -44,17 +44,62 @@ use std::collections::BTreeSet;
 
 /// Squad executorから渡されたmember集合（Noneなら全unit）から最良の1手を選び、
 /// 評価内訳をEventで通知する。
+#[cfg(test)]
 pub(crate) fn decide_action(
     world: &mut World,
     player_id: PlayerId,
     skip_entities: &HashSet<Entity>,
     permitted: Option<&HashSet<Entity>>,
 ) -> Option<(Entity, AiCommand)> {
+    let batch = evaluate_actions(world, player_id, skip_entities, permitted);
+    let mut best = None;
+    for (index, action) in batch.actions.iter().enumerate() {
+        if best.is_none_or(|previous: usize| action.rank > batch.actions[previous].rank) {
+            best = Some(index);
+        }
+    }
+    best.map(|index| batch.choose(world, index))
+}
+
+/// 未確定の部隊行動。命令は現在の盤面で合法な既存評価の最良手だけを保持する。
+struct EvaluatedAction {
+    pub entity: Entity,
+    pub origin: GridPosition,
+    pub command: AiCommand,
+    pub rank: Rank,
+    pub movement: Option<execution_order::MovementIntent>,
+}
+
+/// 同じ盤面を使って一度だけ評価した候補群。通知は最終選択時にだけ発行する。
+struct EvaluatedActions {
+    pub actions: Vec<EvaluatedAction>,
+    pub board: TacticalBoard,
+}
+
+impl EvaluatedActions {
+    pub fn choose(mut self, world: &mut World, index: usize) -> (Entity, AiCommand) {
+        let action = self.actions.swap_remove(index);
+        super::scoring::report_evaluated_action(
+            world,
+            &self.board,
+            action.entity,
+            &action.command,
+            action.rank.1,
+        );
+        (action.entity, action.command)
+    }
+}
+
+/// 既存の兵種別候補・採点・所属を変えずに、各部隊の最良手を集める。
+/// 依存先を調べるための再帰的な採点や、未実行候補の評価イベント送信は行わない。
+fn evaluate_actions(
+    world: &mut World,
+    player_id: PlayerId,
+    skip_entities: &HashSet<Entity>,
+    permitted: Option<&HashSet<Entity>>,
+) -> EvaluatedActions {
     let (movable_units, occupancy) =
         movable_units_and_occupancy(world, player_id, skip_entities, permitted);
-    if movable_units.is_empty() {
-        return None;
-    }
     let manager = world
         .get_resource::<SquadManager>()
         .cloned()
@@ -62,20 +107,30 @@ pub(crate) fn decide_action(
     let squads = SquadRoles::for_small_map(world, player_id, manager);
     let tactical = TacticalBoard::observe(world, player_id, occupancy, squads);
     let board = SmallMapBoard::observe(world, tactical);
-    let best = with_turn_distances(world, &board.tactical, |world, distances| {
-        let mut best = BestUnitAction::default();
-        for entity in movable_units {
-            let Some(unit) = SmallMapUnit::observe(world, &board, entity, distances) else {
-                continue;
-            };
-            best.offer(
-                entity,
-                best_action_for_unit(world, &board, &unit, distances),
-            );
-        }
-        best
+    let actions = with_turn_distances(world, &board.tactical, |world, distances| {
+        movable_units
+            .into_iter()
+            .filter_map(|entity| {
+                let unit = SmallMapUnit::observe(world, &board, entity, distances)?;
+                let (rank, command) =
+                    best_action_for_unit(world, &board, &unit, distances).into_inner()?;
+                let movement = execution_order::MovementIntent::observe(
+                    world, &board, &unit, &command, distances,
+                );
+                Some(EvaluatedAction {
+                    entity,
+                    origin: unit.state.position,
+                    command,
+                    rank,
+                    movement,
+                })
+            })
+            .collect()
     });
-    best.choose(world, &board.tactical)
+    EvaluatedActions {
+        actions,
+        board: board.tactical,
+    }
 }
 
 /// 小規模マップの行動選択で全unitが共有する盤面の事実。
@@ -223,6 +278,8 @@ struct SmallMapUnit {
     has_offensive_mission: bool,
     is_capture_mission: bool,
     capture_contract: Option<CaptureContract>,
+    /// 味方の退去後にも、通常と同じ移動候補制約を再利用するための事実。
+    has_capture_target: bool,
     is_solo: bool,
     starts_on_own_production: bool,
     candidate_tiles: Vec<(usize, usize)>,
@@ -390,6 +447,7 @@ impl SmallMapUnit {
             has_offensive_mission,
             is_capture_mission,
             capture_contract,
+            has_capture_target: small_map_capture_target.is_some(),
             is_solo,
             starts_on_own_production,
             candidate_tiles,
@@ -1065,4 +1123,5 @@ fn prefer_fire_in_place(
     }
 }
 
+mod execution_order;
 pub(crate) mod squad_executor;
