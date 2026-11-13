@@ -620,7 +620,7 @@ pub(crate) fn assess_merge(
 }
 
 /// AIが決定した最善の行動の評価をEventとして送出する。
-fn report_evaluated_action(
+pub(super) fn report_evaluated_action(
     world: &mut World,
     board: &TacticalBoard,
     entity: Entity,

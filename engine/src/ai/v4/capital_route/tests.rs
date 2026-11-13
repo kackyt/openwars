@@ -572,6 +572,117 @@ fn route_order_is_shared_by_members_of_the_same_squad() {
     assert_eq!(capital_route_waypoint(&world, player, unassigned), None);
 }
 
+/// 異兵種の前衛が退くとDAGの到達先自体が変わる。古い到達先のまま後続を確定しない。
+#[test]
+fn dag_partial_advance_recomputes_the_destination_after_friendly_departure() {
+    use crate::ai::v4::capital_route::model::{CapitalRouteNodeId, CapitalRouteTopology};
+    use crate::components::{ActionCompleted, Fuel, HasMoved};
+    let _path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+    let player = PlayerId(1);
+    let island = crate::ai::islands::IslandId(0);
+    let mut world = World::new();
+    world.insert_resource(flat_map(8, 1));
+    world.insert_resource(MasterDataRegistry::load().unwrap());
+    world.insert_resource(crate::resources::DamageChart::new());
+    let mut settings = crate::ai::ai_version::PlayerAiSettings::default();
+    settings.set_version(player, crate::ai::ai_version::AiVersion::V4);
+    world.insert_resource(settings);
+    let spawn = |world: &mut World, kind: UnitType, x| {
+        let mut stats = world
+            .resource::<MasterDataRegistry>()
+            .create_unit_stats(&crate::resources::master_data::UnitName(
+                kind.as_str().to_owned(),
+            ))
+            .unwrap();
+        stats.max_movement = 3;
+        world
+            .spawn((
+                Faction(player),
+                pos(x, 0),
+                stats,
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Fuel {
+                    current: 99,
+                    max: 99,
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id()
+    };
+    let rear = spawn(&mut world, UnitType::Tank, 0);
+    let front = spawn(&mut world, UnitType::MdTank, 3);
+    let rear_squad = assign_route_squad(&mut world, player, MissionType::Attack, &[rear]);
+    let front_squad = assign_route_squad(&mut world, player, MissionType::Attack, &[front]);
+    let target = pos(7, 0);
+    for squad in world
+        .resource_mut::<crate::ai::squad::SquadManager>()
+        .squads
+        .iter_mut()
+    {
+        squad.plan.target = Some(target);
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+    }
+    let corridor = (0..8).map(|x| pos(x, 0)).collect::<Vec<_>>();
+    let commitment = || CapitalRouteCommitment {
+        player_id: player,
+        island_id: island,
+        route: CapitalRouteId(0),
+        target,
+        target_anchor: target,
+        objective: CapitalRouteNodeObjective::Control,
+        scope: CapitalRouteNodeScope::Point,
+        control_area: vec![target],
+        capture_targets: Vec::new(),
+        crossing_exit: None,
+        crossed: false,
+        execution_target: target,
+        frontline_capacity: 1,
+        path: corridor.clone(),
+        phase: CapitalRouteExecutionPhase::Advance,
+    };
+    world.insert_resource(CapitalRoutePathRegistry {
+        commitments: HashMap::from_iter([(rear_squad, commitment()), (front_squad, commitment())]),
+        ..Default::default()
+    });
+    world.insert_resource(CapitalRouteTopologyRegistry {
+        topologies: HashMap::from_iter([(
+            CapitalRouteTopologyKey {
+                player_id: player,
+                island_id: island,
+            },
+            CapitalRouteTopology {
+                start_node: CapitalRouteNodeId(0),
+                goal_node: CapitalRouteNodeId(0),
+                nodes: Vec::new(),
+                corridor: corridor.clone(),
+                routes: Vec::new(),
+                property_routes: HashMap::default(),
+                from_home: corridor
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (*p, i as u32))
+                    .collect(),
+                beachhead: false,
+            },
+        )]),
+    });
+    let (actor, command) = crate::ai::tactics::small_map::squad_executor::decide_squad_action_v4(
+        &mut world,
+        player,
+        &HashSet::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        actor, front,
+        "DAGの後続を部分前進で確定する前に前方を退去させる: {command:?}"
+    );
+    assert!(matches!(command, crate::ai::AiCommand::Wait { target_pos } if target_pos == pos(6,0)));
+}
+
 #[test]
 fn only_capturer_claims_an_unsecured_route_milestone() {
     let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
