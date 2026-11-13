@@ -482,6 +482,11 @@ fn command_for_order(
             target_entity: enemy.entity,
         }
     } else {
+        // その場で待つだけなら防衛命令で行動を確定せず、通常戦術の判断へ委ねる。
+        // 防衛射撃と指定射点へ向かう移動は維持し、担当割当そのものは変更しない。
+        if position == unit.position {
+            return None;
+        }
         AiCommand::Wait {
             target_pos: position,
         }
@@ -705,6 +710,84 @@ mod tests {
                 .unwrap()
                 .orders
                 .is_empty()
+        );
+    }
+
+    /// 防衛のための移動は、射点が工場でも元の到着先を維持する。
+    #[test]
+    fn defense_movement_keeps_its_factory_firing_position() {
+        let mut world = board();
+        let factory = position(2, 1);
+        world
+            .resource_mut::<Map>()
+            .set_terrain(factory.x, factory.y, Terrain::Factory)
+            .unwrap();
+        world.spawn((
+            factory,
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+        let defender = unit(&mut world, PlayerId(1), UnitType::Tank, position(1, 1));
+        let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(8, 4));
+        let order = DefenseOrder {
+            unit: defender,
+            enemy,
+            property: position(2, 2),
+            firing_position: factory,
+            departure_due: true,
+        };
+        let action = command_for_order(&world, order, &HashSet::default());
+        assert!(
+            matches!(action, Some((entity, AiCommand::Wait { target_pos })) if entity == defender && target_pos == factory),
+            "指定された防衛射点への移動は工場でも変更しない: {action:?}"
+        );
+    }
+
+    /// その場で待つだけの防衛命令は出さず、通常戦術の射撃・移動・待機の選択へ委ねる。
+    #[test]
+    fn stationary_defense_wait_is_delegated_to_normal_tactics() {
+        let mut world = board();
+        let origin = position(1, 1);
+        let defender = unit(&mut world, PlayerId(1), UnitType::Tank, origin);
+        let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(8, 4));
+        let order = DefenseOrder {
+            unit: defender,
+            enemy,
+            property: position(2, 2),
+            firing_position: origin,
+            departure_due: true,
+        };
+        assert!(
+            command_for_order(&world, order, &HashSet::default()).is_none(),
+            "定位置の防衛待機は通常戦術へ戻す"
+        );
+    }
+
+    /// 定位置から防衛対象を撃てるときは、委譲せず射撃命令を維持する。
+    #[test]
+    fn stationary_defense_attack_is_not_delegated() {
+        let mut world = board();
+        let origin = position(1, 1);
+        world
+            .resource_mut::<Map>()
+            .set_terrain(origin.x, origin.y, Terrain::Factory)
+            .unwrap();
+        world.spawn((
+            origin,
+            Property::new(Terrain::Factory, Some(PlayerId(1)), 200),
+        ));
+        let defender = unit(&mut world, PlayerId(1), UnitType::Tank, origin);
+        let enemy = unit(&mut world, PlayerId(2), UnitType::Infantry, position(2, 1));
+        let order = DefenseOrder {
+            unit: defender,
+            enemy,
+            property: position(2, 2),
+            firing_position: origin,
+            departure_due: true,
+        };
+        let action = command_for_order(&world, order, &HashSet::default());
+        assert!(
+            matches!(action, Some((entity, AiCommand::Attack { target_pos, target_entity })) if entity == defender && target_pos == origin && target_entity == enemy),
+            "成立する防衛射撃は変更しない: {action:?}"
         );
     }
 }
