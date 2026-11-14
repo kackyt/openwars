@@ -14,6 +14,7 @@ pub(crate) struct TacticalSnapshotUnit {
     pub(crate) ammo1: u32,
     pub(crate) ammo2: u32,
     pub(crate) is_transporting: bool,
+    has_cargo: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,8 +56,9 @@ impl AiTacticalSnapshot {
                 &UnitStats,
                 Option<&crate::components::Ammo>,
                 Option<&crate::components::Transporting>,
+                Option<&crate::components::CargoCapacity>,
             )>();
-            for (entity, position, faction, stats, ammo, transporting) in query.iter(world) {
+            for (entity, position, faction, stats, ammo, transporting, cargo) in query.iter(world) {
                 let index = units.len();
                 units.push(TacticalSnapshotUnit {
                     entity,
@@ -66,6 +68,7 @@ impl AiTacticalSnapshot {
                     ammo1: ammo.map_or(0, |value| value.ammo1),
                     ammo2: ammo.map_or(0, |value| value.ammo2),
                     is_transporting: transporting.is_some(),
+                    has_cargo: cargo.is_some_and(|capacity| !capacity.loaded.is_empty()),
                 });
                 unit_indices.insert(entity, index);
                 units_by_position
@@ -166,7 +169,11 @@ impl AiTacticalSnapshot {
             .iter()
             .filter_map(|&index| {
                 let target = self.units[index];
-                (target.entity != attacker
+                (!attacker_unit.is_transporting
+                    && !attacker_unit.has_cargo
+                    && !target.is_transporting
+                    && !target.has_cargo
+                    && target.entity != attacker
                     && target.faction == attacker_unit.faction
                     && target.unit_type == stats.unit_type)
                     .then_some(target.entity)

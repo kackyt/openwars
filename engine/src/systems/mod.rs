@@ -41,6 +41,8 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             remove_destroyed_units_system,
             capture_property_system,
             merge_unit_system,
+            // 撃破された輸送役の搭載部隊を、勝敗判定より先に再帰的に除去する。
+            cleanup_cargo_system,
             supply_unit_system,
             load_unit_system,
             unload_unit_system,
@@ -58,4 +60,92 @@ pub fn add_main_game_systems(schedule: &mut Schedule) {
             .chain()
             .in_set(GameSystemSet),
     );
+}
+
+#[cfg(test)]
+mod cargo_victory_tests {
+    use crate::components::{CargoCapacity, Faction, Health, PlayerId, Transporting};
+    use crate::resources::{GameOverCondition, MatchState, master_data::MasterDataRegistry};
+
+    /// 本番スケジュールで輸送船が撃破されたら、入れ子の搭載兵も消え全滅勝利する。
+    #[test]
+    fn destroyed_nested_cargo_does_not_prevent_elimination_victory() {
+        let data = MasterDataRegistry::load().unwrap();
+        let (mut world, mut schedule) =
+            crate::setup::initialize_world_from_master_data(&data, "map_33").unwrap();
+        let existing = world
+            .query::<(bevy_ecs::prelude::Entity, &Faction)>()
+            .iter(&world)
+            .map(|(entity, _)| entity)
+            .collect::<Vec<_>>();
+        for entity in existing {
+            world.despawn(entity);
+        }
+        world.resource_mut::<MatchState>().current_turn_number.0 = 2;
+        world.spawn((
+            Faction(PlayerId(2)),
+            Health {
+                current: 100,
+                max: 100,
+            },
+        ));
+        let ship = world
+            .spawn((
+                Faction(PlayerId(1)),
+                Health {
+                    current: 0,
+                    max: 100,
+                },
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+        let vehicle = world
+            .spawn((
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Transporting(ship),
+                CargoCapacity {
+                    max: 1,
+                    loaded: vec![],
+                },
+            ))
+            .id();
+        let infantry = world
+            .spawn((
+                Faction(PlayerId(1)),
+                Health {
+                    current: 100,
+                    max: 100,
+                },
+                Transporting(vehicle),
+            ))
+            .id();
+        world
+            .get_mut::<CargoCapacity>(ship)
+            .unwrap()
+            .loaded
+            .push(vehicle);
+        world
+            .get_mut::<CargoCapacity>(vehicle)
+            .unwrap()
+            .loaded
+            .push(infantry);
+        schedule.run(&mut world);
+        assert!(world.get_entity(ship).is_err());
+        assert!(world.get_entity(vehicle).is_err());
+        assert!(
+            world.get_entity(infantry).is_err(),
+            "入れ子の歩兵が孤立して残ってはならない"
+        );
+        assert_eq!(
+            world.resource::<MatchState>().game_over,
+            Some(GameOverCondition::Winner(PlayerId(2)))
+        );
+    }
 }
