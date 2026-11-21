@@ -40,6 +40,7 @@ mod production_pipeline;
 pub mod rolling_plan;
 mod slot_demand;
 pub mod trace;
+mod unified_production;
 pub mod victory_roadmap;
 use crate::ai::planning::decision::AdoptedTurnPortfolio;
 use crate::ai::production::allocation::AllocationState;

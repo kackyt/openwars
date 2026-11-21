@@ -79,6 +79,11 @@ impl ProductionPolicy {
         }
     }
 
+    /// 小規模マップで模擬戦を使わない単一統合生産評価を使うか。`enabled` は環境変数による切替。
+    pub(in crate::ai::v4) fn unified_production(self, enabled: bool) -> bool {
+        self == Self::SmallMap && enabled
+    }
+
     pub(in crate::ai::v4) fn allocates_surplus(self) -> bool {
         self == Self::SmallMap
     }
@@ -311,5 +316,19 @@ impl CaptureSlotPolicy for CaptureArrivalPolicy {
         .unwrap_or(u32::MAX);
         let committed_best = committed_capture_arrival(scan, ctx, anchor, self.player_id);
         property_control::capture_speed_fitness(candidate_arrival, committed_best)
+    }
+}
+
+#[cfg(test)]
+mod unified_production_tests {
+    use super::ProductionPolicy;
+
+    #[test]
+    fn unified_production_is_only_for_small_map_when_enabled() {
+        // 小規模マップかつ統合評価フラグが有効なときだけ、統合生産評価を使う。
+        assert!(ProductionPolicy::SmallMap.unified_production(true));
+        assert!(!ProductionPolicy::SmallMap.unified_production(false));
+        assert!(!ProductionPolicy::Standard.unified_production(true));
+        assert!(!ProductionPolicy::Standard.unified_production(false));
     }
 }

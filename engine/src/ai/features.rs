@@ -11,6 +11,11 @@ pub fn prediction_ledger_enabled() -> bool {
     std::env::var_os("OPENWARS_PREDICTION_LEDGER").is_some()
 }
 
+/// 小規模マップのV4生産で、模擬戦に頼らない単一統合生産評価を使う。既定では無効。
+pub fn unified_production_eval_enabled() -> bool {
+    std::env::var_os("OPENWARS_UNIFIED_PRODUCTION").is_some()
+}
+
 /// 物件契約と保護供給の帰属を照合する任意の診断出力。既定では無効。
 pub fn campaign_scope_audit_enabled() -> bool {
     std::env::var_os("OPENWARS_CAMPAIGN_SCOPE_AUDIT").is_some()
