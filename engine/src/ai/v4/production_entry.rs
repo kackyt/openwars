@@ -258,20 +258,35 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         plan_contract::PlanContractRegistry::default()
     };
     rolling_registry.reconcile_produced_steps(player_id, &produced_plan_steps);
-    let input = production_pipeline::ProductionInputs {
-        policy,
-        scan: &scan,
-        player_id,
-        allow_structural_slots: campaign_surplus.is_none(),
-        committed_combat_assignments: &committed_combat_assignments,
-        advancing_route_entities: &advancing_route_entities,
-        turn,
-    };
-    let (planned, mut plan_trace) = production_pipeline::plan_production_with_registry(
-        &input,
-        &mut rolling_registry,
-        &mut contract_registry,
-    );
+    let (planned, mut plan_trace) =
+        if policy.unified_production(crate::ai::features::unified_production_eval_enabled()) {
+            let recent_enemy =
+                enemy_forecast::recent_observed_enemy_productions(world, player_id, turn, 3);
+            let extras = unified_production::collect_board_extras(world, player_id);
+            unified_production::plan_unified_production(
+                &scan,
+                &extras,
+                player_id,
+                turn,
+                campaign_surplus.is_none(),
+                &recent_enemy,
+            )
+        } else {
+            let input = production_pipeline::ProductionInputs {
+                policy,
+                scan: &scan,
+                player_id,
+                allow_structural_slots: campaign_surplus.is_none(),
+                committed_combat_assignments: &committed_combat_assignments,
+                advancing_route_entities: &advancing_route_entities,
+                turn,
+            };
+            production_pipeline::plan_production_with_registry(
+                &input,
+                &mut rolling_registry,
+                &mut contract_registry,
+            )
+        };
     plan_trace.enemy_production_forecast = enemy_production_forecast;
     if policy.uses_joint_capture() {
         world.insert_resource(contract_registry);

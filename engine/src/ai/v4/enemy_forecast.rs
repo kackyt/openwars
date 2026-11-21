@@ -49,6 +49,31 @@ pub(in crate::ai::v4) struct EnemyProductionEstimator {
     pub(in crate::ai::v4) by_observer: HashMap<PlayerId, EnemyProductionEstimatorState>,
 }
 
+/// 直近 `window_turns` ターン以内に観測した敵生産 `(turn, unit_type)` の一覧を返す。
+pub(in crate::ai::v4) fn recent_observed_enemy_productions(
+    world: &World,
+    player_id: PlayerId,
+    turn: u32,
+    window_turns: u32,
+) -> Vec<(u32, UnitType)> {
+    let Some(estimator) = world.get_resource::<EnemyProductionEstimator>() else {
+        return Vec::new();
+    };
+    let Some(state) = estimator.by_observer.get(&player_id) else {
+        return Vec::new();
+    };
+    if window_turns == 0 {
+        return Vec::new();
+    }
+    let min_turn = turn.saturating_sub(window_turns.saturating_sub(1));
+    state
+        .history
+        .iter()
+        .filter(|production| production.turn >= min_turn)
+        .map(|production| (production.turn, production.unit_type))
+        .collect()
+}
+
 /// 直近の実生産から、次の敵手番に現れる量を予測して前回予測を採点する。
 ///
 /// 基準は履歴全体の平均で、直近2手番の平均がその前の2手番を上回るときだけ
