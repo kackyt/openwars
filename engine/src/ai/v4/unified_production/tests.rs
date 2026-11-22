@@ -1247,3 +1247,91 @@ fn spreads_direct_combat_anchors_across_multiple_frontline_enemies() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn air_unit_stops_at_enemy_zoc_in_reachable_tiles() {
+    let (_, md, _, avail) = load_full_combat_resources("map_1");
+    let map = Map {
+        width: 9,
+        height: 3,
+        tiles: vec![Terrain::Plains; 9 * 3],
+        topology: GridTopology::Square,
+    };
+    let mut bcopters = unit_snap(&avail, UnitType::Bcopters, 1, 1, 100);
+    bcopters.stats.max_movement = 5;
+    // (3, 1) に敵がいるため (2, 1) と (4, 1) は敵 ZOC、さらに (3, 0) と (3, 2) も敵 ZOC
+    let occ = super::reach::OccupancyGrid::from_units(&map, [], [pos(3, 1)]);
+    let r1 = super::reach::reachable_tiles(
+        &map,
+        &md,
+        &occ,
+        pos(1, 1),
+        MovementType::Air,
+        bcopters.stats.max_movement,
+        bcopters.stats.max_fuel,
+        super::reach::OCC_FRIENDLY,
+        1,
+        None,
+    );
+    assert!(
+        r1.contains(pos(2, 1)),
+        "敵 ZOC の入口マス (2, 1) 自体は 1T で進入できる"
+    );
+    assert!(
+        !r1.contains(pos(4, 1)),
+        "航空ユニットであっても敵 ZOC を素通りして背後の (4, 1) へ 1T で抜けてはならない"
+    );
+}
+
+#[test]
+fn two_turn_reach_does_not_carry_over_leftover_mp_across_turn_boundary() {
+    let (_, md, _, avail) = load_full_combat_resources("map_1");
+    // 1行マップ: (0,0)平地, (1,0)森(コスト2), (2,0)平地(コスト1), (3,0)森(コスト2), (4,0)平地(コスト1)
+    // Tank (mp=4): 平地=1, 森=2。
+    // 単一パス max_mp=8 だと合計コスト 1+2+1+2+1=7<=8 で 2T 以内に (4,0) と先まで届くように見えるが、
+    // 正しくは 1T 目に 森(2)+平地(1)=3MP しか使えず残り 1MP で 森(3,0)=コスト2 に踏み込めないため 1T 終了は (2,0)。
+    // 2T 目に (2,0) から 森(2)+平地(1)=3MP で (4,0) が 2T 到達の限界であり、もし 森(4,0) なら 2T 目も届かない。
+    let mut map = Map {
+        width: 6,
+        height: 1,
+        tiles: vec![
+            Terrain::Plains,
+            Terrain::Forest,
+            Terrain::Plains,
+            Terrain::Forest,
+            Terrain::Forest,
+            Terrain::Plains,
+        ],
+        topology: GridTopology::Square,
+    };
+    let tank = unit_snap(&avail, UnitType::Tank, 0, 0, 100);
+    let r2p = super::reach::reachable_pierce(
+        &map,
+        &md,
+        pos(0, 0),
+        tank.stats.movement_type,
+        tank.stats.max_movement,
+        tank.stats.max_fuel,
+        2,
+    );
+    // 合計MPは 2+1+2+2 = 7 <= 8 だが、1T目で(2,0)止まり(残り1MP<2)、2T目で(3,0)(2MP)止まり(残り2MP=2で(4,0)可)、
+    // (5,0)は合計コスト8だが2Tでは絶対に到達不能。
+    assert!(r2p.contains(pos(4, 0)), "(4, 0) までは 2T 目で到達できる");
+    assert!(
+        !r2p.contains(pos(5, 0)),
+        "総 MP コストが 8(=4*2) 以下であってもターン境界での端数 MP 切り捨てにより 2T 以内に (5, 0) へ届いてはならない"
+    );
+
+    // もう1例: 3ターンかかる経路を unit_turn_distance_field で検証
+    map.set_terrain(4, 0, Terrain::Plains).unwrap();
+    let df = super::reach::unit_turn_distance_field(
+        &map,
+        &md,
+        pos(0, 0),
+        tank.stats.movement_type,
+        tank.stats.max_movement,
+        tank.stats.max_fuel,
+    );
+    assert_eq!(df.get(pos(2, 0)), Some(1));
+    assert_eq!(df.get(pos(3, 0)), Some(2));
+}

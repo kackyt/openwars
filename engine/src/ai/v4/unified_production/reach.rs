@@ -1,7 +1,8 @@
-//! 高速・決定的な盤面到達性・最短移動コスト場ユーティリティ。
+//! 高速・決定的な盤面到達性・最短移動ターン場ユーティリティ。
 //!
-//! 小マップ向けの生産評価で反復的に呼ばれるため、盤面サイズ `width * height` の
-//! フラット配列を用いてハッシュ計算と動的確保を抑え、完全決定的な順序で探索する。
+//! 実ゲームエンジン（`systems/movement.rs`）と一致するよう、以下のルールを厳密に適用する：
+//! - 航空ユニットを含むすべての移動タイプが、敵 ZOC マスに入った時点でそのターンの移動を停止する。
+//! - 複数ターンの移動では残り MP を次ターンへ繰り越さず、ターン境界で MP 上限 `max_movement` をリセットする。
 
 use crate::collections::HashSet;
 use crate::components::GridPosition;
@@ -88,7 +89,7 @@ impl OccupancyGrid {
     }
 }
 
-/// 盤面全体に対する移動コスト・到達性マップ。
+/// 盤面全体に対する移動コスト／到達ターンマップ。
 #[derive(Debug, Clone)]
 pub(super) struct ReachMap {
     pub(super) width: usize,
@@ -119,7 +120,7 @@ impl ReachMap {
         self.get(pos).is_some()
     }
 
-    /// 到達可能な全 `(座標, 移動コスト)` を座標昇順で返す。
+    /// 到達可能な全 `(座標, コスト/ターン数)` を座標昇順で返す。
     pub(super) fn iter(&self) -> impl Iterator<Item = (GridPosition, u32)> + '_ {
         self.costs
             .iter()
@@ -133,7 +134,7 @@ impl ReachMap {
     }
 }
 
-/// ユニット遮蔽と敵 ZOC 停止を含む到達可能マス集合を返す。
+/// ユニット遮蔽・全兵種共通の敵 ZOC 停止・ターン境界を含む到達可能マス集合を返す。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reachable_tiles(
     map: &Map,
@@ -144,32 +145,36 @@ pub(super) fn reachable_tiles(
     max_movement: u32,
     max_fuel: u32,
     mover_code: u8,
-    mp_mult: u32,
+    max_turns: u32,
     allow_own_mobile: Option<&HashSet<GridPosition>>,
 ) -> ReachMap {
-    let mut dist = ReachMap::new(map.width, map.height);
+    let mut result = ReachMap::new(map.width, map.height);
     if start.x >= map.width || start.y >= map.height {
-        return dist;
+        return result;
     }
-    let max_mp = max_movement.saturating_mul(mp_mult);
-    let is_air = movement_type == MovementType::Air;
+    let effective_fuel = if max_fuel == 0 { u32::MAX } else { max_fuel };
+    let len = map.width.saturating_mul(map.height);
+    let mut best_state = vec![(UNREACHABLE, UNREACHABLE); len];
     let start_idx = occ.idx(start);
-    dist.costs[start_idx] = 0;
+    best_state[start_idx] = (0, 0);
 
-    // (累計移動コスト, 累計移動歩数=燃料消費, y, x) の最小ヒープ
+    // (経過ターン, ターン内消費MP, 累計歩数=燃料消費, y, x) の最小ヒープ
     let mut heap = BinaryHeap::new();
-    heap.push(Reverse((0_u32, 0_u32, start.y, start.x)));
+    heap.push(Reverse((0_u32, 0_u32, 0_u32, start.y, start.x)));
 
-    while let Some(Reverse((cost, steps, y, x))) = heap.pop() {
+    while let Some(Reverse((turns, mp_in_turn, steps, y, x))) = heap.pop() {
         let pos = GridPosition { x, y };
         let idx = occ.idx(pos);
-        if cost > dist.costs[idx] || steps >= max_fuel {
+        if (turns, mp_in_turn) > best_state[idx] || turns > max_turns || steps >= effective_fuel {
             continue;
         }
-        // 航空ユニット以外は敵 ZOC に入ったマスで移動が止まる
-        if pos != start && !is_air && occ.is_zoc_for(mover_code, pos) {
-            continue;
-        }
+        // 他味方が占有しており退避許可もないマスではターンを終了して次ターンへ繰り越せない
+        let occupied_non_vacatable = pos != start
+            && occ.cells[idx] != 0
+            && !allow_own_mobile.is_some_and(|set| set.contains(&pos));
+        // 実エンジン準拠：航空ユニットを含め全移動タイプが敵 ZOC に進入したらそのターンを終了する
+        let must_start_next_turn = turns > 0 && pos != start && occ.is_zoc_for(mover_code, pos);
+
         for (nx, ny) in map.get_adjacent(x, y) {
             let npos = GridPosition { x: nx, y: ny };
             let cell_occ = occ.at(npos);
@@ -183,37 +188,54 @@ pub(super) fn reachable_tiles(
             else {
                 continue;
             };
-            let next_cost = cost.saturating_add(step_cost);
+            if step_cost > max_movement {
+                continue;
+            }
+            let (next_turns, next_mp) = if turns == 0 {
+                (1, step_cost)
+            } else if must_start_next_turn || mp_in_turn.saturating_add(step_cost) > max_movement {
+                if occupied_non_vacatable {
+                    continue;
+                }
+                (turns.saturating_add(1), step_cost)
+            } else {
+                (turns, mp_in_turn.saturating_add(step_cost))
+            };
             let next_steps = steps.saturating_add(1);
+            if next_turns > max_turns || next_steps > effective_fuel {
+                continue;
+            }
             let nidx = occ.idx(npos);
-            if next_cost <= max_mp && next_steps <= max_fuel && next_cost < dist.costs[nidx] {
-                dist.costs[nidx] = next_cost;
-                heap.push(Reverse((next_cost, next_steps, ny, nx)));
+            if (next_turns, next_mp) < best_state[nidx] {
+                best_state[nidx] = (next_turns, next_mp);
+                heap.push(Reverse((next_turns, next_mp, next_steps, ny, nx)));
             }
         }
     }
 
-    // 他味方が占有しているマスへの停止可否を確定する（補給都市退避許可分だけ残す）
+    // 停止可能マスのみ確定する（補給都市退避許可分を除き他味方占有マスへの停止は不可）
     for y in 0..map.height {
         for x in 0..map.width {
             let pos = GridPosition { x, y };
             let idx = occ.idx(pos);
-            if dist.costs[idx] == UNREACHABLE || pos == start {
+            let t = best_state[idx].0;
+            if t == UNREACHABLE {
                 continue;
             }
-            if occ.cells[idx] != 0 {
+            if pos != start && occ.cells[idx] != 0 {
                 let allowed = allow_own_mobile.is_some_and(|set| set.contains(&pos));
                 if !allowed {
-                    dist.costs[idx] = UNREACHABLE;
+                    continue;
                 }
             }
+            result.costs[idx] = t;
         }
     }
 
-    dist
+    result
 }
 
-/// ユニット遮蔽・ZOC を無視した純地形到達範囲を返す（2ターン突破リスク計算用）。
+/// ユニット遮蔽・ZOC を無視し、ターン境界（残り MP 繰り越し禁止）だけを守った到達範囲を返す。
 pub(super) fn reachable_pierce(
     map: &Map,
     master_data: &MasterDataRegistry,
@@ -221,22 +243,24 @@ pub(super) fn reachable_pierce(
     movement_type: MovementType,
     max_movement: u32,
     max_fuel: u32,
-    mp_mult: u32,
+    max_turns: u32,
 ) -> ReachMap {
-    let mut dist = ReachMap::new(map.width, map.height);
+    let mut result = ReachMap::new(map.width, map.height);
     if start.x >= map.width || start.y >= map.height {
-        return dist;
+        return result;
     }
-    let max_mp = max_movement.saturating_mul(mp_mult);
+    let effective_fuel = if max_fuel == 0 { u32::MAX } else { max_fuel };
+    let len = map.width.saturating_mul(map.height);
+    let mut best_state = vec![(UNREACHABLE, UNREACHABLE); len];
     let start_idx = start.y * map.width + start.x;
-    dist.costs[start_idx] = 0;
+    best_state[start_idx] = (0, 0);
 
     let mut heap = BinaryHeap::new();
-    heap.push(Reverse((0_u32, 0_u32, start.y, start.x)));
+    heap.push(Reverse((0_u32, 0_u32, 0_u32, start.y, start.x)));
 
-    while let Some(Reverse((cost, steps, y, x))) = heap.pop() {
+    while let Some(Reverse((turns, mp_in_turn, steps, y, x))) = heap.pop() {
         let idx = y * map.width + x;
-        if cost > dist.costs[idx] || steps >= max_fuel {
+        if (turns, mp_in_turn) > best_state[idx] || turns > max_turns || steps >= effective_fuel {
             continue;
         }
         for (nx, ny) in map.get_adjacent(x, y) {
@@ -247,17 +271,55 @@ pub(super) fn reachable_pierce(
             else {
                 continue;
             };
-            let next_cost = cost.saturating_add(step_cost);
+            if step_cost > max_movement {
+                continue;
+            }
+            let (next_turns, next_mp) = if turns == 0 {
+                (1, step_cost)
+            } else if mp_in_turn.saturating_add(step_cost) > max_movement {
+                (turns.saturating_add(1), step_cost)
+            } else {
+                (turns, mp_in_turn.saturating_add(step_cost))
+            };
             let next_steps = steps.saturating_add(1);
+            if next_turns > max_turns || next_steps > effective_fuel {
+                continue;
+            }
             let nidx = ny * map.width + nx;
-            if next_cost <= max_mp && next_steps <= max_fuel && next_cost < dist.costs[nidx] {
-                dist.costs[nidx] = next_cost;
-                heap.push(Reverse((next_cost, next_steps, ny, nx)));
+            if (next_turns, next_mp) < best_state[nidx] {
+                best_state[nidx] = (next_turns, next_mp);
+                heap.push(Reverse((next_turns, next_mp, next_steps, ny, nx)));
             }
         }
     }
 
-    dist
+    for (idx, &(t, _)) in best_state.iter().enumerate() {
+        if t != UNREACHABLE {
+            result.costs[idx] = t;
+        }
+    }
+
+    result
+}
+
+/// 単一始点からマップ全域への、ターン境界つき最小移動ターン数場を返す（始点は 0 ターン）。
+pub(super) fn unit_turn_distance_field(
+    map: &Map,
+    master_data: &MasterDataRegistry,
+    start: GridPosition,
+    movement_type: MovementType,
+    max_movement: u32,
+    max_fuel: u32,
+) -> ReachMap {
+    reachable_pierce(
+        map,
+        master_data,
+        start,
+        movement_type,
+        max_movement.max(1),
+        max_fuel,
+        u32::MAX,
+    )
 }
 
 /// 多始点 Dijkstra による目標集合からの最短移動コスト場（敵前進投影・距離参照用）。
@@ -302,48 +364,6 @@ pub(super) fn shortest_dist_field(
             };
             let next_cost = cost.saturating_add(step_cost);
             let nidx = occ.idx(npos);
-            if next_cost < dist.costs[nidx] {
-                dist.costs[nidx] = next_cost;
-                heap.push(Reverse((next_cost, ny, nx)));
-            }
-        }
-    }
-
-    dist
-}
-
-/// 単一始点からマップ全域への純地形最短移動コスト場を返す。
-pub(super) fn unit_distance_field(
-    map: &Map,
-    master_data: &MasterDataRegistry,
-    start: GridPosition,
-    movement_type: MovementType,
-) -> ReachMap {
-    let mut dist = ReachMap::new(map.width, map.height);
-    if start.x >= map.width || start.y >= map.height {
-        return dist;
-    }
-    let start_idx = start.y * map.width + start.x;
-    dist.costs[start_idx] = 0;
-
-    let mut heap = BinaryHeap::new();
-    heap.push(Reverse((0_u32, start.y, start.x)));
-
-    while let Some(Reverse((cost, y, x))) = heap.pop() {
-        let idx = y * map.width + x;
-        if cost > dist.costs[idx] {
-            continue;
-        }
-        for (nx, ny) in map.get_adjacent(x, y) {
-            let Some(terrain) = map.get_terrain(nx, ny) else {
-                continue;
-            };
-            let Some(step_cost) = get_valid_movement_cost(master_data, movement_type, terrain)
-            else {
-                continue;
-            };
-            let next_cost = cost.saturating_add(step_cost);
-            let nidx = ny * map.width + nx;
             if next_cost < dist.costs[nidx] {
                 dist.costs[nidx] = next_cost;
                 heap.push(Reverse((next_cost, ny, nx)));

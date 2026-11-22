@@ -16,6 +16,12 @@ pub fn unified_production_eval_enabled() -> bool {
     std::env::var_os("OPENWARS_UNIFIED_PRODUCTION").is_some()
 }
 
+/// 標準サイズを含む全マップで統合生産評価を試行するか（`OPENWARS_UNIFIED_PRODUCTION=all`）。既定では無効。
+pub fn unified_production_all_maps_enabled() -> bool {
+    std::env::var("OPENWARS_UNIFIED_PRODUCTION")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("all"))
+}
+
 /// 物件契約と保護供給の帰属を照合する任意の診断出力。既定では無効。
 pub fn campaign_scope_audit_enabled() -> bool {
     std::env::var_os("OPENWARS_CAMPAIGN_SCOPE_AUDIT").is_some()
