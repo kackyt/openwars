@@ -482,7 +482,15 @@ fn excludes_transport_units_from_direct_combat_candidates() {
         scan.available_types
             .iter()
             .find(|(ut, _)| *ut == p.command.unit_type)
-            .is_some_and(|(_, s)| s.max_cargo > 0)
+            .is_some_and(|(ut, s)| {
+                s.max_cargo > 0
+                    && (matches!(s.movement_type, MovementType::Air | MovementType::Ship)
+                        || super::threats::max_base_damage(
+                            &scan.damage_chart,
+                            *ut,
+                            UnitType::Infantry,
+                        ) == 0)
+            })
     });
     assert!(
         !bought_transport,
@@ -796,6 +804,324 @@ fn continues_producing_from_rear_factories_when_screen_saturated_and_enemies_far
         planned
             .iter()
             .map(|p| p.command.unit_type)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn selects_fast_anti_capturer_when_enemy_infantry_rush_neutral_properties() {
+    let (mut scan, avail) = flat_combat_scan(12, 10, 10000);
+    scan.capital_position = Some(pos(1, 1));
+    scan.production_facilities = vec![
+        (pos(2, 1), Terrain::Factory),
+        (pos(1, 2), Terrain::Factory),
+        (pos(2, 2), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(1, 1), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 中立物件群上に敵歩兵が迫る（味方歩兵4体だけでは決定的阻止ができない）盤面
+    scan.neutral_properties = vec![pos(5, 3), pos(6, 3), pos(5, 4), pos(6, 4)];
+    scan.open_properties = scan.neutral_properties.clone();
+    scan.my_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 3, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 2, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 4, 100),
+    ];
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 5, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 6, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 6, 4, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(1), 2, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    let has_fast_anti_infantry = planned.iter().any(|p| {
+        let Some((_, st)) = avail.iter().find(|(t, _)| *t == p.command.unit_type) else {
+            return false;
+        };
+        let anti_inf_dmg = super::threats::max_base_damage(
+            &scan.damage_chart,
+            p.command.unit_type,
+            UnitType::Infantry,
+        );
+        st.max_range <= 1 && st.max_movement >= 4 && anti_inf_dmg >= 55
+    });
+    assert!(
+        has_fast_anti_infantry,
+        "中立物件上の敵占領ラッシュに対し、高機動かつ対歩兵決定的火力(>=55%)を持つ直接ユニットを採用するべき: {:?}",
+        units
+    );
+}
+
+#[test]
+fn avoids_early_unscreened_heavy_indirect_when_outnumbered() {
+    let (mut scan, avail) = flat_combat_scan(14, 14, 18000);
+    // 敵の装甲車(mp=6)が2T突破しないようにy=7..8に森帯を配置する
+    if let Some(m) = std::sync::Arc::get_mut(&mut scan.map) {
+        for x in 0..14 {
+            m.set_terrain(x, 7, Terrain::Forest).unwrap();
+            m.set_terrain(x, 8, Terrain::Forest).unwrap();
+        }
+    }
+    scan.capital_position = Some(pos(1, 1));
+    scan.production_facilities = vec![
+        (pos(2, 1), Terrain::Factory),
+        (pos(3, 1), Terrain::Factory),
+        (pos(4, 1), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(1, 1), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 味方歩兵5体 vs 敵10体（装甲車2 + 歩兵8）の序盤劣勢盤面
+    scan.my_units = (0..5)
+        .map(|i| unit_snap(&avail, UnitType::Infantry, 2 + i, 4, 100))
+        .collect();
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Recon, 3, 10, 100),
+        unit_snap(&avail, UnitType::Recon, 6, 10, 100),
+        unit_snap(&avail, UnitType::Infantry, 2, 7, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 7, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 7, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 7, 100),
+        unit_snap(&avail, UnitType::Infantry, 2, 8, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 8, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 8, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 8, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(1), 2, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    assert!(
+        !units.contains(&UnitType::HeavySpGun),
+        "前衛薄い序盤劣勢盤面で全予算近いHeavySpGunを買わず前衛戦力を厚くするべき: {:?}",
+        units
+    );
+    assert!(
+        planned.iter().any(|p| p.role == SlotKind::Combat),
+        "前衛戦力増強のためCombatロールを少なくとも1体以上生産するべき: {:?}",
+        units
+    );
+}
+
+#[test]
+fn does_not_overbuy_pure_anti_air_when_one_counter_already_exists() {
+    let (mut scan, avail) = flat_combat_scan(12, 10, 16000);
+    scan.capital_position = Some(pos(1, 1));
+    scan.production_facilities = vec![
+        (pos(2, 1), Terrain::Factory),
+        (pos(1, 2), Terrain::Factory),
+        (pos(2, 2), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(1, 1), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 既に味方対空戦車1両 + 歩兵4体が存在する状態で、敵戦闘ヘリ2機 + 地上部隊が接近
+    scan.my_units = vec![
+        unit_snap(&avail, UnitType::AntiAir, 4, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 4, 100),
+    ];
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Bcopters, 6, 5, 100),
+        unit_snap(&avail, UnitType::Bcopters, 7, 5, 100),
+        unit_snap(&avail, UnitType::Tank, 6, 6, 100),
+        unit_snap(&avail, UnitType::Tank, 7, 6, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 6, 100),
+        unit_snap(&avail, UnitType::Infantry, 8, 6, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 7, 100),
+        unit_snap(&avail, UnitType::Infantry, 7, 7, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(1), 3, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    let aa_count = units.iter().filter(|&&u| u == UnitType::AntiAir).count();
+    assert!(
+        aa_count <= 1,
+        "既に対空戦車1両がある盤面で1ターンにAntiAirを2体以上重複購入してはならない: aa_count={}, units={:?}",
+        aa_count,
+        units
+    );
+}
+
+#[test]
+fn beam_search_finds_high_roi_mixed_portfolio_over_greedy_expensive_pair() {
+    let (mut scan, avail) = flat_combat_scan(14, 12, 10000);
+    scan.capital_position = Some(pos(1, 1));
+    scan.production_facilities = vec![
+        (pos(2, 1), Terrain::Factory),
+        (pos(3, 1), Terrain::Factory),
+        (pos(4, 1), Terrain::Factory),
+        (pos(1, 2), Terrain::Factory),
+        (pos(2, 2), Terrain::Factory),
+        (pos(3, 2), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(1, 1), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 工場近くに6個の未占領中立都市があり、対岸に中立都市圏内の敵歩兵6体が展開している T1 盤面
+    scan.neutral_properties = vec![
+        pos(5, 2),
+        pos(6, 2),
+        pos(2, 5),
+        pos(3, 5),
+        pos(4, 5),
+        pos(5, 5),
+    ];
+    scan.open_properties = scan.neutral_properties.clone();
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 10, 8, 100),
+        unit_snap(&avail, UnitType::Infantry, 11, 8, 100),
+        unit_snap(&avail, UnitType::Infantry, 12, 8, 100),
+        unit_snap(&avail, UnitType::Infantry, 10, 9, 100),
+        unit_snap(&avail, UnitType::Infantry, 11, 9, 100),
+        unit_snap(&avail, UnitType::Infantry, 12, 9, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 1, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    let cap_count = planned
+        .iter()
+        .filter(|p| p.role == SlotKind::Capture)
+        .count();
+    assert!(
+        planned.len() >= 5,
+        "深さ2でRecon×2のみに枝刈りされず5体以上生産して多工場展開できるべき: count={}, units={:?}",
+        planned.len(),
+        units
+    );
+    assert!(
+        cap_count >= 3,
+        "資金10,000Gの初手展開で少なくとも3体以上のCapture役を同時生産するべき: cap_count={}, units={:?}",
+        cap_count,
+        units
+    );
+}
+
+#[test]
+fn avoids_wasting_capturers_on_enemy_closer_neutral_properties() {
+    let (mut scan, avail) = flat_combat_scan(14, 10, 10000);
+    scan.capital_position = Some(pos(0, 4));
+    scan.production_facilities = vec![
+        (pos(1, 3), Terrain::Factory),
+        (pos(1, 4), Terrain::Factory),
+        (pos(1, 5), Terrain::Factory),
+        (pos(2, 4), Terrain::Factory),
+        (pos(2, 5), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(0, 4), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 自軍側中立都市2個 + 敵歩兵が隣接済みの敵陣側中立都市3個
+    scan.neutral_properties = vec![pos(4, 4), pos(4, 5), pos(10, 3), pos(10, 4), pos(10, 5)];
+    scan.open_properties = scan.neutral_properties.clone();
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 11, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 11, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 11, 5, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 1, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    let cap_count = planned
+        .iter()
+        .filter(|p| p.role == SlotKind::Capture)
+        .count();
+    let combat_count = planned
+        .iter()
+        .filter(|p| p.role == SlotKind::Combat)
+        .count();
+    assert!(
+        cap_count <= 3,
+        "敵が先着する敵陣側中立都市へ5体分のCapture役を浪費しないべき: cap_count={}, units={:?}",
+        cap_count,
+        units
+    );
+    assert!(
+        combat_count >= 1,
+        "敵先着中立都市を割り引いた結果、余力でCombat前衛（Recon等）を併産するべき: units={:?}",
+        units
+    );
+}
+
+#[test]
+fn produces_air_transport_for_unreachable_neutral_city_when_airport_available() {
+    let (_, md, damage_chart, avail) = load_full_combat_resources("map_3");
+    let mut map = strait_map(None);
+    map.set_terrain(0, 0, Terrain::Capital).unwrap();
+    map.set_terrain(0, 1, Terrain::Factory).unwrap();
+    map.set_terrain(1, 1, Terrain::Airport).unwrap();
+    map.set_terrain(8, 1, Terrain::City).unwrap();
+
+    let mut scan = empty_scan(map, md, damage_chart, avail.clone(), 8000);
+    scan.capital_position = Some(pos(0, 0));
+    scan.owned_airport_count = 1;
+    scan.production_facilities = vec![(pos(0, 1), Terrain::Factory), (pos(1, 1), Terrain::Airport)];
+    scan.free_facilities = scan.production_facilities.clone();
+    let extras = UnifiedBoardExtras {
+        friendly_properties: vec![
+            (pos(0, 0), Terrain::Capital),
+            (pos(0, 1), Terrain::Factory),
+            (pos(1, 1), Terrain::Airport),
+        ],
+        ..Default::default()
+    };
+    scan.my_units = vec![unit_snap(&avail, UnitType::Infantry, 0, 2, 100)];
+    scan.neutral_properties = vec![pos(8, 1)];
+    scan.open_properties = vec![pos(8, 1)];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(1), 2, true, &[]);
+    let transport_count = planned
+        .iter()
+        .filter(|p| {
+            p.role == SlotKind::Transport
+                && p.command.unit_type == UnitType::TransportHelicopter
+                && p.capture_intent.as_ref().is_some_and(|ci| {
+                    ci.role == crate::ai::v4::campaign_execution::CampaignProductionRole::Transport
+                })
+        })
+        .count();
+    assert_eq!(
+        transport_count,
+        1,
+        "海峡で隔てられた中立都市に対し空き空港から輸送ヘリ(Transport役)を1機生産するべき: {:?}",
+        planned
+            .iter()
+            .map(|p| (p.command.unit_type, p.role))
             .collect::<Vec<_>>()
     );
 }

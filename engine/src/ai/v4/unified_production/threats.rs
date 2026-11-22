@@ -69,6 +69,24 @@ const INITIAL_EMPTY_ARMY_FALLBACK_AEFF: f32 = 25.0;
 const INITIAL_EMPTY_ARMY_GROUND_ASYM: f32 = 1.25;
 /// 既存味方が敵脅威を質的に抑えられる（強いカウンター役）とみなす最小期待ダメージ。
 const STRONG_COUNTER_MIN_DMG: f32 = 35.0;
+/// 中立/自軍物件上に居座る敵占領ユニットの占領妨害優先ボーナス。
+const CAPTURE_DENIAL_ON_PROP_BONUS: f32 = 55.0;
+/// 1ターン以内に中立/自軍物件へ到達可能な敵占領ユニットの占領妨害ボーナス。
+const CAPTURE_DENIAL_NEAR_PROP_BONUS: f32 = 35.0;
+/// 対空カウンター 1 体が抑止できる敵航空戦力の HP 換算倍率。
+const AIR_COUNTER_CAPACITY_PER_UNIT: f32 = 1.5;
+/// 航空敵に対する基準非対称倍率。
+const AIR_ASYM_BASE: f32 = 1.1;
+/// 対空不足時の追加非対称倍率幅（最大 3.0）。
+const AIR_ASYM_SPAN: f32 = 1.9;
+/// 対空充足とみなすカバー率閾値。
+const AIR_COV_SATURATED_THRESHOLD: f32 = 0.9;
+/// 間接ユニット前衛護衛比の敵直接部隊数下限基準。
+const INDIRECT_SCREEN_MIN_ENEMY_REF: usize = 4;
+/// 敵直接部隊に対する十分な味方前衛直接部隊の目標比率。
+const INDIRECT_SCREEN_RATIO: f32 = 1.1;
+/// 前衛不足時の間接射点生存率補正の下限。
+const INDIRECT_MIN_SCREEN_SUPPORT: f32 = 0.55;
 
 /// 投影済み・重み付け済みの敵ターゲット 1 体。
 #[derive(Debug, Clone)]
@@ -369,7 +387,9 @@ impl ThreatContext {
                 .iter()
                 .filter(|(cand_ut, st)| {
                     !profiles.is_indirect(*cand_ut)
-                        && st.max_cargo == 0
+                        && (st.max_cargo == 0
+                            || max_base_damage(chart, *cand_ut, UnitType::Infantry) > 0
+                            || max_base_damage(chart, *cand_ut, UnitType::Tank) > 0)
                         && !matches!(st.movement_type, MovementType::Air | MovementType::Ship)
                         && scan
                             .production_facilities
@@ -607,11 +627,13 @@ impl ThreatContext {
             let asym_mult = if is_ind {
                 (2.2 + a_eff / 35.0).min(3.8)
             } else if is_air {
-                let air_cov = (strong_cnt / combat_air_hp_equiv.max(1.0)).min(1.0);
-                if air_cov >= 0.9 {
-                    1.2
+                let air_cov = (strong_cnt * AIR_COUNTER_CAPACITY_PER_UNIT
+                    / combat_air_hp_equiv.max(1.0))
+                .min(1.0);
+                if air_cov >= AIR_COV_SATURATED_THRESHOLD {
+                    AIR_ASYM_BASE
                 } else {
-                    1.2 + (1.0 - air_cov) * 3.0
+                    AIR_ASYM_BASE + (1.0 - air_cov) * AIR_ASYM_SPAN
                 }
             } else if scan.my_units.is_empty() {
                 INITIAL_EMPTY_ARMY_GROUND_ASYM
@@ -663,7 +685,31 @@ impl ThreatContext {
                 }
             };
 
-            let w_full = a_eff.max(8.0) * asym_mult * v_scale * urgency;
+            // 中立または自軍物件を占領・脅かす敵占領ユニットには占領妨害ボーナスを加算
+            let cap_denial_bonus = if !virtual_wave && u.stats.can_capture {
+                let min_prop_dist = scan
+                    .neutral_properties
+                    .iter()
+                    .copied()
+                    .chain(extras.friendly_properties.iter().map(|(p, _)| *p))
+                    .map(|p| {
+                        map.distance(pos.x, pos.y, p.x, p.y)
+                            .min(map.distance(pos_proj.x, pos_proj.y, p.x, p.y))
+                    })
+                    .min()
+                    .unwrap_or(u32::MAX);
+                if min_prop_dist == 0 {
+                    CAPTURE_DENIAL_ON_PROP_BONUS
+                } else if min_prop_dist <= u.stats.max_movement {
+                    CAPTURE_DENIAL_NEAR_PROP_BONUS
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let w_full = a_eff.max(8.0) * asym_mult * v_scale * urgency + cap_denial_bonus;
             enemy_targets.push(ProjectedEnemy {
                 entity: u.entity,
                 stats: u.stats,
@@ -883,6 +929,14 @@ impl ThreatContext {
         let mut surv = (1.0 - risk / 100.0).max(0.0).powi(2);
         if !is_sup {
             surv *= NON_SUPPLY_SURV_MULT;
+        }
+        // 前衛直接部隊の数が敵直接部隊数に対して薄い局面では、地上間接ユニットの射点生存率を割り引く
+        if !matches!(stats.movement_type, MovementType::Air | MovementType::Ship) {
+            let enemy_ref = self.e_direct_cnt.max(INDIRECT_SCREEN_MIN_ENEMY_REF) as f32;
+            let screen_support = (self.f_direct_units.len() as f32
+                / (enemy_ref * INDIRECT_SCREEN_RATIO))
+                .clamp(INDIRECT_MIN_SCREEN_SUPPORT, 1.0);
+            surv *= screen_support;
         }
         (surv, breach_risk)
     }

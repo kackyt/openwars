@@ -29,8 +29,14 @@ const MIN_WORKING_CAPITAL: f32 = 18000.0;
 const SURPLUS_LAM_HALF_LIFE_FUNDS: f32 = 14000.0;
 /// 過剰資金時にも無駄買いを抑止するための実効資金限界費用の下限（1,000Gあたり）。
 const MIN_SURPLUS_LAM_PER_1K: f32 = 1.5;
-/// ビームサーチ幅。
-const BEAM_WIDTH: usize = 10;
+/// 生スコア上位から確保するビーム枠数。
+const BEAM_RAW_SLOTS: usize = 6;
+/// 資金 1,000G あたりスコア（費用対効果）上位から確保するビーム枠数。
+const BEAM_EFF_SLOTS: usize = 6;
+/// ビームサーチ幅（生スコア上位枠 + 費用対効果上位枠）。
+const BEAM_WIDTH: usize = BEAM_RAW_SLOTS + BEAM_EFF_SLOTS;
+/// 同一兵種構成（施設配置違いのみ）のビーム占有上限。
+const BEAM_MAX_PER_COMPOSITION: usize = 2;
 /// 1 ターンあたりの最大生産数。
 const MAX_PURCHASES_PER_TURN: usize = 8;
 /// 役割横断の候補プール上限（合計 14 + 36 + 12 = 62 <= 64 でビットマスク収容）。
@@ -50,9 +56,9 @@ const MAX_ATTACKS_PER_DIRECT: usize = 10;
 const MAX_TARGETS_PER_INDIRECT: usize = 12;
 
 /// 占領経済価値の基準係数（標準都市 durability=200 の cap_turns=2 割引を補正）。
-const CAPTURE_BASE_VALUE: f32 = 78.0;
+const CAPTURE_BASE_VALUE: f32 = 88.0;
 /// 占領到着ターンの時間割引率。
-const CAPTURE_DISCOUNT: f32 = 0.84;
+const CAPTURE_DISCOUNT: f32 = 0.85;
 /// 収入倍率の上限（首都 4,000G 等の過剰重み抑止）。
 const MAX_CAPTURE_INCOME_MULT: f32 = 2.5;
 /// 首都生産圏内の物件価値ボーナス倍率。
@@ -75,6 +81,16 @@ const CAP_SAFETY_2T_HEAVY_MULT: f32 = 0.75;
 const CAP_ENEMY_FAC_GUARD_RADIUS: u32 = 3;
 const CAP_ENEMY_GUARD_MIN_UNITS: usize = 2;
 const CAP_SAFETY_GUARDED_ENEMY_PROP_MULT: f32 = 0.25;
+/// 敵占領ユニットの方が自軍より先に到達できる中立物件の占領安全性割引。
+const CAP_SAFETY_ENEMY_CONTESTED_NEUTRAL_MULT: f32 = 0.25;
+/// 統合評価で新規追加する航空輸送ユニットの既存上限。
+const MAX_EXISTING_AIR_TRANSPORTS: usize = 2;
+/// 航空輸送による積載・降下オーバーヘッド（ターン数）。
+const AIRLIFT_LOAD_DROP_OVERHEAD_TURNS: u32 = 2;
+/// 徒歩占領より空輸を優先するために必要な最小短縮ターン数。
+const AIRLIFT_MIN_TURN_GAIN: u32 = 2;
+/// 多積載・地形越え継続運用を加味した空輸占領の経済価値倍率。
+const AIRLIFT_CAPTURE_VALUE_MULT: f32 = 1.35;
 
 /// 既存味方によるターゲット充足判定の最小期待ダメージ（対空）。
 const DIRECT_EXISTING_COV_MIN_DMG: u32 = 20;
@@ -87,6 +103,10 @@ const AIR_EXISTING_COV_GLOBAL_PROX: f32 = 0.60;
 const DIRECT_EXISTING_COV_EXP: f32 = 1.15;
 /// 既存味方の充足度 1 体分あたりの地上ターゲット需要逆数飽和係数。
 const GROUND_EXISTING_COV_DECAY: f32 = 0.45;
+/// 敵占領ユニットに対して決定的火力（反撃を抑えて占領妨害可能）とみなす最小期待ダメージ。
+const ANTI_CAPTURER_DECISIVE_DMG: u32 = 55;
+/// 決定的火力未満の味方（自軍歩兵等）が敵占領ユニット需要を充足する際の減衰倍率。
+const ANTI_CAPTURER_SOFT_COV_MULT: f32 = 0.40;
 
 /// 直接ユニット1ターンあたりの攻撃可能ラウンド数上限。
 const DIRECT_MAX_ENGAGEMENTS: u32 = 2;
@@ -131,6 +151,7 @@ const ASSET_RISK_PER_1K: f32 = 6.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateKind {
     Capture,
+    Transport,
     Direct,
     Indirect,
 }
@@ -175,6 +196,10 @@ enum PoolPayload {
         /// 既存占領役より到着を早められる `(capture_props index, delta_cap)` の降順リスト。
         prop_deltas: Vec<(usize, f32)>,
         screen_value: f32,
+    },
+    Transport {
+        /// 空輸によって早期化または到達可能になる `(capture_props index, delta_cap)` の降順リスト。
+        prop_deltas: Vec<(usize, f32)>,
     },
     Direct {
         unit_spec: DirectUnitSpec,
@@ -223,6 +248,7 @@ struct BeamState {
     asset_risk: f32,
     spent: u32,
     capture_count: usize,
+    transport_count: usize,
     chosen_mask: u64,
     fac_mask: u64,
     chosen: Vec<usize>,
@@ -388,75 +414,137 @@ pub(in crate::ai::v4) fn plan_unified_production(
     let mut direct_pool: Vec<PoolCandidate> = Vec::new();
     let mut indirect_pool: Vec<PoolCandidate> = Vec::new();
 
-    // 占領候補（施設多様性を維持しつつ施設×占領可能兵種ごとに全改善物件リストを保持）
+    // 占領・空輸輸送候補（施設多様性を維持しつつ施設×兵種ごとに全改善物件リストを保持）
     if allow_structural_slots && !capture_props.is_empty() {
+        let existing_air_transports = scan
+            .my_units
+            .iter()
+            .filter(|u| u.stats.movement_type == MovementType::Air && u.stats.max_cargo > 0)
+            .count();
+        let can_add_air_transport = existing_air_transports < MAX_EXISTING_AIR_TRANSPORTS;
+        let capture_unit_types: Vec<UnitType> = scan
+            .available_types
+            .iter()
+            .filter(|(_, s)| s.can_capture)
+            .map(|(ut, _)| *ut)
+            .collect();
+
         let mut first_per_fac: Vec<PoolCandidate> = Vec::new();
         let mut extra_capture_cands: Vec<PoolCandidate> = Vec::new();
         for &(fac, terrain) in &scan.free_facilities {
             let fac_idx = fac_idx_by_pos[&fac];
             let mut per_fac: Vec<PoolCandidate> = Vec::new();
             for &(ut, ref stats) in &scan.available_types {
-                if !stats.can_capture
-                    || stats.cost == 0
-                    || stats.cost > scan.funds
-                    || !scan.can_produce(terrain, ut)
-                {
+                if stats.cost == 0 || stats.cost > scan.funds || !scan.can_produce(terrain, ut) {
                     continue;
                 }
-                let scr_val = if can_add_land_screen {
-                    screen_marginal_value(
-                        scan,
-                        threat_ctx.e_direct_cnt,
-                        stats,
-                        existing_direct_cnt,
-                        target_screen,
-                        has_enemy,
-                    )
-                } else {
-                    0.0
-                };
-                let mut prop_deltas: Vec<(usize, f32)> = Vec::new();
-                for (pidx, cp) in capture_props.iter().enumerate() {
-                    let Some(cost_mp) = dist_between(fac, cp.pos, stats.movement_type) else {
-                        continue;
-                    };
-                    let eta = cost_mp.div_ceil(stats.max_movement.max(1));
-                    let new_arrival = eta.saturating_add(1).saturating_add(cp.cap_turns);
-                    if new_arrival >= cp.base_arrival {
-                        continue;
-                    }
-                    let base_disc = if cp.base_arrival == u32::MAX {
-                        0.0
+                if stats.can_capture {
+                    let scr_val = if can_add_land_screen {
+                        screen_marginal_value(
+                            scan,
+                            threat_ctx.e_direct_cnt,
+                            stats,
+                            existing_direct_cnt,
+                            target_screen,
+                            has_enemy,
+                        )
                     } else {
-                        CAPTURE_DISCOUNT.powi(cp.base_arrival as i32)
+                        0.0
                     };
-                    let new_disc = CAPTURE_DISCOUNT.powi(new_arrival as i32);
-                    let delta_cap = cp.economic_value * (new_disc - base_disc);
-                    if delta_cap > 0.0 {
-                        prop_deltas.push((pidx, delta_cap));
+                    let mut prop_deltas: Vec<(usize, f32)> = Vec::new();
+                    for (pidx, cp) in capture_props.iter().enumerate() {
+                        let Some(cost_mp) = dist_between(fac, cp.pos, stats.movement_type) else {
+                            continue;
+                        };
+                        let eta = cost_mp.div_ceil(stats.max_movement.max(1));
+                        let new_arrival = eta.saturating_add(1).saturating_add(cp.cap_turns);
+                        if new_arrival >= cp.base_arrival {
+                            continue;
+                        }
+                        let base_disc = if cp.base_arrival == u32::MAX {
+                            0.0
+                        } else {
+                            CAPTURE_DISCOUNT.powi(cp.base_arrival as i32)
+                        };
+                        let new_disc = CAPTURE_DISCOUNT.powi(new_arrival as i32);
+                        let delta_cap = cp.economic_value * (new_disc - base_disc);
+                        if delta_cap > 0.0 {
+                            prop_deltas.push((pidx, delta_cap));
+                        }
                     }
+                    if prop_deltas.is_empty() {
+                        continue;
+                    }
+                    prop_deltas.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    let best_delta_cap = prop_deltas[0].1;
+                    let eff_scr_val = scr_val
+                        * screen_decay_factor(existing_direct_cnt, target_screen, has_enemy);
+                    let solo_net = best_delta_cap + eff_scr_val - budget_cost(stats.cost, eff_lam);
+                    per_fac.push(PoolCandidate {
+                        kind: CandidateKind::Capture,
+                        unit_type: ut,
+                        cost: stats.cost,
+                        facility: fac,
+                        fac_idx,
+                        pos_key: fac,
+                        solo_net,
+                        payload: PoolPayload::Capture {
+                            prop_deltas,
+                            screen_value: scr_val,
+                        },
+                    });
+                } else if can_add_air_transport
+                    && stats.movement_type == MovementType::Air
+                    && stats.max_cargo > 0
+                    && stats
+                        .loadable_unit_types
+                        .iter()
+                        .any(|lt| capture_unit_types.contains(lt))
+                {
+                    let mut prop_deltas: Vec<(usize, f32)> = Vec::new();
+                    for (pidx, cp) in capture_props.iter().enumerate() {
+                        let Some(cost_mp) = dist_between(fac, cp.pos, MovementType::Air) else {
+                            continue;
+                        };
+                        let air_eta = cost_mp.div_ceil(stats.max_movement.max(1));
+                        let airlift_arrival = air_eta
+                            .saturating_add(AIRLIFT_LOAD_DROP_OVERHEAD_TURNS)
+                            .saturating_add(cp.cap_turns);
+                        let accelerates_capture = cp.base_arrival == u32::MAX
+                            || airlift_arrival.saturating_add(AIRLIFT_MIN_TURN_GAIN)
+                                <= cp.base_arrival;
+                        if !accelerates_capture {
+                            continue;
+                        }
+                        let base_disc = if cp.base_arrival == u32::MAX {
+                            0.0
+                        } else {
+                            CAPTURE_DISCOUNT.powi(cp.base_arrival as i32)
+                        };
+                        let new_disc = CAPTURE_DISCOUNT.powi(airlift_arrival as i32);
+                        let delta_cap =
+                            cp.economic_value * (new_disc - base_disc) * AIRLIFT_CAPTURE_VALUE_MULT;
+                        if delta_cap > 0.0 {
+                            prop_deltas.push((pidx, delta_cap));
+                        }
+                    }
+                    if prop_deltas.is_empty() {
+                        continue;
+                    }
+                    prop_deltas.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    let best_delta_cap = prop_deltas[0].1;
+                    let solo_net = best_delta_cap - budget_cost(stats.cost, eff_lam);
+                    per_fac.push(PoolCandidate {
+                        kind: CandidateKind::Transport,
+                        unit_type: ut,
+                        cost: stats.cost,
+                        facility: fac,
+                        fac_idx,
+                        pos_key: fac,
+                        solo_net,
+                        payload: PoolPayload::Transport { prop_deltas },
+                    });
                 }
-                if prop_deltas.is_empty() {
-                    continue;
-                }
-                prop_deltas.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                let best_delta_cap = prop_deltas[0].1;
-                let eff_scr_val =
-                    scr_val * screen_decay_factor(existing_direct_cnt, target_screen, has_enemy);
-                let solo_net = best_delta_cap + eff_scr_val - budget_cost(stats.cost, eff_lam);
-                per_fac.push(PoolCandidate {
-                    kind: CandidateKind::Capture,
-                    unit_type: ut,
-                    cost: stats.cost,
-                    facility: fac,
-                    fac_idx,
-                    pos_key: fac,
-                    solo_net,
-                    payload: PoolPayload::Capture {
-                        prop_deltas,
-                        screen_value: scr_val,
-                    },
-                });
             }
             per_fac.sort_by(|a, b| {
                 b.solo_net
@@ -489,14 +577,14 @@ pub(in crate::ai::v4) fn plan_unified_production(
         }
     }
 
-    // 直接・対空・航空候補（全候補生成後に輸送専用除外・廉価前衛枠先取り・兵種別枠を適用）
+    // 直接・対空・航空候補（全候補生成後に空海・無武装輸送車の除外、廉価前衛枠先取り・兵種別枠を適用）
     let mut raw_direct_cands: Vec<(bool, PoolCandidate)> = Vec::new();
     for &(fac, terrain) in &scan.free_facilities {
         let fac_idx = fac_idx_by_pos[&fac];
         for &(ut, ref stats) in &scan.available_types {
             if stats.cost == 0
                 || stats.cost > scan.funds
-                || stats.max_cargo > 0
+                || is_non_combat_transport(&scan.damage_chart, stats)
                 || profiles.is_indirect(ut)
                 || !profiles.has_any_weapon(ut)
                 || !scan.can_produce(terrain, ut)
@@ -799,6 +887,7 @@ pub(in crate::ai::v4) fn plan_unified_production(
         asset_risk: 0.0,
         spent: 0,
         capture_count: 0,
+        transport_count: 0,
         chosen_mask: 0,
         fac_mask: 0,
         chosen: Vec::new(),
@@ -826,7 +915,11 @@ pub(in crate::ai::v4) fn plan_unified_production(
                 if fac_used {
                     continue;
                 }
-                if cand.kind == CandidateKind::Capture && state.capture_count >= capture_props.len()
+                if cand.kind == CandidateKind::Transport && state.transport_count >= 1 {
+                    continue;
+                }
+                if matches!(cand.kind, CandidateKind::Capture | CandidateKind::Transport)
+                    && state.capture_count >= capture_props.len()
                 {
                     continue;
                 }
@@ -854,9 +947,10 @@ pub(in crate::ai::v4) fn plan_unified_production(
                     (0_u64, chosen)
                 };
 
-                // 占領候補の追加は戦闘出力を変えないため親状態の delta_combat を再利用する
+                // 占領・輸送候補の追加は戦闘出力を変えないため親状態の delta_combat を再利用する
                 let reuse_combat =
-                    (cand.kind == CandidateKind::Capture).then_some(state.delta_combat);
+                    matches!(cand.kind, CandidateKind::Capture | CandidateKind::Transport)
+                        .then_some(state.delta_combat);
                 let (score, dc, dcap, dscr, bp, ar, spent) = evaluate_combo(
                     &pool,
                     &next_chosen,
@@ -883,8 +977,13 @@ pub(in crate::ai::v4) fn plan_unified_production(
                 if cand.kind == CandidateKind::Indirect {
                     used_ind.push(cand.pos_key);
                 }
-                let next_cap_cnt =
-                    state.capture_count + usize::from(cand.kind == CandidateKind::Capture);
+                let next_cap_cnt = state.capture_count
+                    + usize::from(matches!(
+                        cand.kind,
+                        CandidateKind::Capture | CandidateKind::Transport
+                    ));
+                let next_transport_cnt =
+                    state.transport_count + usize::from(cand.kind == CandidateKind::Transport);
 
                 let next_state = BeamState {
                     score,
@@ -895,6 +994,7 @@ pub(in crate::ai::v4) fn plan_unified_production(
                     asset_risk: ar,
                     spent,
                     capture_count: next_cap_cnt,
+                    transport_count: next_transport_cnt,
                     chosen_mask: next_mask,
                     fac_mask: next_fac_mask,
                     chosen: next_chosen,
@@ -910,9 +1010,7 @@ pub(in crate::ai::v4) fn plan_unified_production(
         if next_beam.is_empty() {
             break;
         }
-        next_beam.sort_by(|a, b| b.score.total_cmp(&a.score));
-        next_beam.truncate(BEAM_WIDTH);
-        beam = next_beam;
+        beam = select_diverse_beam(&pool, next_beam);
     }
 
     best.chosen.sort_unstable();
@@ -921,8 +1019,11 @@ pub(in crate::ai::v4) fn plan_unified_production(
     // 占領候補と未所有物件の 1 対 1 割当を最終状態に対して確定する
     eval_bufs.cap_cands.clear();
     for &idx in &best.chosen {
-        if let PoolPayload::Capture { prop_deltas, .. } = &pool[idx].payload {
-            eval_bufs.cap_cands.push((idx, prop_deltas.as_slice()));
+        match &pool[idx].payload {
+            PoolPayload::Capture { prop_deltas, .. } | PoolPayload::Transport { prop_deltas } => {
+                eval_bufs.cap_cands.push((idx, prop_deltas.as_slice()));
+            }
+            PoolPayload::Direct { .. } | PoolPayload::Indirect { .. } => {}
         }
     }
     let capture_assignment: HashMap<usize, Option<usize>> = if eval_bufs.cap_cands.is_empty() {
@@ -994,6 +1095,33 @@ pub(in crate::ai::v4) fn plan_unified_production(
                         fallback_anchor,
                     )
                 }
+            }
+            PoolPayload::Transport { .. } => {
+                let target = capture_assignment
+                    .get(&idx)
+                    .copied()
+                    .flatten()
+                    .map(|pidx| capture_props[pidx].pos)
+                    .unwrap_or_else(|| capture_props.first().map_or(cand.facility, |p| p.pos));
+                let island_id = island_map
+                    .get_island_at(&target)
+                    .or_else(|| island_map.get_island_at(&cand.facility))
+                    .map(|island| island.id)
+                    .unwrap_or(crate::ai::islands::IslandId(0));
+                let intent = campaign_execution::CampaignProductionIntent {
+                    command: cmd.clone(),
+                    island_id,
+                    role: campaign_execution::CampaignProductionRole::Transport,
+                    mission_target: Some(target),
+                };
+                (
+                    SlotKind::Transport,
+                    PurchasePurpose::OperationSlot,
+                    None,
+                    Some(intent),
+                    OperationKind::Capture,
+                    target,
+                )
             }
             PoolPayload::Direct {
                 anchor,
@@ -1099,6 +1227,123 @@ pub(in crate::ai::v4) fn plan_unified_production(
     (commands, plan_trace)
 }
 
+/// 深さごとのビーム候補から、生スコア上位枠・費用対効果上位枠を組み合わせて兵種構成の多様性を保つ。
+fn select_diverse_beam(pool: &[PoolCandidate], next_beam: Vec<BeamState>) -> Vec<BeamState> {
+    if next_beam.len() <= BEAM_RAW_SLOTS {
+        let mut sorted = next_beam;
+        sorted.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.spent.cmp(&b.spent))
+                .then_with(|| a.chosen.cmp(&b.chosen))
+        });
+        return sorted;
+    }
+
+    let n = next_beam.len();
+    let comp_keys: Vec<Vec<UnitType>> = next_beam
+        .iter()
+        .map(|s| {
+            let mut key: Vec<UnitType> = s.chosen.iter().map(|&idx| pool[idx].unit_type).collect();
+            key.sort_unstable_by_key(|ut| ut.as_str());
+            key
+        })
+        .collect();
+
+    let mut raw_order: Vec<usize> = (0..n).collect();
+    raw_order.sort_by(|&a, &b| {
+        next_beam[b]
+            .score
+            .total_cmp(&next_beam[a].score)
+            .then_with(|| next_beam[a].spent.cmp(&next_beam[b].spent))
+            .then_with(|| next_beam[a].chosen.cmp(&next_beam[b].chosen))
+    });
+
+    let mut taken = vec![false; n];
+    let mut comp_counts: HashMap<&[UnitType], usize> = HashMap::default();
+    let mut selected_indices: Vec<usize> = Vec::with_capacity(BEAM_WIDTH);
+
+    // 枠 1: 生スコア上位から同一兵種構成の上限を守りつつ確保
+    let mut raw_picked = 0_usize;
+    for &idx in &raw_order {
+        if raw_picked >= BEAM_RAW_SLOTS {
+            break;
+        }
+        let key = comp_keys[idx].as_slice();
+        let cnt = comp_counts.get(key).copied().unwrap_or(0);
+        if cnt >= BEAM_MAX_PER_COMPOSITION {
+            continue;
+        }
+        taken[idx] = true;
+        comp_counts.insert(key, cnt + 1);
+        selected_indices.push(idx);
+        raw_picked += 1;
+    }
+
+    // 枠 2: 正スコア候補を優先し、資金 1,000G あたりスコア（費用対効果）上位を追加確保
+    let mut eff_order: Vec<usize> = (0..n).filter(|&i| !taken[i]).collect();
+    let eff_score = |s: &BeamState| -> (bool, f32) {
+        let is_pos = s.score > 0.0;
+        let metric = if is_pos {
+            s.score / (s.spent as f32 / 1000.0).max(1.0)
+        } else {
+            s.score
+        };
+        (is_pos, metric)
+    };
+    eff_order.sort_by(|&a, &b| {
+        let (pa, ma) = eff_score(&next_beam[a]);
+        let (pb, mb) = eff_score(&next_beam[b]);
+        pb.cmp(&pa)
+            .then_with(|| mb.total_cmp(&ma))
+            .then_with(|| next_beam[b].score.total_cmp(&next_beam[a].score))
+            .then_with(|| next_beam[a].spent.cmp(&next_beam[b].spent))
+            .then_with(|| next_beam[a].chosen.cmp(&next_beam[b].chosen))
+    });
+
+    let mut eff_picked = 0_usize;
+    for &idx in &eff_order {
+        if eff_picked >= BEAM_EFF_SLOTS || selected_indices.len() >= BEAM_WIDTH {
+            break;
+        }
+        let key = comp_keys[idx].as_slice();
+        let cnt = comp_counts.get(key).copied().unwrap_or(0);
+        if cnt >= BEAM_MAX_PER_COMPOSITION {
+            continue;
+        }
+        taken[idx] = true;
+        comp_counts.insert(key, cnt + 1);
+        selected_indices.push(idx);
+        eff_picked += 1;
+    }
+
+    // 枠 3: 構成上限により枠が余った場合は生スコア順の残りから補充
+    if selected_indices.len() < BEAM_WIDTH {
+        for &idx in &raw_order {
+            if selected_indices.len() >= BEAM_WIDTH {
+                break;
+            }
+            if !taken[idx] {
+                taken[idx] = true;
+                selected_indices.push(idx);
+            }
+        }
+    }
+
+    let mut opts: Vec<Option<BeamState>> = next_beam.into_iter().map(Some).collect();
+    let mut selected: Vec<BeamState> = selected_indices
+        .into_iter()
+        .filter_map(|i| opts[i].take())
+        .collect();
+    selected.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.spent.cmp(&b.spent))
+            .then_with(|| a.chosen.cmp(&b.chosen))
+    });
+    selected
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_combo<'a>(
     pool: &'a [PoolCandidate],
@@ -1142,6 +1387,9 @@ fn evaluate_combo<'a>(
                 );
                 delta_screen += screen_value * factor;
                 land_added += 1;
+            }
+            PoolPayload::Transport { prop_deltas } => {
+                bufs.cap_cands.push((idx, prop_deltas.as_slice()));
             }
             PoolPayload::Direct {
                 unit_spec,
@@ -1336,7 +1584,7 @@ fn compute_direct_need(
 
     let map = &scan.map;
     let chart = &scan.damage_chart;
-    let mut per_unit_weights: Vec<(usize, f32)> = Vec::with_capacity(n);
+    let mut per_unit_weights: Vec<(usize, f32, f32)> = Vec::with_capacity(n);
 
     for u in &scan.my_units {
         let ut = u.stats.unit_type;
@@ -1417,7 +1665,7 @@ fn compute_direct_need(
                 }
                 let w = (dmg as f32 / 100.0) * prox;
                 sum_w += w;
-                per_unit_weights.push((ei, w));
+                per_unit_weights.push((ei, w, 1.0));
             } else {
                 if dmg < GROUND_EXISTING_COV_MIN_DMG {
                     continue;
@@ -1444,8 +1692,14 @@ fn compute_direct_need(
                     continue;
                 }
                 let w = (dmg as f32 / 100.0) * prox;
+                // 占領歩兵同士の歩兵カバーだけでは決定的妨害にならず、高機動力対歩兵ユニットの需要を維持する
+                let eff_mult = if et.stats.can_capture && dmg < ANTI_CAPTURER_DECISIVE_DMG {
+                    ANTI_CAPTURER_SOFT_COV_MULT
+                } else {
+                    1.0
+                };
                 sum_w += w;
-                per_unit_weights.push((ei, w));
+                per_unit_weights.push((ei, w, eff_mult));
             }
         }
 
@@ -1454,8 +1708,8 @@ fn compute_direct_need(
         }
         let denom = sum_w.max(1.0);
         let hp_frac = u.hp as f32 / 100.0;
-        for &(ei, w) in &per_unit_weights {
-            cov[ei] += hp_frac * (w / denom);
+        for &(ei, w, eff_mult) in &per_unit_weights {
+            cov[ei] += hp_frac * (w / denom) * eff_mult;
         }
     }
 
@@ -1476,6 +1730,14 @@ fn compute_direct_need(
 fn can_hit_ground(chart: &crate::resources::DamageChart, ut: UnitType) -> bool {
     max_base_damage(chart, ut, UnitType::Infantry) > 0
         || max_base_damage(chart, ut, UnitType::Tank) > 0
+}
+
+/// 空海輸送ユニットまたは対地攻撃力を持たない後方支援輸送車（直接戦闘候補から除外対象）か。
+#[inline]
+fn is_non_combat_transport(chart: &crate::resources::DamageChart, stats: &UnitStats) -> bool {
+    stats.max_cargo > 0
+        && (matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
+            || !can_hit_ground(chart, stats.unit_type))
 }
 
 /// 運転資金を超過する余剰資金に応じて資金シャドウプライスを滑らかに引き下げる。
@@ -1569,6 +1831,9 @@ fn build_capture_baseline(
     let enemy_prop_set: HashSet<GridPosition> =
         extras.enemy_properties.iter().map(|(p, _)| *p).collect();
 
+    let ref_cap_mp = scan
+        .reference_capture_unit()
+        .map_or(3, |s| s.max_movement.max(1));
     let mut props: Vec<CapturePropertyInfo> = Vec::new();
     for &p in &scan.open_properties {
         if capturer_set.contains(&p) {
@@ -1647,6 +1912,46 @@ fn build_capture_baseline(
                 && min_enemy_fac_dist < min_my_fac_dist
             {
                 cap_safety *= CAP_SAFETY_GUARDED_ENEMY_PROP_MULT;
+            }
+        }
+        // 中立物件で敵占領ユニットの方が自軍より先に到達できる場合は先取失敗リスクを織り込む
+        if !is_enemy_prop {
+            let min_enemy_cap_eta = scan
+                .enemy_units
+                .iter()
+                .filter(|e| e.stats.can_capture)
+                .map(|e| {
+                    map.distance(e.pos.x, e.pos.y, p.x, p.y)
+                        .div_ceil(e.stats.max_movement.max(1))
+                })
+                .min()
+                .unwrap_or(u32::MAX);
+            let existing_cap_eta = existing_capturers
+                .iter()
+                .filter_map(|u| {
+                    dist_between(u.pos, p, u.stats.movement_type)
+                        .map(|c| c.div_ceil(u.stats.max_movement.max(1)))
+                })
+                .min()
+                .unwrap_or(u32::MAX);
+            let fac_cap_eta = scan
+                .production_facilities
+                .iter()
+                .filter(|(_, f_terrain)| {
+                    scan.available_types
+                        .iter()
+                        .any(|(ut, st)| st.can_capture && scan.can_produce(*f_terrain, *ut))
+                })
+                .map(|(fp, _)| {
+                    map.distance(fp.x, fp.y, p.x, p.y)
+                        .div_ceil(ref_cap_mp)
+                        .saturating_add(1)
+                })
+                .min()
+                .unwrap_or(u32::MAX);
+            let my_min_eta = existing_cap_eta.min(fac_cap_eta);
+            if min_enemy_cap_eta < my_min_eta {
+                cap_safety *= CAP_SAFETY_ENEMY_CONTESTED_NEUTRAL_MULT;
             }
         }
 
