@@ -1125,3 +1125,125 @@ fn produces_air_transport_for_unreachable_neutral_city_when_airport_available() 
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn selects_bcopters_from_idle_airport_against_ground_without_aa() {
+    let (mut scan, avail) = flat_combat_scan(12, 10, 14000);
+    scan.capital_position = Some(pos(1, 1));
+    scan.owned_airport_count = 1;
+    scan.production_facilities = vec![
+        (pos(1, 2), Terrain::Airport),
+        (pos(2, 1), Terrain::Factory),
+        (pos(2, 2), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(1, 1), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    scan.my_units = vec![
+        unit_snap(&avail, UnitType::Tank, 4, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 5, 100),
+    ];
+    // 対空兵器・戦闘機が一切いない敵地上部隊
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Tank, 6, 3, 100),
+        unit_snap(&avail, UnitType::Tank, 7, 3, 100),
+        unit_snap(&avail, UnitType::Recon, 6, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 7, 4, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(1), 4, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    assert!(
+        units.contains(&UnitType::Bcopters),
+        "敵に対空網がなく空き空港がある盤面では対地航空戦力Bcoptersを採用するべき: {:?}",
+        units
+    );
+}
+
+#[test]
+fn p2_still_captures_equidistant_center_neutral_city_despite_p1_first_move() {
+    let (mut scan, avail) = flat_combat_scan(14, 12, 10000);
+    scan.capital_position = Some(pos(1, 5));
+    scan.production_facilities = vec![(pos(2, 5), Terrain::Factory), (pos(2, 6), Terrain::Factory)];
+    let extras = UnifiedBoardExtras {
+        friendly_properties: vec![
+            (pos(1, 5), Terrain::Capital),
+            (pos(2, 5), Terrain::Factory),
+            (pos(2, 6), Terrain::Factory),
+        ],
+        ..Default::default()
+    };
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 等距離にある中央中立都市 (6,5), (6,6) に対し、先攻 P1 歩兵は1手だけ早く出現済み（min_enemy_cap_eta=2 vs my_min_eta=3）
+    scan.neutral_properties = vec![pos(6, 5), pos(6, 6)];
+    scan.open_properties = scan.neutral_properties.clone();
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 10, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 10, 6, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 1, true, &[]);
+    let cap_count = planned
+        .iter()
+        .filter(|p| p.role == SlotKind::Capture)
+        .count();
+    assert!(
+        cap_count >= 1,
+        "先攻と1手差の中央中立都市を後攻が全面放棄せず少なくとも1体以上のCapture役を生産するべき: {:?}",
+        planned
+            .iter()
+            .map(|p| (p.command.unit_type, p.role))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn spreads_direct_combat_anchors_across_multiple_frontline_enemies() {
+    let (mut scan, avail) = flat_combat_scan(14, 12, 16000);
+    scan.capital_position = Some(pos(1, 5));
+    scan.production_facilities = vec![
+        (pos(2, 2), Terrain::Factory),
+        (pos(2, 5), Terrain::Factory),
+        (pos(2, 8), Terrain::Factory),
+        (pos(1, 5), Terrain::Capital),
+    ];
+    let extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 上下2翼に分かれた敵歩兵2体（いずれも1〜2手で到着可能）
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 5, 2, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 9, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 2, true, &[]);
+    let anchors: std::collections::HashSet<GridPosition> = planned
+        .iter()
+        .filter(|p| p.role == SlotKind::Combat)
+        .filter_map(|p| p.deployment.as_ref().map(|d| d.anchor))
+        .collect();
+    assert!(
+        anchors.len() >= 2,
+        "複数生産する直接戦闘部隊は単一の敵へ集中せず複数前線へ分散配備されるべき: {:?}",
+        planned
+            .iter()
+            .map(|p| (
+                p.command.unit_type,
+                p.role,
+                p.deployment.as_ref().map(|d| d.anchor)
+            ))
+            .collect::<Vec<_>>()
+    );
+}

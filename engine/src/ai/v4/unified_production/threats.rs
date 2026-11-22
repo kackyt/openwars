@@ -379,6 +379,13 @@ impl ThreatContext {
             .filter(|u| !profiles.is_indirect(u.stats.unit_type))
             .count();
 
+        let mut is_neutral_prop = vec![false; grid_len];
+        for p in &scan.neutral_properties {
+            if p.x < width && p.y < height {
+                is_neutral_prop[p.y * width + p.x] = true;
+            }
+        }
+
         let mut claimed_proj = vec![false; grid_len];
         // 自軍ユニット不在時に代表被ダメージ計算へ使う生産可能地上兵種リストを事前抽出
         let initial_ref_types: Vec<UnitType> = if scan.my_units.is_empty() {
@@ -539,26 +546,44 @@ impl ThreatContext {
             {
                 pos
             } else {
-                let r1_hits_goal = r1.iter().any(|(p, _)| df.get(p) == Some(0));
-                let pool = if r1_hits_goal { &r1 } else { &r2 };
-                pool.iter()
-                    .min_by_key(|&(p, _)| {
-                        let base_d = df.get(p).unwrap_or(100_000);
-                        let claim_pen = if claimed_proj[p.y * width + p.x] {
-                            3
-                        } else {
-                            0
-                        };
-                        let tdef = terrain_def_at(map, master, p) as i32;
-                        (
-                            base_d.saturating_add(claim_pen),
-                            map.distance(p.x, p.y, pos.x, pos.y),
-                            -tdef,
-                            p.y,
-                            p.x,
-                        )
-                    })
-                    .map_or(pos, |(p, _)| p)
+                // 1T以内に到達可能な未予約の中立物件がある敵占領役は、そこへ占領に入る前提で投影し前衛配備を合わせる
+                let neutral_cap_proj = if !virtual_wave && u.stats.can_capture {
+                    r1.iter()
+                        .filter(|&(p, _)| {
+                            p.x < width
+                                && p.y < height
+                                && is_neutral_prop[p.y * width + p.x]
+                                && !claimed_proj[p.y * width + p.x]
+                        })
+                        .min_by_key(|&(p, _)| (map.distance(pos.x, pos.y, p.x, p.y), p.y, p.x))
+                        .map(|(p, _)| p)
+                } else {
+                    None
+                };
+                if let Some(np) = neutral_cap_proj {
+                    np
+                } else {
+                    let r1_hits_goal = r1.iter().any(|(p, _)| df.get(p) == Some(0));
+                    let pool = if r1_hits_goal { &r1 } else { &r2 };
+                    pool.iter()
+                        .min_by_key(|&(p, _)| {
+                            let base_d = df.get(p).unwrap_or(100_000);
+                            let claim_pen = if claimed_proj[p.y * width + p.x] {
+                                3
+                            } else {
+                                0
+                            };
+                            let tdef = terrain_def_at(map, master, p) as i32;
+                            (
+                                base_d.saturating_add(claim_pen),
+                                map.distance(p.x, p.y, pos.x, pos.y),
+                                -tdef,
+                                p.y,
+                                p.x,
+                            )
+                        })
+                        .map_or(pos, |(p, _)| p)
+                }
             };
 
             if !virtual_wave && pos_proj.x < width && pos_proj.y < height {

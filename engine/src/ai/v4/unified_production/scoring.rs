@@ -83,14 +83,18 @@ const CAP_ENEMY_GUARD_MIN_UNITS: usize = 2;
 const CAP_SAFETY_GUARDED_ENEMY_PROP_MULT: f32 = 0.25;
 /// 敵占領ユニットの方が自軍より先に到達できる中立物件の占領安全性割引。
 const CAP_SAFETY_ENEMY_CONTESTED_NEUTRAL_MULT: f32 = 0.25;
+/// 中立物件を敵先着とみなす最小先行ターン差（後攻の 1 手差で中央都市を放棄しないため 2 以上）。
+const CAP_CONTESTED_ENEMY_MIN_LEAD_TURNS: u32 = 2;
 /// 統合評価で新規追加する航空輸送ユニットの既存上限。
 const MAX_EXISTING_AIR_TRANSPORTS: usize = 2;
 /// 航空輸送による積載・降下オーバーヘッド（ターン数）。
 const AIRLIFT_LOAD_DROP_OVERHEAD_TURNS: u32 = 2;
 /// 徒歩占領より空輸を優先するために必要な最小短縮ターン数。
-const AIRLIFT_MIN_TURN_GAIN: u32 = 2;
+const AIRLIFT_MIN_TURN_GAIN: u32 = 1;
 /// 多積載・地形越え継続運用を加味した空輸占領の経済価値倍率。
-const AIRLIFT_CAPTURE_VALUE_MULT: f32 = 1.35;
+const AIRLIFT_CAPTURE_VALUE_MULT: f32 = 2.10;
+/// 地形・障害物を無視して対地打撃できる航空戦闘ユニットの機動投影価値。
+const AIR_GROUND_PROJECTION_BONUS: f32 = 18.0;
 
 /// 既存味方によるターゲット充足判定の最小期待ダメージ（対空）。
 const DIRECT_EXISTING_COV_MIN_DMG: u32 = 20;
@@ -147,6 +151,8 @@ const MAX_TARGET_SCREEN: usize = 44;
 const CRIPPLE_REF_DAMAGE: f32 = 85.0;
 /// 間接ユニットの期待資産損耗係数（1,000Gあたり）。
 const ASSET_RISK_PER_1K: f32 = 6.0;
+/// 同一ターン内の複数直接戦闘ユニット配備で同一敵ターゲットへの集中を抑える混雑減衰係数。
+const JOINT_DEPLOY_CROWDING_PENALTY: f32 = 0.35;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateKind {
@@ -206,6 +212,7 @@ enum PoolPayload {
         anchor: GridPosition,
         priority_enemies: Vec<bevy_ecs::prelude::Entity>,
         screen_value: f32,
+        is_land_screen: bool,
     },
     Indirect {
         gun_spec: IndirectGunSpec,
@@ -422,12 +429,36 @@ pub(in crate::ai::v4) fn plan_unified_production(
             .filter(|u| u.stats.movement_type == MovementType::Air && u.stats.max_cargo > 0)
             .count();
         let can_add_air_transport = existing_air_transports < MAX_EXISTING_AIR_TRANSPORTS;
-        let capture_unit_types: Vec<UnitType> = scan
+        let capture_unit_stats: Vec<(UnitType, &UnitStats)> = scan
             .available_types
             .iter()
             .filter(|(_, s)| s.can_capture)
-            .map(|(ut, _)| *ut)
+            .map(|(ut, s)| (*ut, s))
             .collect();
+        let capture_unit_types: Vec<UnitType> =
+            capture_unit_stats.iter().map(|(ut, _)| *ut).collect();
+        // 空輸が地上工場生産の徒歩占領より本当に速いか判定するための基準到着ターン
+        let mut best_foot_fac_arrivals = Vec::with_capacity(capture_props.len());
+        if can_add_air_transport {
+            for cp in &capture_props {
+                let mut best_arr = u32::MAX;
+                for &(pfac, pterrain) in &scan.production_facilities {
+                    for &(cut, cst) in &capture_unit_stats {
+                        if !scan.can_produce(pterrain, cut) {
+                            continue;
+                        }
+                        if let Some(cost_mp) = dist_between(pfac, cp.pos, cst.movement_type) {
+                            let arr = cost_mp
+                                .div_ceil(cst.max_movement.max(1))
+                                .saturating_add(1)
+                                .saturating_add(cp.cap_turns);
+                            best_arr = best_arr.min(arr);
+                        }
+                    }
+                }
+                best_foot_fac_arrivals.push(best_arr);
+            }
+        }
 
         let mut first_per_fac: Vec<PoolCandidate> = Vec::new();
         let mut extra_capture_cands: Vec<PoolCandidate> = Vec::new();
@@ -510,9 +541,11 @@ pub(in crate::ai::v4) fn plan_unified_production(
                         let airlift_arrival = air_eta
                             .saturating_add(AIRLIFT_LOAD_DROP_OVERHEAD_TURNS)
                             .saturating_add(cp.cap_turns);
-                        let accelerates_capture = cp.base_arrival == u32::MAX
+                        let effective_foot_arrival =
+                            cp.base_arrival.min(best_foot_fac_arrivals[pidx]);
+                        let accelerates_capture = effective_foot_arrival == u32::MAX
                             || airlift_arrival.saturating_add(AIRLIFT_MIN_TURN_GAIN)
-                                <= cp.base_arrival;
+                                <= effective_foot_arrival;
                         if !accelerates_capture {
                             continue;
                         }
@@ -616,7 +649,10 @@ pub(in crate::ai::v4) fn plan_unified_production(
                 &mut dist_between,
             );
             let hits_ground = can_hit_ground(&scan.damage_chart, ut);
-            let scr_val = if !is_air && !is_ship && can_add_land_screen && hits_ground {
+            let is_cheap_filler =
+                stats.can_capture && stats.cost <= CHEAP_FILLER_MAX_COST && hits_ground;
+            let is_land_screen = !is_air && !is_ship && can_add_land_screen && hits_ground;
+            let scr_val = if is_land_screen {
                 screen_marginal_value(
                     scan,
                     threat_ctx.e_direct_cnt,
@@ -625,6 +661,8 @@ pub(in crate::ai::v4) fn plan_unified_production(
                     target_screen,
                     has_enemy,
                 )
+            } else if is_air && hits_ground && !spec.attacks.is_empty() {
+                AIR_GROUND_PROJECTION_BONUS
             } else {
                 0.0
             };
@@ -643,8 +681,11 @@ pub(in crate::ai::v4) fn plan_unified_production(
             ) - base_combat_val;
             // 対地能力を持たない純対空ユニットは余剰資金時の割引や赤字許容に便乗させない
             let cand_lam = if hits_ground { eff_lam } else { LAM0_PER_1K };
-            let eff_scr_val =
-                scr_val * screen_decay_factor(existing_direct_cnt, target_screen, has_enemy);
+            let eff_scr_val = if is_land_screen {
+                scr_val * screen_decay_factor(existing_direct_cnt, target_screen, has_enemy)
+            } else {
+                scr_val
+            };
             let solo_net = delta_c + eff_scr_val - budget_cost(stats.cost, cand_lam);
             let min_net = if hits_ground {
                 DIRECT_MIN_SOLO_NET
@@ -655,8 +696,6 @@ pub(in crate::ai::v4) fn plan_unified_production(
                 continue;
             }
 
-            let is_cheap_filler =
-                stats.can_capture && stats.cost <= CHEAP_FILLER_MAX_COST && hits_ground;
             let (anchor, priority_enemies) =
                 direct_deployment_target(scan, &threat_ctx, &direct_need, &spec, fac);
             raw_direct_cands.push((
@@ -674,6 +713,7 @@ pub(in crate::ai::v4) fn plan_unified_production(
                         anchor,
                         priority_enemies,
                         screen_value: scr_val,
+                        is_land_screen,
                     },
                 },
             ));
@@ -1036,6 +1076,8 @@ pub(in crate::ai::v4) fn plan_unified_production(
             &mut eval_bufs.cap_used_prop,
         )
     };
+    let direct_deployments =
+        assign_joint_direct_deployments(scan, &threat_ctx, &direct_need, &pool, &best.chosen);
 
     let mut commands = Vec::with_capacity(best.chosen.len());
     let mut rem_funds = scan.funds;
@@ -1133,12 +1175,16 @@ pub(in crate::ai::v4) fn plan_unified_production(
                 priority_enemies,
                 ..
             } => {
+                let (eff_anchor, eff_priorities) = direct_deployments
+                    .get(&idx)
+                    .map(|(a, pe)| (*a, pe.clone()))
+                    .unwrap_or_else(|| (*anchor, priority_enemies.clone()));
                 let dep = PlannedDeployment {
-                    anchor: *anchor,
-                    staging_anchor: *anchor,
+                    anchor: eff_anchor,
+                    staging_anchor: eff_anchor,
                     posture: deployment::DeploymentPosture::Execute,
                     slot_kind: SlotKind::Combat,
-                    priority_enemies: priority_enemies.clone(),
+                    priority_enemies: eff_priorities,
                     threat_horizon: 4,
                     forecast: deployment::DeploymentForecast::default(),
                     plan_step: None,
@@ -1150,7 +1196,7 @@ pub(in crate::ai::v4) fn plan_unified_production(
                     Some(dep),
                     None,
                     OperationKind::Capture,
-                    *anchor,
+                    eff_anchor,
                 )
             }
         };
@@ -1394,19 +1440,24 @@ fn evaluate_combo<'a>(
             PoolPayload::Direct {
                 unit_spec,
                 screen_value,
+                is_land_screen,
                 ..
             } => {
                 if reuse_delta_combat.is_none() {
                     bufs.dirs.push(unit_spec);
                 }
                 if *screen_value > 0.0 {
-                    let factor = screen_decay_factor(
-                        existing_direct_cnt.saturating_add(land_added),
-                        target_screen,
-                        has_enemy,
-                    );
-                    delta_screen += screen_value * factor;
-                    land_added += 1;
+                    if *is_land_screen {
+                        let factor = screen_decay_factor(
+                            existing_direct_cnt.saturating_add(land_added),
+                            target_screen,
+                            has_enemy,
+                        );
+                        delta_screen += screen_value * factor;
+                        land_added += 1;
+                    } else {
+                        delta_screen += screen_value;
+                    }
                 }
             }
             PoolPayload::Indirect {
@@ -1916,25 +1967,29 @@ fn build_capture_baseline(
         }
         // 中立物件で敵占領ユニットの方が自軍より先に到達できる場合は先取失敗リスクを織り込む
         if !is_enemy_prop {
-            let min_enemy_cap_eta = scan
+            let (min_enemy_cap_eta, min_enemy_cap_dist) = scan
                 .enemy_units
                 .iter()
                 .filter(|e| e.stats.can_capture)
                 .map(|e| {
-                    map.distance(e.pos.x, e.pos.y, p.x, p.y)
-                        .div_ceil(e.stats.max_movement.max(1))
+                    let dist = map.distance(e.pos.x, e.pos.y, p.x, p.y);
+                    (dist.div_ceil(e.stats.max_movement.max(1)), dist)
                 })
                 .min()
-                .unwrap_or(u32::MAX);
-            let existing_cap_eta = existing_capturers
+                .unwrap_or((u32::MAX, u32::MAX));
+            let (existing_cap_eta, existing_cap_dist) = existing_capturers
                 .iter()
                 .filter_map(|u| {
-                    dist_between(u.pos, p, u.stats.movement_type)
-                        .map(|c| c.div_ceil(u.stats.max_movement.max(1)))
+                    dist_between(u.pos, p, u.stats.movement_type).map(|c| {
+                        (
+                            c.div_ceil(u.stats.max_movement.max(1)),
+                            map.distance(u.pos.x, u.pos.y, p.x, p.y),
+                        )
+                    })
                 })
                 .min()
-                .unwrap_or(u32::MAX);
-            let fac_cap_eta = scan
+                .unwrap_or((u32::MAX, u32::MAX));
+            let (fac_cap_eta, fac_cap_dist) = scan
                 .production_facilities
                 .iter()
                 .filter(|(_, f_terrain)| {
@@ -1943,14 +1998,21 @@ fn build_capture_baseline(
                         .any(|(ut, st)| st.can_capture && scan.can_produce(*f_terrain, *ut))
                 })
                 .map(|(fp, _)| {
-                    map.distance(fp.x, fp.y, p.x, p.y)
-                        .div_ceil(ref_cap_mp)
-                        .saturating_add(1)
+                    let dist = map.distance(fp.x, fp.y, p.x, p.y);
+                    (dist.div_ceil(ref_cap_mp).saturating_add(1), dist)
                 })
                 .min()
-                .unwrap_or(u32::MAX);
-            let my_min_eta = existing_cap_eta.min(fac_cap_eta);
-            if min_enemy_cap_eta < my_min_eta {
+                .unwrap_or((u32::MAX, u32::MAX));
+            let (my_min_eta, my_min_dist) =
+                (existing_cap_eta, existing_cap_dist).min((fac_cap_eta, fac_cap_dist));
+            // 2ターン以上先行された場合に加え、同距離の中央物件（後攻の1手差のみ）は残しつつ、
+            // 敵の方がヘックス距離でも近く先着できる相手陣営側の中立物件を割り引く
+            let enemy_strictly_ahead = min_enemy_cap_eta
+                .saturating_add(CAP_CONTESTED_ENEMY_MIN_LEAD_TURNS - 1)
+                < my_min_eta;
+            let enemy_closer_with_lead =
+                min_enemy_cap_eta < my_min_eta && min_enemy_cap_dist < my_min_dist;
+            if enemy_strictly_ahead || enemy_closer_with_lead {
                 cap_safety *= CAP_SAFETY_ENEMY_CONTESTED_NEUTRAL_MULT;
             }
         }
@@ -2252,19 +2314,28 @@ fn build_direct_spec(
                     0.0
                 }
             };
-            if dmg_e2 > top1 {
+            let factor_e2 = if is_air {
+                // 対空・航空・間接脅威による迎撃のみ高被弾係数を適用し、一般地上歩兵・戦車反撃とは分離する
+                let is_aa_threat = e2.stats.movement_type == MovementType::Air
+                    || !can_hit_ground(chart, e2_ut)
+                    || profiles.is_indirect(e2_ut);
+                if is_aa_threat {
+                    AIR_RETAL_FACTOR
+                } else {
+                    DIRECT_RETAL_FACTOR
+                }
+            } else {
+                DIRECT_RETAL_FACTOR
+            };
+            let eff_e2 = dmg_e2 * factor_e2;
+            if eff_e2 > top1 {
                 top2 = top1;
-                top1 = dmg_e2;
-            } else if dmg_e2 > top2 {
-                top2 = dmg_e2;
+                top1 = eff_e2;
+            } else if eff_e2 > top2 {
+                top2 = eff_e2;
             }
         }
-        let retal_factor = if is_air {
-            AIR_RETAL_FACTOR
-        } else {
-            DIRECT_RETAL_FACTOR
-        };
-        let retal_dmg = (retal_factor * (top1 + DIRECT_SECOND_RETAL_WEIGHT * top2)).min(100.0);
+        let retal_dmg = (top1 + DIRECT_SECOND_RETAL_WEIGHT * top2).min(100.0);
 
         // 100HP 基準の単発純利得が非正（赤字特攻）のターゲットは事前に枝刈りする
         let cf = cripple_factor(d_deal);
@@ -2490,6 +2561,118 @@ fn indirect_priority_enemies(
         .collect()
 }
 
+/// 直接攻撃1回分の期待撃破利得と反撃・被弾損耗コストを算出する共通ヘルパ。
+fn direct_attack_gain_vs_hp(
+    spec: &DirectUnitSpec,
+    atk: &CombatAttackEntry,
+    target_hp: u32,
+    w_per_hp: f32,
+    need: f32,
+) -> (f32, f32) {
+    let eff = atk.dmg.min(target_hp);
+    let post_rhp = target_hp.saturating_sub(eff);
+    let actual_cnt = if post_rhp == 0 {
+        0.0
+    } else {
+        atk.dmg_cnt_100 * (post_rhp as f32 / 100.0)
+    };
+    let step_hp_loss = (actual_cnt + atk.retal_dmg).min(spec.hp as f32);
+    let attrition = (step_hp_loss / 100.0) * DIRECT_ATTRITION_PER_1K * (spec.cost as f32 / 1000.0);
+    let raw_gain = eff as f32 * w_per_hp * need;
+    (raw_gain, attrition)
+}
+
+/// 敵候補が不在時に最寄りの未所有物件または自施設座標を配備先として返す。
+fn nearest_open_property_or(scan: &BoardScan, fallback_origin: GridPosition) -> GridPosition {
+    scan.open_properties
+        .iter()
+        .min_by_key(|p| {
+            scan.map
+                .distance(fallback_origin.x, fallback_origin.y, p.x, p.y)
+        })
+        .copied()
+        .unwrap_or(fallback_origin)
+}
+
+/// 同一ターンに複数生産される直接戦闘ユニット間でターゲット残存HPを共有し、単一敵への過剰集中を防いで配備先を割り当てる。
+fn assign_joint_direct_deployments(
+    scan: &BoardScan,
+    threat_ctx: &ThreatContext,
+    direct_need: &[f32],
+    pool: &[PoolCandidate],
+    chosen: &[usize],
+) -> HashMap<usize, (GridPosition, Vec<bevy_ecs::prelude::Entity>)> {
+    let mut direct_items: Vec<(usize, &DirectUnitSpec, GridPosition)> = Vec::new();
+    for &idx in chosen {
+        if let PoolPayload::Direct { ref unit_spec, .. } = pool[idx].payload {
+            direct_items.push((idx, unit_spec, pool[idx].facility));
+        }
+    }
+    if direct_items.len() <= 1 || threat_ctx.enemy_targets.is_empty() {
+        return HashMap::default();
+    }
+
+    // 到達可能な近接ターゲット数が少なく低コストな局所前衛から先に割当を確定し、高機動ユニットを残余脅威へ振り向ける
+    direct_items.sort_by_key(|&(pool_idx, spec, fac)| {
+        let near_cnt = spec.attacks.iter().filter(|&&(r, _)| r <= 1).count();
+        let reach_rank = if near_cnt > 0 {
+            (0_usize, near_cnt)
+        } else {
+            (1_usize, spec.attacks.len())
+        };
+        (reach_rank, spec.cost, fac.y, fac.x, pool_idx)
+    });
+
+    let mut rem_hp: Vec<u32> = threat_ctx.enemy_targets.iter().map(|e| e.hp).collect();
+    let mut assigned_cnt: Vec<usize> = vec![0; threat_ctx.enemy_targets.len()];
+    let mut result: HashMap<usize, (GridPosition, Vec<bevy_ecs::prelude::Entity>)> =
+        HashMap::default();
+
+    for (pool_idx, spec, fallback_origin) in direct_items {
+        let mut pairs: Vec<(
+            f32,
+            GridPosition,
+            Option<bevy_ecs::prelude::Entity>,
+            usize,
+            u32,
+        )> = spec
+            .attacks
+            .iter()
+            .map(|&(ready, ref atk)| {
+                let ei = atk.enemy_idx;
+                let et = &threat_ctx.enemy_targets[ei];
+                let (full_gain, full_attr) =
+                    direct_attack_gain_vs_hp(spec, atk, et.hp, et.w_per_hp, direct_need[ei]);
+                let full_net = (full_gain - full_attr) / (ready as f32 + 1.0);
+                let score = if rem_hp[ei] > 0 && full_net > 0.0 {
+                    1.0e4
+                        + full_net / (1.0 + JOINT_DEPLOY_CROWDING_PENALTY * assigned_cnt[ei] as f32)
+                } else {
+                    full_net / (1.0 + assigned_cnt[ei] as f32)
+                };
+                (score, et.pos_proj, et.entity, ei, atk.dmg)
+            })
+            .collect();
+        pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.3.cmp(&b.3)));
+
+        if let Some(&(_, best_pos, _, best_ei, best_dmg)) = pairs.first() {
+            rem_hp[best_ei] = rem_hp[best_ei].saturating_sub(best_dmg);
+            assigned_cnt[best_ei] = assigned_cnt[best_ei].saturating_add(1);
+            let mut seen = HashSet::default();
+            let priority_enemies = pairs
+                .into_iter()
+                .filter_map(|(_, _, ent, _, _)| ent.filter(|e| seen.insert(*e)))
+                .collect();
+            result.insert(pool_idx, (best_pos, priority_enemies));
+        } else {
+            let anchor = nearest_open_property_or(scan, fallback_origin);
+            result.insert(pool_idx, (anchor, Vec::new()));
+        }
+    }
+
+    result
+}
+
 fn direct_deployment_target(
     scan: &BoardScan,
     threat_ctx: &ThreatContext,
@@ -2502,17 +2685,8 @@ fn direct_deployment_target(
         .iter()
         .map(|&(ready, ref atk)| {
             let et = &threat_ctx.enemy_targets[atk.enemy_idx];
-            let eff = atk.dmg.min(et.hp);
-            let post_rhp = et.hp.saturating_sub(eff);
-            let actual_cnt = if post_rhp == 0 {
-                0.0
-            } else {
-                atk.dmg_cnt_100 * (post_rhp as f32 / 100.0)
-            };
-            let step_hp_loss = (actual_cnt + atk.retal_dmg).min(spec.hp as f32);
-            let attrition =
-                (step_hp_loss / 100.0) * DIRECT_ATTRITION_PER_1K * (spec.cost as f32 / 1000.0);
-            let raw_gain = eff as f32 * et.w_per_hp * direct_need[atk.enemy_idx];
+            let (raw_gain, attrition) =
+                direct_attack_gain_vs_hp(spec, atk, et.hp, et.w_per_hp, direct_need[atk.enemy_idx]);
             let score = (raw_gain - attrition) / (ready as f32 + 1.0);
             (score, et.pos_proj, et.entity)
         })
@@ -2522,16 +2696,7 @@ fn direct_deployment_target(
     let anchor = pairs
         .first()
         .map(|p| p.1)
-        .or_else(|| {
-            scan.open_properties
-                .iter()
-                .min_by_key(|p| {
-                    scan.map
-                        .distance(fallback_origin.x, fallback_origin.y, p.x, p.y)
-                })
-                .copied()
-        })
-        .unwrap_or(fallback_origin);
+        .unwrap_or_else(|| nearest_open_property_or(scan, fallback_origin));
 
     let mut seen = HashSet::default();
     let priority_enemies = pairs
