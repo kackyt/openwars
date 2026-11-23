@@ -22,19 +22,15 @@ pub fn is_unit_selectable(world: &World, unit_entity: Entity) -> bool {
     let Some(faction) = world.get::<Faction>(unit_entity) else {
         return false;
     };
-    if faction.0 != active_player.id
-        || world
+    // 自軍の、未行動・非搭載・未撃破のユニットだけが行動できる
+    faction.0 == active_player.id
+        && !world
             .get::<ActionCompleted>(unit_entity)
             .is_some_and(|action| action.0)
-        || world.get::<Transporting>(unit_entity).is_some()
-        || world
+        && world.get::<Transporting>(unit_entity).is_none()
+        && !world
             .get::<Health>(unit_entity)
             .is_some_and(Health::is_destroyed)
-    {
-        return false;
-    }
-
-    true
 }
 
 /// 指定ユニットが新たな移動先を選択できるかを判定します。
