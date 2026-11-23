@@ -1,4 +1,4 @@
-use crate::collections::HashSet;
+use crate::collections::{HashMap, HashSet};
 use crate::components::*;
 use crate::events::*;
 use crate::resources::*;
@@ -183,7 +183,13 @@ pub fn advance_next_phase(world: &mut World) {
     );
 
     // 6. ユニット補給
-    apply_unit_resupply(active_player_id, &mut players, &q_properties, &mut q_units);
+    apply_unit_resupply(
+        active_player_id,
+        &mut players,
+        &q_properties,
+        &registry,
+        &mut q_units,
+    );
 
     // 7. UIへ通知 (Mainフェーズ開始のみ通知)
     phase_changed_events.send(GamePhaseChangedEvent {
@@ -330,11 +336,14 @@ fn apply_carrier_cargo_service(world: &mut World, active_player_id: PlayerId) {
 }
 
 /// プレイヤーの所有物件に滞在しているユニットの補給（燃料・弾薬・HP回復）を行います。
+/// 補給・修理できるのは、物件の補給補充の系統（landscape.csv）に属する兵種だけです
+/// （例: 都市・工場・首都は地上部隊、空港は航空部隊、港は艦船部隊）。
 #[allow(clippy::type_complexity)]
 fn apply_unit_resupply(
     active_player_id: PlayerId,
     players: &mut Players,
     q_properties: &Query<(&GridPosition, &Property)>,
+    registry: &MasterDataRegistry,
     q_units: &mut Query<(
         Entity,
         &mut HasMoved,
@@ -348,8 +357,8 @@ fn apply_unit_resupply(
         Option<&Transporting>,
     )>,
 ) {
-    // 補給可能な物件の座標を収集
-    let mut resupply_tiles = HashSet::default();
+    // 補給可能な物件の座標と地形を収集（兵種ごとの可否は下で地形の補給系統と照合する）
+    let mut resupply_tiles = HashMap::default();
     for (pos, prop) in q_properties.iter() {
         if prop.owner_id == Some(active_player_id)
             && (prop.terrain == Terrain::City
@@ -358,7 +367,7 @@ fn apply_unit_resupply(
                 || prop.terrain == Terrain::Port
                 || prop.terrain == Terrain::Capital)
         {
-            resupply_tiles.insert((pos.x, pos.y));
+            resupply_tiles.insert((pos.x, pos.y), prop.terrain);
         }
     }
 
@@ -374,7 +383,11 @@ fn apply_unit_resupply(
             if hp.is_destroyed() {
                 continue;
             }
-            if resupply_tiles.contains(&(pos.x, pos.y)) {
+            // 物件の補給系統に属さない兵種（例: 空港の地上部隊、都市の航空部隊）は補給しない
+            if resupply_tiles
+                .get(&(pos.x, pos.y))
+                .is_some_and(|terrain| registry.can_repair_on_terrain(stats.unit_type, *terrain))
+            {
                 // 回復・補充にかかるコストを計算
                 // HP回復（最大20回復）
                 let hp_to_restore = 20.min(hp.max.saturating_sub(hp.current));
@@ -1106,5 +1119,96 @@ mod tests {
         assert_eq!(health.current, 70); // 50 + 20
         assert_eq!(fuel.current, 50);
         assert_eq!(ammo.ammo1, 8);
+    }
+
+    /// P2の損傷・弾薬消費した部隊を、P2所有の物件の上に置く。
+    fn spawn_damaged_unit_on_property(
+        world: &mut World,
+        unit_type: UnitType,
+        terrain: Terrain,
+    ) -> Entity {
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(terrain, Some(PlayerId(2)), 200),
+        ));
+        world
+            .spawn((
+                GridPosition { x: 0, y: 0 },
+                Faction(PlayerId(2)),
+                UnitStats {
+                    unit_type,
+                    cost: 10000,
+                    max_fuel: 50,
+                    max_ammo1: 8,
+                    ammo1_cost: 50,
+                    max_ammo2: 0,
+                    ..UnitStats::mock()
+                },
+                Health {
+                    current: 50,
+                    max: 100,
+                },
+                Fuel {
+                    current: 40,
+                    max: 50,
+                },
+                Ammo {
+                    ammo1: 6,
+                    max_ammo1: 8,
+                    ammo2: 0,
+                    max_ammo2: 0,
+                },
+                HasMoved(false),
+                ActionCompleted(false),
+            ))
+            .id()
+    }
+
+    /// P1 -> P2 へ手番を進め、P2の手番開始の補給を実行する。
+    fn start_p2_turn(world: &mut World, schedule: &mut Schedule) {
+        world.send_event(NextPhaseCommand);
+        schedule.run(world);
+    }
+
+    #[test]
+    fn ground_unit_on_own_airport_is_not_resupplied() {
+        // 空港は航空部隊だけを補給・修理する（landscape.csv の補給補充＝航空部隊）。
+        let (mut world, mut schedule) = setup_world();
+        let unit = spawn_damaged_unit_on_property(&mut world, UnitType::Infantry, Terrain::Airport);
+        world.resource_mut::<Players>().0[1].funds = 50_000;
+
+        start_p2_turn(&mut world, &mut schedule);
+
+        assert_eq!(world.get::<Health>(unit).unwrap().current, 50);
+        assert_eq!(world.get::<Ammo>(unit).unwrap().ammo1, 6);
+        assert_eq!(world.get::<Fuel>(unit).unwrap().current, 40);
+    }
+
+    #[test]
+    fn air_unit_on_own_city_is_not_resupplied() {
+        // 都市は地上部隊だけを補給・修理する（landscape.csv の補給補充＝地上部隊）。
+        let (mut world, mut schedule) = setup_world();
+        let unit = spawn_damaged_unit_on_property(&mut world, UnitType::Fighter, Terrain::City);
+        world.resource_mut::<Players>().0[1].funds = 50_000;
+
+        start_p2_turn(&mut world, &mut schedule);
+
+        assert_eq!(world.get::<Health>(unit).unwrap().current, 50);
+        assert_eq!(world.get::<Ammo>(unit).unwrap().ammo1, 6);
+        assert_eq!(world.get::<Fuel>(unit).unwrap().current, 40);
+    }
+
+    #[test]
+    fn air_unit_on_own_airport_is_resupplied() {
+        // 対応する系統の物件では、従来どおりHP回復と燃料・弾薬の補給が行われる。
+        let (mut world, mut schedule) = setup_world();
+        let unit = spawn_damaged_unit_on_property(&mut world, UnitType::Fighter, Terrain::Airport);
+        world.resource_mut::<Players>().0[1].funds = 50_000;
+
+        start_p2_turn(&mut world, &mut schedule);
+
+        assert_eq!(world.get::<Health>(unit).unwrap().current, 70);
+        assert_eq!(world.get::<Ammo>(unit).unwrap().ammo1, 8);
+        assert_eq!(world.get::<Fuel>(unit).unwrap().current, 50);
     }
 }

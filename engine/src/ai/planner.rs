@@ -68,11 +68,7 @@ pub fn is_invasion_allowed(
 
     // 優勢判定: 自軍戦闘ユニット総数 >= 目標島の守備隊数 * 1.2 + 2
     let threshold = (garrison_total as f64 * 1.2).ceil() as u32 + 2;
-    if own_combat_total >= threshold {
-        return true;
-    }
-
-    false
+    own_combat_total >= threshold
 }
 
 /// 戦略目標に基づいて輸送ミッションを割り当てる。
