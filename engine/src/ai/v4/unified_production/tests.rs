@@ -1564,3 +1564,59 @@ fn direct_combat_prefers_tank_over_recon_against_armored_threat_with_abundant_fu
         units
     );
 }
+
+#[test]
+fn airport_does_not_starve_ground_factories_when_outnumbered() {
+    let (mut scan, avail) = flat_combat_scan(14, 12, 13000);
+    scan.capital_position = Some(pos(11, 10));
+    scan.owned_airport_count = 1;
+    scan.production_facilities = vec![
+        (pos(10, 9), Terrain::Airport),
+        (pos(10, 10), Terrain::Factory),
+        (pos(11, 9), Terrain::Factory),
+        (pos(12, 9), Terrain::Factory),
+        (pos(12, 10), Terrain::Factory),
+        (pos(10, 11), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(11, 10), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 味方歩兵1体 vs 敵歩兵5体の頭数劣勢かつ地上機動戦闘車両が未配備の盤面（資金13,000G・空港1＋地上工場5）
+    scan.my_units = vec![unit_snap(&avail, UnitType::Infantry, 8, 7, 100)];
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 2, 2, 100),
+        unit_snap(&avail, UnitType::Infantry, 2, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 2, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 2, 4, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 2, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    let has_mobile_ground = planned.iter().any(|p| {
+        avail
+            .iter()
+            .find(|(ut, _)| *ut == p.command.unit_type)
+            .is_some_and(|(_, st)| {
+                !st.can_capture
+                    && st.min_range <= 1
+                    && !matches!(st.movement_type, MovementType::Air | MovementType::Ship)
+            })
+    });
+    assert!(
+        !units.contains(&UnitType::Bcopters),
+        "頭数劣勢・地上5工場空きの状況で空港がBcopters(7500G)に残資金の過半を吸い上げないべき: {:?}",
+        units
+    );
+    assert!(
+        planned.len() >= 4 && has_mobile_ground,
+        "地上工場から機動戦闘車両(Recon等)を含め4体以上を生産するべき: {:?}",
+        units
+    );
+}

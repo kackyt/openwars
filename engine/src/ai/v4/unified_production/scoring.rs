@@ -993,8 +993,8 @@ fn allocate_capture_and_airlift_phase(
                 ) else {
                     continue;
                 };
-                // 積載・降下オーバーヘッド 2T を含めた空輸完了ターン
-                let airlift_arr = air_eta.saturating_add(2).saturating_add(cp.cap_turns);
+                // 積載・降下オーバーヘッド 1T を含めた空輸完了ターン
+                let airlift_arr = air_eta.saturating_add(1).saturating_add(cp.cap_turns);
                 let eff_foot = cp.base_arrival.min(cp.best_foot_fac_arrival);
                 let accelerates = eff_foot == u32::MAX || airlift_arr.saturating_add(2) <= eff_foot;
                 if !accelerates {
@@ -1247,6 +1247,9 @@ fn allocate_capture_and_airlift_phase(
 /// 間接砲1門の後方射点を敵地上部隊の回り込みから ZOC・占有で塞ぐために必要な前衛部隊数の下限（砲1門あたり前衛2体）。
 const MIN_SCREEN_UNITS_PER_INDIRECT: usize = 2;
 
+/// 前線突破力を損なわずに間接火網を維持できる総門数上限。
+const MAX_INDIRECT_UNITS: usize = 4;
+
 /// Phase 3 & Phase 4: 前衛安全条件を満たし安全な射点と有効目標がある場合のみ間接火網を 1 門割り当てる。
 fn allocate_indirect_phase(
     alloc: &mut AllocationContext<'_>,
@@ -1256,7 +1259,7 @@ fn allocate_indirect_phase(
     threat_ctx: &ThreatContext,
 ) {
     let scan = alloc.scan;
-    if threat_ctx.enemies.is_empty() {
+    if threat_ctx.enemies.is_empty() || alloc.my_indirect_cnt >= MAX_INDIRECT_UNITS {
         return;
     }
     // 既存間接が前衛比上限に達している（砲1門あたり前衛2体未満になる）場合は新規追加しない
@@ -1644,11 +1647,22 @@ fn allocate_direct_combat_phase(
         };
         if !is_air_fac
             && !has_mobile_ground_combat
+            && rem_ground_after <= 1
             && min_mobile_ground_cost > 0
             && alloc.rem_funds >= min_mobile_ground_cost
             && alloc.rem_funds.saturating_sub(reserve) < min_mobile_ground_cost
         {
             reserve = 0;
+        }
+        if is_air_fac
+            && rem_ground_after >= 1
+            && !has_mobile_ground_combat
+            && min_mobile_ground_cost > min_ground_cost
+        {
+            let mobile_ground_reserve = min_mobile_ground_cost
+                .saturating_add(min_ground_cost.saturating_mul((rem_ground_after - 1) as u32));
+            reserve = reserve
+                .max(mobile_ground_reserve.min(alloc.rem_funds.saturating_sub(min_ground_cost)));
         }
         let max_spend = alloc.rem_funds.saturating_sub(reserve);
 
@@ -1857,15 +1871,12 @@ fn allocate_direct_combat_phase(
                 };
 
                 // 物理的交換成果：与えた有効ダメージが半減された反撃損耗を上回ること（歩兵の対車両特攻等を抑止）
-                // 高価値の敵車両に対する打撃はコストの平方根で穏やかに重み付けし、歩兵への装甲車偏重を防ぐ
                 let exchange_score = deal as f32 - 0.75 * counter_dmg as f32;
                 if exchange_score <= 0.0 && max_spend > min_ground_cost {
                     continue;
                 }
-                let enemy_value_weight = (et.stats.cost as f32 / 1000.0).max(1.0).sqrt();
-                let base_exchange = exchange_score.max(1.0)
-                    * (eff_deal as f32 / deal.max(1) as f32)
-                    * enemy_value_weight;
+                let base_exchange =
+                    exchange_score.max(1.0) * (eff_deal as f32 / deal.max(1) as f32);
                 // 占領中の敵占領役の占領力を 1 撃で半減させる高速打撃（例: Recon 66% vs Infantry）を優先
                 let anti_cap_mult = if et.threatens_property && deal >= et.hp / 2 {
                     2.0
