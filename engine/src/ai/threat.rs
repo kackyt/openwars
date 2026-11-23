@@ -211,8 +211,8 @@ pub fn exposure_penalty(
     expected_loss_value(total_damage, my_cost, my_hp) * EXPOSURE_RISK_NUM / EXPOSURE_RISK_DEN
 }
 
-/// 敵の直接攻撃が届くタイルで、地形防御によって避けられる期待損失額を返します。
-/// 地形防御0のときと実際の地形との期待損失の差で、直接攻撃圏の外では0になります。
+/// 敵の直接攻撃または間接攻撃が届くタイルで、地形防御によって避けられる期待損失額を返します。
+/// 地形防御0のときと実際の地形との期待損失の差で、敵の攻撃圏の外では0になります。
 /// 露出そのものは減点しないため、前進の評価は変えずに、前線での停止位置だけを
 /// 防御地形へ寄せられます。
 #[allow(clippy::too_many_arguments)]
@@ -252,6 +252,133 @@ pub fn direct_reach_terrain_relief(
         registry,
     );
     expected_loss_value(bare, my_cost, my_hp) - expected_loss_value(defended, my_cost, my_hp)
+}
+
+/// 敵の直接攻撃到達圏および間接射撃圏に入るタイルで、地形防御によって避けられる期待損失額を返します。
+/// 前線で敵の砲火や直接攻撃と接する場面において、無防備な道路・平地（防御0%）ではなく
+/// 森や都市などの防御地形に布陣する価値を評価します。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn total_threat_terrain_relief(
+    map: &Map,
+    tile: (usize, usize),
+    my_unit_type: UnitType,
+    my_cost: u32,
+    my_hp: u32,
+    tile_def_bonus: u32,
+    enemy_units: &[EnemyThreatInfo],
+    damage_chart: &DamageChart,
+    registry: &crate::resources::master_data::MasterDataRegistry,
+) -> i32 {
+    if tile_def_bonus == 0 {
+        return 0;
+    }
+    let bare = expected_incoming_damage(
+        map,
+        tile,
+        my_unit_type,
+        0,
+        enemy_units,
+        damage_chart,
+        registry,
+    );
+    if bare == 0 {
+        return 0;
+    }
+    let defended = expected_incoming_damage(
+        map,
+        tile,
+        my_unit_type,
+        tile_def_bonus,
+        enemy_units,
+        damage_chart,
+        registry,
+    );
+    expected_loss_value(bare, my_cost, my_hp) - expected_loss_value(defended, my_cost, my_hp)
+}
+
+/// 標的 `attacked_target_pos` に `damage_dealt` の期待ダメージを与えた後の盤面において、
+/// 攻撃位置 `tile` で次ターンに敵全体から受ける期待被ダメージ合計（HP換算）を返します。
+/// 対空戦車などを直接先制攻撃して無力化・撃破した場合は、その対空戦車からの次ターン反撃脅威が
+/// 減算（撃破なら消滅）される一方、別の無傷の対空部隊の射程内で安価な敵を叩いた場合は
+/// 残存対空網からの被ダメージがそのまま計上されます。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn post_attack_expected_incoming_damage(
+    map: &Map,
+    tile: (usize, usize),
+    my_unit_type: UnitType,
+    tile_def_bonus: u32,
+    attacked_target_pos: GridPosition,
+    damage_dealt: u32,
+    enemy_units: &[EnemyThreatInfo],
+    damage_chart: &DamageChart,
+    registry: &crate::resources::master_data::MasterDataRegistry,
+) -> u32 {
+    let mut total_damage = 0;
+    for enemy in enemy_units {
+        let mut adjusted = *enemy;
+        if adjusted.position == attacked_target_pos {
+            adjusted.hp = adjusted.hp.saturating_sub(damage_dealt);
+        }
+        if adjusted.hp == 0 {
+            continue;
+        }
+        let distance = map.distance(adjusted.position.x, adjusted.position.y, tile.0, tile.1);
+        if adjusted.min_range > 1 {
+            if distance >= adjusted.min_range && distance <= adjusted.max_range {
+                total_damage += shot_damage(
+                    &adjusted,
+                    my_unit_type,
+                    distance,
+                    tile_def_bonus,
+                    damage_chart,
+                    registry,
+                );
+            }
+        } else if distance <= adjusted.max_movement + adjusted.max_range {
+            let firing_distance = distance.saturating_sub(adjusted.max_movement).max(1);
+            total_damage += shot_damage(
+                &adjusted,
+                my_unit_type,
+                firing_distance,
+                tile_def_bonus,
+                damage_chart,
+                registry,
+            );
+        }
+    }
+    total_damage
+}
+
+/// 攻撃後の残存HP `post_counter_hp` に対し、次ターンに周囲の未撃破敵から受ける期待損失額（Gold換算）を返します。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn post_attack_expected_loss_value(
+    map: &Map,
+    tile: (usize, usize),
+    my_unit_type: UnitType,
+    my_cost: u32,
+    post_counter_hp: u32,
+    tile_def_bonus: u32,
+    attacked_target_pos: GridPosition,
+    damage_dealt: u32,
+    enemy_units: &[EnemyThreatInfo],
+    damage_chart: &DamageChart,
+    registry: &crate::resources::master_data::MasterDataRegistry,
+) -> i32 {
+    if post_counter_hp == 0 {
+        return 0;
+    }
+    let incoming = post_attack_expected_incoming_damage(
+        map,
+        tile,
+        my_unit_type,
+        tile_def_bonus,
+        attacked_target_pos,
+        damage_dealt,
+        enemy_units,
+        damage_chart,
+        registry,
+    );
+    expected_loss_value(incoming, my_cost, post_counter_hp)
 }
 
 /// 指定タイルにおいて敵から受ける期待総被ダメージ（HP換算）を計算します。

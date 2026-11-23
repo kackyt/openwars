@@ -2140,4 +2140,212 @@ mod tests {
             "戦車は敵工場 (1, 0) の封鎖を維持すべき"
         );
     }
+
+    #[test]
+    fn v4_bomber_aggressively_attacks_antiair_but_skips_cheap_infantry_inside_unattacked_aa_net() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let mut world = setup_v3_test_world(8, crate::ai::ai_version::AiVersion::V4);
+        world.insert_resource(Map::new(8, 2, Terrain::Plains, GridTopology::Square));
+        let registry = world.resource::<MasterDataRegistry>().clone();
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Bomber, UnitType::AntiAir, 92);
+        chart.insert_damage(UnitType::Bomber, UnitType::Infantry, 77);
+        chart.insert_damage(UnitType::AntiAir, UnitType::Bomber, 68);
+        world.insert_resource(chart);
+
+        let stats_for = |kind: UnitType| {
+            let mut s = registry
+                .create_unit_stats(&UnitName(kind.as_str().to_owned()))
+                .unwrap();
+            s.max_ammo1 = 9;
+            s
+        };
+        let bomber_stats = stats_for(UnitType::Bomber);
+        let aa_stats = stats_for(UnitType::AntiAir);
+        let inf_stats = stats_for(UnitType::Infantry);
+
+        let bomber = spawn_v3_test_unit(&mut world, player, 0, 100, bomber_stats.clone());
+        world.entity_mut(bomber).insert(crate::components::Ammo {
+            ammo1: 9,
+            max_ammo1: 9,
+            ammo2: 9,
+            max_ammo2: 9,
+        });
+        // 自軍空港を (0, 0) に置き帰還燃料制約を満たす
+        world.spawn((
+            GridPosition { x: 0, y: 0 },
+            Property::new(Terrain::Airport, Some(player), 100),
+        ));
+
+        // 1. 対空戦車 (4, 0) と軽歩兵 (3, 1) がいる盤面:
+        // 軽歩兵を (3, 0) から叩くと無傷の対空戦車 (4, 0) から次ターン 68% (14,960G) の反撃を受けるが、
+        // 対空戦車 (4, 0) 自身を (3, 0) から直接叩けば 92%+5=97% ダメージで無力化できるため、対空戦車を積極攻撃する。
+        let enemy_aa = spawn_v3_test_unit(&mut world, enemy, 4, 100, aa_stats.clone());
+        let enemy_inf = spawn_v3_test_unit(&mut world, enemy, 3, 100, inf_stats);
+        *world.get_mut::<GridPosition>(enemy_inf).unwrap() = GridPosition { x: 3, y: 1 };
+        for e in [enemy_aa, enemy_inf] {
+            world.entity_mut(e).insert(crate::components::Ammo {
+                ammo1: 9,
+                max_ammo1: 9,
+                ammo2: 9,
+                max_ammo2: 9,
+            });
+        }
+
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.insert(bomber);
+        squad.plan.target = Some(GridPosition { x: 4, y: 0 });
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        world.insert_resource(manager);
+
+        let (_, command) =
+            decide_squad_action_v4(&mut world, player, &HashSet::default()).expect("行動を選ぶ");
+        assert!(
+            matches!(command, AiCommand::Attack { target_entity, .. } if target_entity == enemy_aa),
+            "爆撃機は安価な歩兵ではなく対空戦車を直接叩き潰すべき: {command:?}"
+        );
+
+        // 2. 対空戦車 (7, 0) が爆撃機の射程外（距離7、爆撃機は(3,1)の歩兵だけ叩けるが、(3,0)に出ると対空戦車の移動5+射程1=6以内に入る）の場合:
+        // 無傷の対空戦車の射程内で 1,000G の歩兵を叩いて 22,000G の爆撃機を晒す攻撃は行わない。
+        *world.get_mut::<GridPosition>(enemy_aa).unwrap() = GridPosition { x: 7, y: 0 };
+        let (_, command2) =
+            decide_squad_action_v4(&mut world, player, &HashSet::default()).expect("行動を選ぶ");
+        assert!(
+            !matches!(command2, AiCommand::Attack { target_entity, .. } if target_entity == enemy_inf),
+            "無傷の対空戦車の迎撃圏内で安価な歩兵を叩いて爆撃機を失う攻撃は避けるべき: {command2:?}"
+        );
+    }
+
+    #[test]
+    fn v4_indirect_artillery_holds_active_supply_battery_city_instead_of_stepping_onto_road() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let mut world = setup_v3_test_world(8, crate::ai::ai_version::AiVersion::V4);
+        // (1, 0) は自軍の非生産補給都市、(2, 0)..(7, 0) は道路（防御0%）。
+        let mut tiles = vec![Terrain::Road; 8];
+        tiles[1] = Terrain::City;
+        world.insert_resource(Map {
+            width: 8,
+            height: 1,
+            tiles,
+            topology: GridTopology::Square,
+        });
+        world.insert_resource(DamageChart::new());
+        world.spawn((
+            GridPosition { x: 1, y: 0 },
+            Property::new(Terrain::City, Some(player), 100),
+        ));
+
+        let registry = world.resource::<MasterDataRegistry>().clone();
+        let rocket_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Rockets.as_str().to_owned()))
+            .unwrap();
+        let front_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Infantry.as_str().to_owned()))
+            .unwrap();
+
+        let rocket = spawn_v3_test_unit(&mut world, player, 1, 100, rocket_stats.clone());
+        let front = spawn_v3_test_unit(&mut world, player, 3, 100, front_stats.clone());
+        world.get_mut::<HasMoved>(front).unwrap().0 = true;
+        world.get_mut::<ActionCompleted>(front).unwrap().0 = true;
+        // 敵歩兵 (移動3) が (7, 0) にいる: (1, 0) からの距離は 6（敵の1T前進先 (4, 0) が距離3でロケット砲の射程2..=3に収まる補給砲座）
+        let enemy_unit = spawn_v3_test_unit(&mut world, enemy, 7, 100, front_stats);
+        for e in [rocket, front, enemy_unit] {
+            let s = world.get::<UnitStats>(e).unwrap();
+            let ammo = crate::components::Ammo {
+                ammo1: s.max_ammo1,
+                max_ammo1: s.max_ammo1,
+                ammo2: s.max_ammo2,
+                max_ammo2: s.max_ammo2,
+            };
+            world.entity_mut(e).insert(ammo);
+        }
+
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.extend([rocket, front]);
+        squad.plan.target = Some(GridPosition { x: 7, y: 0 });
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        world.insert_resource(manager);
+
+        let (actor, command) =
+            decide_squad_action_v4(&mut world, player, &HashSet::from_iter([front]))
+                .expect("ロケット砲が行動を選ぶ");
+        assert_eq!(actor, rocket);
+        assert!(
+            matches!(
+                command,
+                AiCommand::Wait {
+                    target_pos: GridPosition { x: 1, y: 0 }
+                }
+            ),
+            "前線（敵の1T進行圏）を射程に収める補給都市 (1, 0) から無防備な道路 (2, 0) へ降りてはならない: {command:?}"
+        );
+    }
+
+    #[test]
+    fn v4_frontline_infantry_prefers_forest_over_exposed_road_in_enemy_threat_zone() {
+        let _code_path = crate::ai::code_path::enter(crate::ai::code_path::CodePath::Extended);
+        let player = PlayerId(1);
+        let enemy = PlayerId(2);
+        let mut world = setup_v3_test_world(8, crate::ai::ai_version::AiVersion::V4);
+        // (2, 0) は森（防御30%）、(3, 0) は道路（防御0%）。敵戦車が (6, 0)（移動5+射程1で両方とも攻撃圏内）にいる。
+        let mut tiles = vec![Terrain::Plains; 8];
+        tiles[2] = Terrain::Forest;
+        tiles[3] = Terrain::Road;
+        world.insert_resource(Map {
+            width: 8,
+            height: 1,
+            tiles,
+            topology: GridTopology::Square,
+        });
+        let registry = world.resource::<MasterDataRegistry>().clone();
+        let mut chart = DamageChart::new();
+        chart.insert_damage(UnitType::Tank, UnitType::Mech, 75);
+        chart.insert_secondary_damage(UnitType::Tank, UnitType::Mech, 75);
+        world.insert_resource(chart);
+
+        let mech_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Mech.as_str().to_owned()))
+            .unwrap();
+        let tank_stats = registry
+            .create_unit_stats(&UnitName(UnitType::Tank.as_str().to_owned()))
+            .unwrap();
+
+        // 重歩兵 (移動2) が (1, 0) から前進する: 1歩先の森 (2, 0) と2歩先の道路 (3, 0) に到達可能。
+        // 道路 (3, 0) は目標に1マス近いが防御0%で被ダメージ75%、森 (2, 0) は防御30%で被ダメージ52%（23%軽減）。
+        let mech = spawn_v3_test_unit(&mut world, player, 1, 100, mech_stats);
+        let enemy_tank = spawn_v3_test_unit(&mut world, enemy, 6, 100, tank_stats);
+        world
+            .entity_mut(enemy_tank)
+            .insert(crate::components::Ammo {
+                ammo1: 9,
+                max_ammo1: 9,
+                ammo2: 9,
+                max_ammo2: 9,
+            });
+
+        let mut manager = crate::ai::squad::SquadManager::new();
+        let mut squad = manager.create_owned_squad(crate::ai::squad::MissionType::Attack, player);
+        squad.members.insert(mech);
+        squad.plan.target = Some(GridPosition { x: 7, y: 0 });
+        squad.plan.phase = crate::ai::squad::MissionPhase::MovingToTarget;
+        world.insert_resource(manager);
+
+        let (_, command) =
+            decide_squad_action_v4(&mut world, player, &HashSet::default()).expect("行動を選ぶ");
+        assert!(
+            matches!(
+                command,
+                AiCommand::Wait {
+                    target_pos: GridPosition { x: 2, y: 0 }
+                }
+            ),
+            "敵戦車の直接攻撃圏内では、攻撃できないのに防御0%の道路(3,0)へ踏み出すより森(2,0)で止まるべき: {command:?}"
+        );
+    }
 }

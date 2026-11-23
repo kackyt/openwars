@@ -162,7 +162,7 @@ pub(crate) const DIRECT_THREAT_TERRAIN_CAP: i32 = 1000;
 /// 直接攻撃unitは敵の直接攻撃圏への踏み込みを減点しない（[`v3_positioning_score`]）。
 /// そのため地形防御の効果が `地形効果×10` の同点比較にしか残らず、前線で道路に止まる。
 /// 圏内に限り、地形で避けられる期待損失を上限つきで加点し、同程度の前進なら防御地形で
-/// 止まるようにする。小規模マップの経路では前進が遅れたため使わない。
+/// 止まるようにする。
 pub(crate) fn direct_threat_terrain_score(
     board: &TacticalBoard,
     unit: &UnitState,
@@ -185,6 +185,116 @@ pub(crate) fn direct_threat_terrain_score(
         &board.registry,
     )
     .min(DIRECT_THREAT_TERRAIN_CAP)
+}
+
+/// 小規模マップの前線において、直接攻撃unitが敵の攻撃圏（直接・間接）で防御地形に立つ価値。
+///
+/// 敵の脅威が届かない後方では0になり前進速度を落とさない一方、敵の射程と接する前線では
+/// 地形防御によって軽減される期待損耗率（`1% = 120`点、30%防御で約2,500〜3,200点）を加点し、
+/// 攻撃できないのに無防備な道路や平地（防御0%）へ飛び出して待機するのを防ぐ。
+pub(crate) const FRONTLINE_TERRAIN_RELIEF_CAP: i32 = 3200;
+
+pub(crate) fn frontline_threat_terrain_score(
+    board: &TacticalBoard,
+    unit: &UnitState,
+    position: GridPosition,
+    defense_bonus: u32,
+) -> i32 {
+    let stats = &unit.stats;
+    if !board.weighs_direct_threat_terrain
+        || stats.min_range > 1
+        || stats.movement_type == MovementType::Air
+        || defense_bonus == 0
+    {
+        return 0;
+    }
+    let bare_dmg = crate::ai::threat::expected_incoming_damage(
+        &board.map,
+        (position.x, position.y),
+        stats.unit_type,
+        0,
+        &board.enemies,
+        &board.damage_chart,
+        &board.registry,
+    );
+    if bare_dmg == 0 {
+        return 0;
+    }
+    let def_dmg = crate::ai::threat::expected_incoming_damage(
+        &board.map,
+        (position.x, position.y),
+        stats.unit_type,
+        defense_bonus,
+        &board.enemies,
+        &board.damage_chart,
+        &board.registry,
+    );
+    let hp_saved = bare_dmg.min(unit.hp).saturating_sub(def_dmg.min(unit.hp)) as i32;
+    let cost_relief = crate::ai::threat::total_threat_terrain_relief(
+        &board.map,
+        (position.x, position.y),
+        stats.unit_type,
+        stats.cost,
+        unit.hp,
+        defense_bonus,
+        &board.enemies,
+        &board.damage_chart,
+        &board.registry,
+    );
+    (hp_saved * 120)
+        .max(cost_relief)
+        .min(FRONTLINE_TERRAIN_RELIEF_CAP)
+}
+
+/// 有効な補給砲座（前線を射程に収める味方の非生産補給都市）を確保・維持するボーナス。
+/// 1歩前進することによる `AMBUSH_IN_RANGE_BONUS` (+4000) の差分に負けないよう 5000 点とする。
+pub(crate) const SUPPLY_BATTERY_HOLD_BONUS: i32 = 5000;
+
+/// 指定位置が、間接攻撃unitにとって前線（現在の敵、敵の1T到達圏、または接敵中の味方前衛）を
+/// 射程 `[min_range, max_range]` に収める味方の非生産補給施設（補給砲座都市）であるかを判定する。
+pub(crate) fn is_active_supply_battery_at(
+    board: &TacticalBoard,
+    unit: &UnitState,
+    position: GridPosition,
+) -> bool {
+    let stats = &unit.stats;
+    if stats.min_range <= 1 || repair_site_at(board, unit, position) != Some(false) {
+        return false;
+    }
+    let min_r = stats.min_range;
+    let max_r = stats.max_range;
+    // 1. 現在の敵、または敵の1ターン移動先（交戦前線）を射程に収めているか
+    let covers_enemy_or_approach = board.enemies.iter().any(|enemy| {
+        if enemy.hp == 0 {
+            return false;
+        }
+        let d = board
+            .map
+            .distance(position.x, position.y, enemy.position.x, enemy.position.y);
+        let earliest = d.saturating_sub(enemy.max_movement);
+        let latest = d.saturating_add(enemy.max_movement);
+        earliest <= max_r && latest >= min_r && d <= max_r.saturating_add(enemy.max_movement)
+    });
+    if covers_enemy_or_approach {
+        return true;
+    }
+    // 2. 敵の攻撃圏（移動+射程）と接している味方前衛タイルを射程に収めているか
+    board.occupancy.iter().any(|(&(fx, fy), occupant)| {
+        if occupant.player_id != board.player_id || (fx, fy) == (position.x, position.y) {
+            return false;
+        }
+        let dist_to_ally = board.map.distance(position.x, position.y, fx, fy);
+        if !(min_r..=max_r).contains(&dist_to_ally) {
+            return false;
+        }
+        board.enemies.iter().any(|enemy| {
+            enemy.hp > 0
+                && board
+                    .map
+                    .distance(fx, fy, enemy.position.x, enemy.position.y)
+                    <= enemy.max_movement.saturating_add(enemy.max_range).max(2)
+        })
+    })
 }
 
 /// Squad目標への接近（到達可否によらず加点する）。

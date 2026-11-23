@@ -13,10 +13,11 @@
 use super::approach::{ApproachDistances, nearest_approach_bonus, with_turn_distances};
 use super::board::{SquadRoles, TacticalBoard, movable_units_and_occupancy};
 use super::scoring::{
-    BestAction, CAPTURE_SCORE, Rank, assess_attack, assess_merge, attack_serves_campaign,
-    capture_or_hunt_score, empty_transport_return_score, repair_site_at, solo_enemy_approach_score,
-    squad_target_approach_score, stranded_infantry_score, terrain_defense_bonus,
-    v3_positioning_score, wait_recovery_score,
+    BestAction, CAPTURE_SCORE, Rank, SUPPLY_BATTERY_HOLD_BONUS, assess_attack, assess_merge,
+    attack_serves_campaign, capture_or_hunt_score, empty_transport_return_score,
+    frontline_threat_terrain_score, is_active_supply_battery_at, repair_site_at,
+    solo_enemy_approach_score, squad_target_approach_score, stranded_infantry_score,
+    terrain_defense_bonus, v3_positioning_score, wait_recovery_score,
 };
 use super::unit::UnitState;
 use crate::ai::command::AiCommand;
@@ -406,6 +407,22 @@ impl SmallMapUnit {
         let support_destination =
             (board.is_v4 && state.stats.min_range > 1 && !state.combat_ineffective)
                 .then(|| {
+                    // すでに前線を射程に収める有効な補給砲座都市に布陣している間は、
+                    // 補給と地形防御30%を捨ててまで非補給タイルへ追随前進しない。
+                    if is_active_supply_battery_at(tactical, &state, state.position) {
+                        return None;
+                    }
+                    // 現在位置で既に誰かの敵を射程に収めている、または自軍生産施設から出る際に
+                    // 1手で有効な補給砲座都市へ入れるなら、前方の道路への追随移動で上書きしない。
+                    let can_reach_supply_battery = candidate_tiles.iter().any(|&(x, y)| {
+                        let pos = GridPosition { x, y };
+                        pos != state.position
+                            && !tactical.occupancy.contains_key(&(x, y))
+                            && is_active_supply_battery_at(tactical, &state, pos)
+                    });
+                    if can_reach_supply_battery {
+                        return None;
+                    }
                     coordinated_support_destination(
                         world,
                         player_id,
@@ -704,8 +721,15 @@ impl TileCandidate {
         }
         if tactical.uses_v3_tactics {
             score += v3_positioning_score(tactical, state, position, defense_bonus);
+            score += frontline_threat_terrain_score(tactical, state, position, defense_bonus);
+        }
+        let on_active_supply_battery =
+            board.is_v4 && is_active_supply_battery_at(tactical, state, position);
+        if on_active_supply_battery {
+            score += SUPPLY_BATTERY_HOLD_BONUS;
         }
         // 間接部隊の支援射点: 前衛の目標を射程に収める位置へ加点し、射程外への前進を抑える。
+        // 既に前線を射程に収める有効な補給砲座都市にいる場合は、砲座自体も支援射点と同等に扱う。
         if board.is_v4
             && state.stats.min_range > 1
             && let Some(target) = unit.squad_target
@@ -713,14 +737,27 @@ impl TileCandidate {
             let distance = tactical
                 .map
                 .distance(target.x, target.y, position.x, position.y);
-            if (state.stats.min_range..=state.stats.max_range).contains(&distance) {
+            if (state.stats.min_range..=state.stats.max_range).contains(&distance)
+                || on_active_supply_battery
+            {
                 score += 5000;
             }
         }
         if !unit.is_solo
             && let Some(target) = unit.squad_target
         {
-            score += squad_target_approach_score(state, position, target, distances);
+            // 前線を射程に収める有効な補給砲座都市にいる（またはこのターンに補給砲座都市へ入る）間接部隊は、
+            // 奥の目標へ距離を縮めるだけの理由で非補給タイル（道路や平地）を優先しない。
+            let can_use_supply_battery = board.is_v4
+                && state.stats.min_range > 1
+                && (on_active_supply_battery
+                    || is_active_supply_battery_at(tactical, state, state.position));
+            let approach_pos = if can_use_supply_battery && !on_active_supply_battery {
+                state.position
+            } else {
+                position
+            };
+            score += squad_target_approach_score(state, approach_pos, target, distances);
         }
         if state.combat_ineffective {
             let nearest =
@@ -862,6 +899,39 @@ fn consider_attacks(
         // 今ターンで撃破し、同時解決の反撃を受けても生存できる攻撃。
         let is_survivable_lethal_strike = attack.expected_damage >= attack.target_hp
             && exchange.expected_counter_damage < unit.state.hp;
+        // 攻撃後に残存する周囲の敵（今回の攻撃で削った・撃破した標的自身のHP減算を反映済み）から
+        // 次ターンに受ける期待損失額を計算する。
+        // 対空戦車や戦車・自走砲を直接叩き潰す攻撃は次ターンの反撃脅威が消える（または高価値与ダメで黒字になる）一方、
+        // 無傷の対空戦車・戦闘機・ミサイルの射程内で安価な歩兵を叩いて高価な爆撃機等を失う赤字攻撃を抑止する。
+        let post_counter_hp = unit
+            .state
+            .hp
+            .saturating_sub(exchange.expected_counter_damage);
+        let attack_def_bonus = terrain_defense_bonus(&board.tactical, tile.position);
+        let post_attack_loss_value = if board.is_v4 && unit.state.stats.min_range <= 1 {
+            crate::ai::threat::post_attack_expected_loss_value(
+                &board.tactical.map,
+                (tile.position.x, tile.position.y),
+                unit.state.stats.unit_type,
+                unit.state.stats.cost,
+                post_counter_hp,
+                attack_def_bonus,
+                attack.target_position,
+                attack.expected_damage,
+                &board.tactical.enemies,
+                &board.tactical.damage_chart,
+                &board.tactical.registry,
+            )
+        } else {
+            0
+        };
+        if board.is_v4
+            && unit.state.stats.movement_type == crate::resources::MovementType::Air
+            && post_attack_loss_value > (exchange.damage_value_dealt as i32).saturating_mul(2)
+            && post_attack_loss_value - (exchange.damage_value_dealt as i32) >= 4_000
+        {
+            continue;
+        }
         let Some(priority) = attack_priority(
             board,
             unit,
@@ -879,7 +949,7 @@ fn consider_attacks(
         } else {
             priority
         };
-        let mut attack_score = tile.base_score + attack.score;
+        let mut attack_score = tile.base_score + attack.score - post_attack_loss_value;
         let on_own_facility = board
             .own_production
             .contains((tile.position.x, tile.position.y));
@@ -979,7 +1049,17 @@ fn consider_wait(
         return;
     }
     let repair_site = repair_site_at(tactical, state, tile.position);
-    let mut score = tile.base_score + wait_recovery_score(state, repair_site);
+    let wait_recovery = if board.is_v4
+        && state.stats.min_range > 1
+        && repair_site == Some(false)
+        && is_active_supply_battery_at(tactical, state, tile.position)
+    {
+        // 前線を射程に収める有効な補給砲座都市では、満タンの間接砲も退去ペナルティ(-2000)を受けない。
+        wait_recovery_score(state, repair_site).max(0)
+    } else {
+        wait_recovery_score(state, repair_site)
+    };
+    let mut score = tile.base_score + wait_recovery;
     let holds_blockade = tile.blockade.holds_site;
     // 占位の価値は base_score で一度計上済みなので、居座りへ重ねて加点しない。
     // 敵生産口から始めた健全なunitが、占位を続けられない敵生産口で待機する場合は、
@@ -1102,7 +1182,20 @@ fn prefer_fire_in_place(
     let state = &unit.state;
     let fire_in_place_blocks_production =
         unit.starts_on_own_production && unit.can_end_turn_off_production;
-    if !board.is_v4 || state.stats.min_range <= 1 || fire_in_place_blocks_production {
+    let can_relocate_off_factory_to_supply_battery = unit.starts_on_own_production
+        && unit.can_end_turn_off_production
+        && unit.candidate_tiles.iter().any(|&(x, y)| {
+            let pos = GridPosition { x, y };
+            pos != state.position
+                && !board.own_production.contains((x, y))
+                && !board.tactical.occupancy.contains_key(&(x, y))
+                && is_active_supply_battery_at(&board.tactical, state, pos)
+        });
+    if !board.is_v4
+        || state.stats.min_range <= 1
+        || fire_in_place_blocks_production
+        || can_relocate_off_factory_to_supply_battery
+    {
         return;
     }
     let Some((rank, target)) = best_stationary_attack else {

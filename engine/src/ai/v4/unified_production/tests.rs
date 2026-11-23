@@ -1415,3 +1415,152 @@ fn infantry_wall_screens_indirect_fire_pos_while_gap_in_wall_rejects_it() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn capture_matching_prefers_constrained_city_and_reserves_budget_for_mobile_combat() {
+    let (mut scan, avail) = flat_combat_scan(12, 12, 10000);
+    scan.capital_position = Some(pos(8, 10));
+    scan.production_facilities = vec![
+        (pos(6, 9), Terrain::Factory),
+        (pos(7, 9), Terrain::Factory),
+        (pos(7, 8), Terrain::Factory),
+        (pos(8, 8), Terrain::Factory),
+        (pos(8, 9), Terrain::Factory),
+        (pos(7, 10), Terrain::Factory),
+        (pos(9, 9), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(8, 10), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // (3,9) は最前線工場 (6,9) のみから 1T(距離3) で到達可能だが、(4,9) 等は後方工場からも 1T で到達可能
+    scan.neutral_properties = vec![pos(4, 8), pos(4, 9), pos(3, 9), pos(3, 8), pos(2, 9)];
+    scan.open_properties = scan.neutral_properties.clone();
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 3, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 4, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 1, true, &[]);
+    let cap_for_3_9 = planned
+        .iter()
+        .find(|p| p.deployment.as_ref().is_some_and(|d| d.anchor == pos(3, 9)));
+    assert!(
+        cap_for_3_9.is_some_and(|p| p.role == SlotKind::Capture
+            && p.command.target_x == 6
+            && p.command.target_y == 9),
+        "1工場からしか1Tで届かない(3,9)が最前線工場(6,9)を優先確保するべき: {:?}",
+        planned
+            .iter()
+            .map(|p| (
+                p.command.unit_type,
+                p.role,
+                (p.command.target_x, p.command.target_y),
+                p.deployment.as_ref().map(|d| (d.anchor.x, d.anchor.y))
+            ))
+            .collect::<Vec<_>>()
+    );
+    let has_mobile_combat = planned.iter().any(|p| {
+        avail
+            .iter()
+            .find(|(ut, _)| *ut == p.command.unit_type)
+            .is_some_and(|(_, st)| !st.can_capture && st.cost >= 4200)
+    });
+    assert!(
+        has_mobile_combat,
+        "占領で資金を使い切らず機動戦闘車両(Recon等)の予約予算を確保するべき: {:?}",
+        planned
+            .iter()
+            .map(|p| (p.command.unit_type, p.role, p.cost))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn anti_air_phase_covers_two_bcopters_with_one_antiair_and_caps_specialized_aa() {
+    let (mut scan, avail) = flat_combat_scan(12, 10, 13000);
+    scan.capital_position = Some(pos(1, 1));
+    scan.owned_airport_count = 1;
+    scan.production_facilities = vec![
+        (pos(2, 2), Terrain::Airport),
+        (pos(2, 1), Terrain::Factory),
+        (pos(1, 2), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
+        ..Default::default()
+    };
+    extras
+        .friendly_properties
+        .push((pos(1, 1), Terrain::Capital));
+    scan.free_facilities = scan.production_facilities.clone();
+
+    // 既に強対空ユニットであるAntiAirを1両保有している状態で、北翼に敵戦闘ヘリ2機、南翼（航空迎撃圏外）に敵戦車・歩兵が展開
+    scan.my_units = vec![
+        unit_snap(&avail, UnitType::AntiAir, 6, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 3, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 4, 100),
+    ];
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Bcopters, 10, 1, 100),
+        unit_snap(&avail, UnitType::Bcopters, 10, 2, 100),
+        unit_snap(&avail, UnitType::Tank, 5, 8, 100),
+        unit_snap(&avail, UnitType::Infantry, 6, 8, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 3, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    assert!(
+        !units.contains(&UnitType::AntiAir),
+        "強対空AntiAir1両で戦闘ヘリ2機をカバーできるため追加AntiAirを買わないべき: {:?}",
+        units
+    );
+    assert!(
+        units.contains(&UnitType::Bcopters),
+        "過剰な対空生産を抑えた予算で空き空港から戦闘ヘリを出撃させるべき: {:?}",
+        units
+    );
+}
+
+#[test]
+fn direct_combat_prefers_tank_over_recon_against_armored_threat_with_abundant_funds() {
+    let (mut scan, avail) = flat_combat_scan(12, 10, 26000);
+    scan.capital_position = Some(pos(1, 5));
+    scan.production_facilities = vec![(pos(2, 5), Terrain::Factory), (pos(2, 6), Terrain::Factory)];
+    scan.free_facilities = scan.production_facilities.clone();
+    let extras = UnifiedBoardExtras {
+        friendly_properties: vec![
+            (pos(1, 5), Terrain::Capital),
+            (pos(2, 5), Terrain::Factory),
+            (pos(2, 6), Terrain::Factory),
+        ],
+        ..Default::default()
+    };
+
+    // 自軍前衛歩兵3体が展開済みの状態で、敵に戦車2両と歩兵2体が混在し資金も潤沢な盤面
+    scan.my_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 4, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 6, 100),
+    ];
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Tank, 6, 5, 100),
+        unit_snap(&avail, UnitType::Tank, 6, 6, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 5, 6, 100),
+    ];
+
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 10, true, &[]);
+    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    assert!(
+        units.contains(&UnitType::Tank) || units.contains(&UnitType::MdTank),
+        "敵戦車が混在し予算も潤沢な盤面ではReconばかり買わず戦車級以上を選ぶべき: {:?}",
+        units
+    );
+}
