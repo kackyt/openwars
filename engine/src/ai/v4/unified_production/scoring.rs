@@ -27,6 +27,12 @@ use crate::resources::{MovementType, Terrain, UnitType};
 use crate::systems::production::PRODUCTION_RANGE;
 use bevy_ecs::prelude::Entity;
 
+/// ユニットの満タン HP（生産時の初期 HP）。
+const FULL_UNIT_HP: u32 = 100;
+
+/// 対空・迎撃枠の候補として認める、満タン敵航空機の最大撃墜攻撃回数（3発以内）。
+const MAX_AA_STRIKES_TO_KILL: u32 = 3;
+
 /// 同一盤面内で `(始点, 移動タイプ, 移動力, 燃料)` ごとの最小ターン数場をキャッシュする。
 #[derive(Default)]
 struct TurnDistCache {
@@ -97,9 +103,10 @@ struct PurchaseOrder<'a> {
 }
 
 struct AntiAirCandidate<'a> {
+    total_cost_gold: u32,
+    cost: u32,
     total_turns: u32,
     dmg: u32,
-    cost: u32,
     fac: GridPosition,
     stats: &'a UnitStats,
     enemy_idx: usize,
@@ -355,17 +362,20 @@ fn allocate_anti_air_phase(
         return;
     }
 
-    // 既存味方のうち、敵航空機へ 3 発以内相当（HP/3 以上）の有効対空打撃を持ち展開可能な機数を数える
+    // 既存味方のうち、敵航空機へ MAX_AA_STRIKES_TO_KILL 発以内相当の有効対空打撃を持ち展開可能な機数を数える
+    let min_aa_dmg_threshold = FULL_UNIT_HP.div_ceil(MAX_AA_STRIKES_TO_KILL);
     let mut aa_capable_cnt = 0_usize;
     for u in &scan.my_units {
-        if u.hp < 30 || !profiles.has_any_weapon(u.stats.unit_type) {
+        if u.hp < FULL_UNIT_HP / MAX_AA_STRIKES_TO_KILL
+            || !profiles.has_any_weapon(u.stats.unit_type)
+        {
             continue;
         }
         let ammo = (u.stats.max_ammo1, u.stats.max_ammo2);
         let is_ind = profiles.is_indirect(u.stats.unit_type);
         let covers_any = combat_air_indices.iter().any(|&ei| {
             let et = &threat_ctx.enemies[ei];
-            let dmg = expected_damage(
+            let dmg_vs_full = expected_damage(
                 chart,
                 profiles,
                 u.stats.unit_type,
@@ -376,7 +386,7 @@ fn allocate_anti_air_phase(
                 u.stats.min_range.max(1),
                 false,
             );
-            if dmg < et.hp.div_ceil(3) {
+            if dmg_vs_full < min_aa_dmg_threshold {
                 return false;
             }
             if is_ind {
@@ -407,6 +417,63 @@ fn allocate_anti_air_phase(
     // 対空ユニット 1 体あたり約 1.5 機の敵航空を牽制・撃墜可能とみなす（切り捨てで過小評価しない）
     let mut covered_air = (aa_capable_cnt * 3) / 2;
     let mut deficit = combat_air_indices.len().saturating_sub(covered_air);
+    let plains_def = scan.master_data.get_terrain_defense_bonus(Terrain::Plains);
+
+    // 各敵戦闘航空機が 1 手番あたり自軍へ与え得る最大期待損害額（単位: Gold）を事前計算する
+    let enemy_air_dmg_gold_per_turn: Vec<u32> = threat_ctx
+        .enemies
+        .iter()
+        .map(|et| {
+            if !et.is_air || et.stats.max_cargo > 0 || et.hp == 0 {
+                return 0;
+            }
+            let dist = et.stats.min_range.max(1);
+            if scan.my_units.is_empty() {
+                available_types
+                    .iter()
+                    .filter(|(_, s)| {
+                        !matches!(s.movement_type, MovementType::Air | MovementType::Ship)
+                    })
+                    .map(|&(ut, s)| {
+                        let d_pct = expected_damage(
+                            chart,
+                            profiles,
+                            et.stats.unit_type,
+                            et.hp,
+                            et.ammo,
+                            ut,
+                            plains_def,
+                            dist,
+                            false,
+                        );
+                        s.cost.saturating_mul(d_pct) / FULL_UNIT_HP
+                    })
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                scan.my_units
+                    .iter()
+                    .map(|u| {
+                        let u_def = terrain_def_at(map, &scan.master_data, u.pos);
+                        let d_pct = expected_damage(
+                            chart,
+                            profiles,
+                            et.stats.unit_type,
+                            et.hp,
+                            et.ammo,
+                            u.stats.unit_type,
+                            u_def,
+                            dist,
+                            false,
+                        );
+                        u.stats.cost.saturating_mul(d_pct) / FULL_UNIT_HP
+                    })
+                    .max()
+                    .unwrap_or(0)
+            }
+        })
+        .collect();
+
     while deficit > 0 {
         let mut best_choice: Option<AntiAirCandidate<'_>> = None;
 
@@ -423,6 +490,14 @@ fn allocate_anti_air_phase(
                     continue;
                 }
                 let is_ind = profiles.is_indirect(ut);
+                if is_ind
+                    && threat_ctx
+                        .firing_tile_threat(scan, profiles, fac, stats)
+                        .direct_1t_dmg
+                        > 0
+                {
+                    continue;
+                }
                 let ammo = (stats.max_ammo1, stats.max_ammo2);
 
                 for &ei in &combat_air_indices {
@@ -435,17 +510,17 @@ fn allocate_anti_air_phase(
                         chart,
                         profiles,
                         ut,
-                        100,
+                        FULL_UNIT_HP,
                         ammo,
                         et.stats.unit_type,
                         et.def_proj,
                         stats.min_range.max(1),
                         false,
                     );
-                    if dmg < rem_hp.div_ceil(3) {
+                    if dmg < min_aa_dmg_threshold {
                         continue;
                     }
-                    // 生産後の実行動は次ターン以降のため、実到達・射撃開始までのターン数を見積もる
+                    // 生産後の実行動は次ターン以降のため、実到達・射撃開始までのターン数と安全性を評価する
                     let ready_turns = if is_ind {
                         let d_fac = map.distance(fac.x, fac.y, et.pos_proj.x, et.pos_proj.y);
                         if d_fac >= stats.min_range && d_fac <= stats.max_range {
@@ -456,41 +531,70 @@ fn allocate_anti_air_phase(
                             continue;
                         }
                     } else {
-                        let min_move_turns = map
+                        let best_adj = map
                             .get_adjacent(et.pos_proj.x, et.pos_proj.y)
                             .into_iter()
                             .filter_map(|(ax, ay)| {
-                                dist_cache.turns_between(
-                                    scan,
-                                    fac,
-                                    GridPosition { x: ax, y: ay },
-                                    stats.movement_type,
-                                    stats.max_movement,
-                                    stats.max_fuel,
-                                )
+                                let adj = GridPosition { x: ax, y: ay };
+                                dist_cache
+                                    .turns_between(
+                                        scan,
+                                        fac,
+                                        adj,
+                                        stats.movement_type,
+                                        stats.max_movement,
+                                        stats.max_fuel,
+                                    )
+                                    .map(|t| (t, terrain_def_at(map, &scan.master_data, adj), adj))
                             })
-                            .min();
-                        let Some(mt) = min_move_turns else {
+                            .min_by_key(|&(t, tdef, adj)| {
+                                (t, std::cmp::Reverse(tdef), adj.y, adj.x)
+                            });
+                        let Some((mt, atk_def, _)) = best_adj else {
                             continue;
                         };
+                        // 撃ち漏らし時の敵反撃で自軍対空ユニットが即死する候補は除外
+                        let post_hp = et.hp.saturating_sub(dmg);
+                        if post_hp > 0 {
+                            let c100 = expected_damage(
+                                chart,
+                                profiles,
+                                et.stats.unit_type,
+                                FULL_UNIT_HP,
+                                et.ammo,
+                                ut,
+                                atk_def,
+                                1,
+                                true,
+                            );
+                            let counter_dmg = c100.saturating_mul(post_hp) / FULL_UNIT_HP;
+                            if counter_dmg >= FULL_UNIT_HP {
+                                continue;
+                            }
+                        }
                         mt.max(1)
                     };
                     let strikes_to_kill = rem_hp.div_ceil(dmg.max(1));
                     let total_turns = ready_turns.saturating_add(strikes_to_kill);
-                    // 主目標優先のため撃破総手数最小 -> 与ダメージ最大 -> 安価優先
+                    // 撃墜までに敵航空機が与える期待損害額 ＋ 購入額（同一 Gold 単位）を最小化する
+                    let expected_loss_until_kill_gold =
+                        enemy_air_dmg_gold_per_turn[ei].saturating_mul(total_turns);
+                    let total_cost_gold = expected_loss_until_kill_gold.saturating_add(stats.cost);
                     let cand_key = (
+                        total_cost_gold,
+                        stats.cost,
                         total_turns,
                         u32::MAX - dmg,
-                        stats.cost,
                         fac.y,
                         fac.x,
                         ut.as_str(),
                     );
                     let replace = best_choice.as_ref().is_none_or(|b| {
                         let b_key = (
+                            b.total_cost_gold,
+                            b.cost,
                             b.total_turns,
                             u32::MAX - b.dmg,
-                            b.cost,
                             b.fac.y,
                             b.fac.x,
                             b.stats.unit_type.as_str(),
@@ -499,9 +603,10 @@ fn allocate_anti_air_phase(
                     });
                     if replace {
                         best_choice = Some(AntiAirCandidate {
+                            total_cost_gold,
+                            cost: stats.cost,
                             total_turns,
                             dmg,
-                            cost: stats.cost,
                             fac,
                             stats,
                             enemy_idx: ei,
@@ -1031,6 +1136,10 @@ fn allocate_capture_and_airlift_phase(
     }
 }
 
+/// ヘックス盤面の標準的な前線アプローチ（幅2マス以上の進路）において、
+/// 間接砲1門の後方射点を敵地上部隊の回り込みから ZOC・占有で塞ぐために必要な前衛部隊数の下限（砲1門あたり前衛2体）。
+const MIN_SCREEN_UNITS_PER_INDIRECT: usize = 2;
+
 /// Phase 3 & Phase 4: 前衛安全条件を満たし安全な射点と有効目標がある場合のみ間接火網を 1 門割り当てる。
 fn allocate_indirect_phase(
     alloc: &mut AllocationContext<'_>,
@@ -1043,36 +1152,8 @@ fn allocate_indirect_phase(
     if threat_ctx.enemies.is_empty() {
         return;
     }
-    // 既存間接が前衛直接の半分以上（1間接あたり2前衛未満）なら新規追加しない
-    if alloc.my_direct_cnt < (alloc.my_indirect_cnt + 1) * 2 {
-        return;
-    }
-
-    // 自軍に占領以外の直接機動力（車両・航空）が1体もおらず、開けた平地で敵占領役が物件を狙っている
-    // 状況では、まず高速直接ユニット（装甲車等）で物件を奪還・阻止する方が先
-    let my_mobile_combat_cnt = alloc
-        .scan
-        .my_units
-        .iter()
-        .filter(|u| !profiles.is_indirect(u.stats.unit_type) && !u.stats.can_capture)
-        .count()
-        + alloc
-            .commands
-            .iter()
-            .filter(|p| {
-                p.role == SlotKind::Combat
-                    && scan
-                        .available_types
-                        .iter()
-                        .find(|(t, _)| *t == p.command.unit_type)
-                        .is_some_and(|(t, s)| !profiles.is_indirect(*t) && !s.can_capture)
-            })
-            .count();
-    let has_heavy_or_choke_target = threat_ctx
-        .enemies
-        .iter()
-        .any(|e| !e.stats.can_capture || e.is_indirect || e.firing_slots <= 2);
-    if my_mobile_combat_cnt == 0 && !has_heavy_or_choke_target {
+    // 既存間接が前衛比上限に達している（砲1門あたり前衛2体未満になる）場合は新規追加しない
+    if alloc.my_direct_cnt < (alloc.my_indirect_cnt + 1) * MIN_SCREEN_UNITS_PER_INDIRECT {
         return;
     }
 
@@ -1173,12 +1254,11 @@ fn allocate_indirect_phase(
             if tile_threat.direct_1t_dmg > 0 || tile_threat.counter_battery_dmg >= 60 {
                 continue;
             }
-            // 数的劣勢または局所前衛護衛が不十分な局面では、2T 到達重脅威のない安全タイルのみ許可
-            if outnumbered {
-                if tile_threat.breach_2t_blk_dmg > 0 || tile_threat.breach_2t_prc_dmg >= 45 {
-                    continue;
-                }
-            } else if tile_threat.breach_2t_blk_dmg >= 60 && tile_threat.nearby_screen_hp < 200 {
+            // 数的優劣に関わらず、壁の隙間等を抜けて 2T 以内に射点隣接へ到達され被弾するタイル、
+            // または遮蔽無視 2T 脅威があるのに進路上の護衛が 1 体もいない射点は拒否する
+            if tile_threat.breach_2t_blk_dmg > 0
+                || (tile_threat.breach_2t_prc_dmg > 0 && tile_threat.positional_screen_units == 0)
+            {
                 continue;
             }
 
@@ -1191,6 +1271,12 @@ fn allocate_indirect_phase(
             for (ei, et) in threat_ctx.enemies.iter().enumerate() {
                 let rem_hp = alloc.enemy_rem_hp[ei];
                 if rem_hp == 0 {
+                    continue;
+                }
+                // 移動を伴う間接配置 (delay > 0) では移動後攻撃不可ルールのために初撃が 2T 後となり、
+                // 既に占領完了が迫っている開けた平地上の敵占領兵を完了前に妨害できないため直接機動枠へ譲る
+                if delay > 0 && et.threatens_property && et.stats.can_capture && et.firing_slots > 2
+                {
                     continue;
                 }
                 let dp = map.distance(fpos.x, fpos.y, et.pos_proj.x, et.pos_proj.y);
@@ -1525,49 +1611,40 @@ fn allocate_direct_combat_phase(
                     continue;
                 };
 
-                // 航空ユニットは攻撃地点周囲で 1T 以内に受ける敵の対空／戦闘機迎撃が重大（>= 80%）なら特攻出撃させない
+                // 航空ユニットは攻撃地点周囲で 1T 以内に全敵から受ける対空／迎撃ダメージ合計が重大（>= 80%）なら特攻出撃させない
                 if is_air {
                     let lethal_aa_sum: u32 = threat_ctx
                         .live_reaches
                         .iter()
-                        .filter(|lr| {
+                        .filter_map(|lr| {
                             let eu = lr.unit.stats.unit_type;
-                            let can_counter_air = lr.unit.stats.movement_type == MovementType::Air
-                                || !can_hit_ground(chart, eu)
-                                || profiles.is_indirect(eu);
-                            if !can_counter_air {
-                                return false;
-                            }
-                            if profiles.is_indirect(eu) {
+                            let eval_dist = if profiles.is_indirect(eu) {
                                 let d = map.distance(
                                     lr.unit.pos.x,
                                     lr.unit.pos.y,
                                     atk_tile.x,
                                     atk_tile.y,
                                 );
-                                d >= lr.unit.stats.min_range && d <= lr.unit.stats.max_range
+                                (d >= lr.unit.stats.min_range && d <= lr.unit.stats.max_range)
+                                    .then_some(d)
                             } else if lr.unit.stats.movement_type == MovementType::Air {
                                 // 敵ターンは他敵が退避して射線を開けられるため航空迎撃は移動圏+1で判定
-                                map.distance(lr.unit.pos.x, lr.unit.pos.y, atk_tile.x, atk_tile.y)
-                                    <= lr.unit.stats.max_movement.saturating_add(1)
+                                (map.distance(lr.unit.pos.x, lr.unit.pos.y, atk_tile.x, atk_tile.y)
+                                    <= lr.unit.stats.max_movement.saturating_add(1))
+                                .then_some(1)
                             } else {
-                                map.get_adjacent(atk_tile.x, atk_tile.y).into_iter().any(
-                                    |(ax, ay)| lr.reach_1t.contains(GridPosition { x: ax, y: ay }),
-                                )
-                            }
-                        })
-                        .map(|lr| {
-                            expected_damage(
-                                chart,
-                                profiles,
-                                lr.unit.stats.unit_type,
-                                lr.unit.hp,
-                                lr.ammo,
-                                ut,
-                                atk_def,
-                                1,
+                                map.get_adjacent(atk_tile.x, atk_tile.y)
+                                    .into_iter()
+                                    .any(|(ax, ay)| {
+                                        lr.reach_1t.contains(GridPosition { x: ax, y: ay })
+                                    })
+                                    .then_some(1)
+                            }?;
+                            let dmg = expected_damage(
+                                chart, profiles, eu, lr.unit.hp, lr.ammo, ut, atk_def, eval_dist,
                                 false,
-                            )
+                            );
+                            (dmg > 0).then_some(dmg)
                         })
                         .sum();
                     if lethal_aa_sum >= 80 {

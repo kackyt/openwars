@@ -1335,3 +1335,83 @@ fn two_turn_reach_does_not_carry_over_leftover_mp_across_turn_boundary() {
     assert_eq!(df.get(pos(2, 0)), Some(1));
     assert_eq!(df.get(pos(3, 0)), Some(2));
 }
+
+#[test]
+fn infantry_wall_screens_indirect_fire_pos_while_gap_in_wall_rejects_it() {
+    let (mut scan, avail) = flat_combat_scan(11, 10, 15000);
+    // 左右を山（戦車進入不可）にし、中央幅5マス (x=2..=6, y=4..=7) の回廊を作る
+    if let Some(m) = std::sync::Arc::get_mut(&mut scan.map) {
+        for y in 4..=7 {
+            for x in 0..11 {
+                if !(2..=6).contains(&x) {
+                    m.set_terrain(x, y, Terrain::Mountain).unwrap();
+                }
+            }
+        }
+        m.set_terrain(2, 8, Terrain::Capital).unwrap();
+        m.set_terrain(3, 8, Terrain::Factory).unwrap();
+        m.set_terrain(4, 8, Terrain::Factory).unwrap();
+    }
+    scan.capital_position = Some(pos(2, 8));
+    scan.production_facilities = vec![(pos(3, 8), Terrain::Factory), (pos(4, 8), Terrain::Factory)];
+    scan.free_facilities = scan.production_facilities.clone();
+    let extras = UnifiedBoardExtras {
+        friendly_properties: vec![
+            (pos(2, 8), Terrain::Capital),
+            (pos(3, 8), Terrain::Factory),
+            (pos(4, 8), Terrain::Factory),
+        ],
+        ..Default::default()
+    };
+
+    // 敵戦車3両が回廊の手前から迫る
+    scan.enemy_units = vec![
+        unit_snap(&avail, UnitType::Tank, 3, 3, 100),
+        unit_snap(&avail, UnitType::Tank, 4, 3, 100),
+        unit_snap(&avail, UnitType::Tank, 5, 3, 100),
+    ];
+
+    // 対照1: 占領能力を持つ歩兵3体が回廊中央 y=5 (x=2,4,6) に ZOC・占有の壁を隙間なく作っている盤面
+    scan.my_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 2, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 6, 5, 100),
+    ];
+    let (walled_plan, _) = plan_unified_production(&scan, &extras, PlayerId(1), 5, true, &[]);
+    let walled_has_indirect = walled_plan.iter().any(|p| {
+        avail
+            .iter()
+            .find(|(ut, _)| *ut == p.command.unit_type)
+            .is_some_and(|(_, st)| st.min_range > 1)
+    });
+    assert!(
+        walled_has_indirect,
+        "歩兵の壁が敵の進路を ZOC と占有で隙間なく塞いでいるときは間接砲を許可するべき: {:?}",
+        walled_plan
+            .iter()
+            .map(|p| p.command.unit_type)
+            .collect::<Vec<_>>()
+    );
+
+    // 対照2: 歩兵総数は3体のまま、右翼 (6,5) の歩兵を左の (3,5) へ寄せて右側に隙間を空けた盤面
+    scan.my_units = vec![
+        unit_snap(&avail, UnitType::Infantry, 2, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 5, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 5, 100),
+    ];
+    let (gapped_plan, _) = plan_unified_production(&scan, &extras, PlayerId(1), 5, true, &[]);
+    let gapped_has_indirect = gapped_plan.iter().any(|p| {
+        avail
+            .iter()
+            .find(|(ut, _)| *ut == p.command.unit_type)
+            .is_some_and(|(_, st)| st.min_range > 1)
+    });
+    assert!(
+        !gapped_has_indirect,
+        "壁に隙間があり敵戦車が 2T 以内に射点隣へ抜けてこれる盤面では間接砲を拒否して前衛を出すべき: {:?}",
+        gapped_plan
+            .iter()
+            .map(|p| p.command.unit_type)
+            .collect::<Vec<_>>()
+    );
+}

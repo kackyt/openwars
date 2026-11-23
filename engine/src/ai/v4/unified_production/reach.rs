@@ -79,7 +79,7 @@ impl OccupancyGrid {
     }
 
     #[inline]
-    fn is_zoc_for(&self, mover_code: u8, pos: GridPosition) -> bool {
+    pub(super) fn is_zoc_for(&self, mover_code: u8, pos: GridPosition) -> bool {
         let idx = self.idx(pos);
         if mover_code == OCC_FRIENDLY {
             self.friendly_zoc_locked[idx]

@@ -5,8 +5,8 @@
 //! 直接観測できる物理量だけを提供する。
 
 use super::reach::{
-    OCC_ENEMY, OCC_FRIENDLY, OccupancyGrid, ReachMap, reachable_pierce, reachable_tiles,
-    shortest_dist_field,
+    OCC_ENEMY, OCC_FRIENDLY, OccupancyGrid, ReachMap, UNREACHABLE, reachable_pierce,
+    reachable_tiles, shortest_dist_field,
 };
 use super::{UnifiedBoardExtras, WeaponProfileTable};
 use crate::ai::v4::{BoardScan, UnitSnapshot};
@@ -17,6 +17,13 @@ use crate::resources::{DamageChart, Map, MovementType, Terrain, UnitType};
 use crate::systems::combat::calculate_damage_formula;
 use crate::systems::movement::get_valid_movement_cost;
 use bevy_ecs::prelude::Entity;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+/// 敵から射点への最短距離に対して同一進路（コリドー）とみなす迂回許容マス数。
+/// 幅3〜5マスの前線壁の端にある隙間を通る経路（最短距離 +2 マス）を進路内として検出し、
+/// 戦線外周を大きく迂回する経路（+4 マス以上）を進路外として除外する。
+const ADVANCE_CORRIDOR_SLACK: u32 = 2;
 
 /// 実在敵 1 体の投影情報と空間制約。
 #[derive(Debug, Clone)]
@@ -37,28 +44,29 @@ pub(super) struct ObservedEnemy {
     pub(super) threatens_property: bool,
 }
 
-/// 実在敵ごとの事前計算済み到達圏（射点・空港安全判定で再利用）。
+/// 実在敵ごとの事前計算済み到達圏（射点・空港安全判定・位置護衛判定で再利用）。
 pub(super) struct LiveEnemyReach {
     pub(super) unit: UnitSnapshot,
     pub(super) ammo: (u32, u32),
     pub(super) reach_1t: ReachMap,
+    pub(super) reach_2t_prc: ReachMap,
     pub(super) seen_2t_blk: Vec<bool>,
     pub(super) seen_2t_prc: Vec<bool>,
 }
 
-/// 射点における物理的な敵脅威の集計値（%ダメージ）。
+/// 射点における物理的な敵脅威の集計値（%ダメージ）と位置ベース護衛数。
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct FiringTileThreat {
     /// 1T 以内に隣接可能な敵直接部隊の期待ダメージ合計。
     pub(super) direct_1t_dmg: u32,
     /// 遮蔽あり 2T 以内に到達可能な敵直接部隊の最大期待ダメージ。
     pub(super) breach_2t_blk_dmg: u32,
-    /// 遮蔽無視 2T 到達範囲内で近接味方護衛が不十分な場合の最大期待ダメージ。
+    /// 遮蔽無視 2T 到達範囲内に到達可能な敵直接部隊の最大期待ダメージ。
     pub(super) breach_2t_prc_dmg: u32,
     /// 敵間接部隊からの対砲兵期待ダメージ合計。
     pub(super) counter_battery_dmg: u32,
-    /// 射点周囲2マス以内で対抗可能な味方前衛直接ユニットの HP 合計。
-    pub(super) nearby_screen_hp: u32,
+    /// 敵地上直接部隊から射点へ向かう進路上に位置し、占有または ZOC で進路を止めている自軍地上部隊数（兵種不問）。
+    pub(super) positional_screen_units: usize,
 }
 
 /// 盤面の物理脅威・供給網・陸路到達性を保持するコンテキスト。
@@ -70,6 +78,7 @@ pub(super) struct ThreatContext {
     pub(super) ground_facility_set: HashSet<GridPosition>,
     pub(super) enemies: Vec<ObservedEnemy>,
     pub(super) f_direct_units: Vec<UnitSnapshot>,
+    pub(super) my_ground_units: Vec<UnitSnapshot>,
     pub(super) e_direct_cnt: usize,
     pub(super) can_reach_enemy_via_land: bool,
     pub(super) live_reaches: Vec<LiveEnemyReach>,
@@ -123,6 +132,18 @@ impl ThreatContext {
             .my_units
             .iter()
             .filter(|u| !profiles.is_indirect(u.stats.unit_type))
+            .cloned()
+            .collect();
+        let my_ground_units: Vec<UnitSnapshot> = scan
+            .my_units
+            .iter()
+            .filter(|u| {
+                u.hp > 0
+                    && !matches!(
+                        u.stats.movement_type,
+                        MovementType::Air | MovementType::Ship
+                    )
+            })
             .cloned()
             .collect();
         let f_positions: Vec<GridPosition> = scan.my_units.iter().map(|u| u.pos).collect();
@@ -292,6 +313,7 @@ impl ThreatContext {
                 unit: u.clone(),
                 ammo,
                 reach_1t: r1.clone(),
+                reach_2t_prc: r2p,
                 seen_2t_blk,
                 seen_2t_prc,
             });
@@ -460,6 +482,7 @@ impl ThreatContext {
             ground_facility_set,
             enemies,
             f_direct_units,
+            my_ground_units,
             e_direct_cnt,
             can_reach_enemy_via_land,
             live_reaches,
@@ -493,19 +516,39 @@ impl ThreatContext {
         let mut breach_2t_blk_dmg = 0_u32;
         let mut breach_2t_prc_dmg = 0_u32;
 
-        // 射点周囲の味方直接前衛 HP 合計（2T 貫通脅威に対する物理遮蔽の有無判定に使用）
-        let nearby_screen_hp: u32 = self
-            .f_direct_units
+        // 敵地上直接部隊から射点へ向かう進路上に位置し、占有または ZOC で進路を止めている自軍地上部隊を数える（兵種不問）
+        let positional_screen_units = self
+            .my_ground_units
             .iter()
-            .filter(|f| f.pos != pos && map.distance(f.pos.x, f.pos.y, pos.x, pos.y) <= 2)
+            .filter(|f| f.pos != pos)
             .filter(|f| {
-                self.enemies.iter().any(|e| {
-                    max_base_damage(chart, f.stats.unit_type, e.stats.unit_type)
-                        >= max_base_damage(chart, e.stats.unit_type, ut) / 2
+                let d_pos_f = map.distance(pos.x, pos.y, f.pos.x, f.pos.y);
+                let f_adj = map.get_adjacent(f.pos.x, f.pos.y);
+                self.live_reaches.iter().any(|lr| {
+                    if profiles.is_indirect(lr.unit.stats.unit_type)
+                        || matches!(
+                            lr.unit.stats.movement_type,
+                            MovementType::Air | MovementType::Ship
+                        )
+                    {
+                        return false;
+                    }
+                    let d_pos_e = map.distance(pos.x, pos.y, lr.unit.pos.x, lr.unit.pos.y);
+                    let d_e_f = map.distance(lr.unit.pos.x, lr.unit.pos.y, f.pos.x, f.pos.y);
+                    // 敵より射点側にいて、敵→射点の進路上（コリドー許容幅内）に位置していること
+                    if !(d_pos_f < d_pos_e
+                        && d_e_f.saturating_add(d_pos_f)
+                            <= d_pos_e.saturating_add(ADVANCE_CORRIDOR_SLACK))
+                    {
+                        return false;
+                    }
+                    lr.reach_2t_prc.contains(f.pos)
+                        || f_adj.iter().any(|&(zx, zy)| {
+                            lr.reach_2t_prc.contains(GridPosition { x: zx, y: zy })
+                        })
                 })
             })
-            .map(|f| f.hp)
-            .sum();
+            .count();
 
         for lr in &self.live_reaches {
             let e_ut = lr.unit.stats.unit_type;
@@ -522,9 +565,29 @@ impl ThreatContext {
                 direct_1t_dmg = direct_1t_dmg.saturating_add(d);
             }
             if lr.seen_2t_blk[tile_idx] {
-                breach_2t_blk_dmg = breach_2t_blk_dmg.max(d);
+                let is_ground_direct = !matches!(
+                    lr.unit.stats.movement_type,
+                    MovementType::Air | MovementType::Ship
+                );
+                let breaches = if is_ground_direct {
+                    enemy_breaches_corridor_in_2t(
+                        map,
+                        master,
+                        &self.occ,
+                        lr.unit.pos,
+                        pos,
+                        lr.unit.stats.movement_type,
+                        lr.unit.stats.max_movement,
+                        lr.unit.stats.max_fuel,
+                    )
+                } else {
+                    true
+                };
+                if breaches {
+                    breach_2t_blk_dmg = breach_2t_blk_dmg.max(d);
+                }
             }
-            if lr.seen_2t_prc[tile_idx] && nearby_screen_hp < 100 {
+            if lr.seen_2t_prc[tile_idx] {
                 breach_2t_prc_dmg = breach_2t_prc_dmg.max(d);
             }
         }
@@ -566,7 +629,7 @@ impl ThreatContext {
             breach_2t_blk_dmg,
             breach_2t_prc_dmg,
             counter_battery_dmg,
-            nearby_screen_hp,
+            positional_screen_units,
         }
     }
 }
@@ -635,4 +698,95 @@ pub(super) fn expected_damage(
         return calculate_damage_formula(bd, att_hp, def_bonus, is_counter);
     }
     0
+}
+
+/// 敵地上直接ユニットが射点 `fpos` へ向かう進路（`ADVANCE_CORRIDOR_SLACK` 許容の進行コリドー）を通って、
+/// 2手番以内に `fpos` の隣接停止可能マスへ突破到達できるか判定する。
+#[allow(clippy::too_many_arguments)]
+fn enemy_breaches_corridor_in_2t(
+    map: &Map,
+    master_data: &MasterDataRegistry,
+    occ: &OccupancyGrid,
+    start: GridPosition,
+    fpos: GridPosition,
+    movement_type: MovementType,
+    max_movement: u32,
+    max_fuel: u32,
+) -> bool {
+    if start.x >= map.width || start.y >= map.height {
+        return false;
+    }
+    let d_total = map.distance(start.x, start.y, fpos.x, fpos.y);
+    if d_total <= 1 {
+        return true;
+    }
+    let effective_fuel = if max_fuel == 0 { u32::MAX } else { max_fuel };
+    let len = map.width.saturating_mul(map.height);
+    let mut best_state = vec![(UNREACHABLE, UNREACHABLE); len];
+    best_state[occ.idx(start)] = (0, 0);
+
+    let mut heap = BinaryHeap::new();
+    heap.push(Reverse((0_u32, 0_u32, 0_u32, start.y, start.x)));
+
+    while let Some(Reverse((turns, mp_in_turn, steps, y, x))) = heap.pop() {
+        let pos = GridPosition { x, y };
+        let idx = occ.idx(pos);
+        if (turns, mp_in_turn) > best_state[idx] || turns > 2 || steps >= effective_fuel {
+            continue;
+        }
+        let d_cur = map.distance(x, y, fpos.x, fpos.y);
+        let occupied_non_vacatable = pos != start && occ.at(pos) != 0;
+        let must_start_next_turn = turns > 0 && pos != start && occ.is_zoc_for(OCC_ENEMY, pos);
+
+        for (nx, ny) in map.get_adjacent(x, y) {
+            let npos = GridPosition { x: nx, y: ny };
+            let cell_occ = occ.at(npos);
+            if cell_occ != 0 && cell_occ != OCC_ENEMY {
+                continue;
+            }
+            let d_next = map.distance(nx, ny, fpos.x, fpos.y);
+            if d_next > d_cur
+                || map
+                    .distance(start.x, start.y, nx, ny)
+                    .saturating_add(d_next)
+                    > d_total.saturating_add(ADVANCE_CORRIDOR_SLACK)
+            {
+                continue;
+            }
+            let Some(terrain) = map.get_terrain(nx, ny) else {
+                continue;
+            };
+            let Some(step_cost) = get_valid_movement_cost(master_data, movement_type, terrain)
+            else {
+                continue;
+            };
+            if step_cost > max_movement {
+                continue;
+            }
+            let (next_turns, next_mp) = if turns == 0 {
+                (1, step_cost)
+            } else if must_start_next_turn || mp_in_turn.saturating_add(step_cost) > max_movement {
+                if occupied_non_vacatable {
+                    continue;
+                }
+                (turns.saturating_add(1), step_cost)
+            } else {
+                (turns, mp_in_turn.saturating_add(step_cost))
+            };
+            let next_steps = steps.saturating_add(1);
+            if next_turns > 2 || next_steps > effective_fuel {
+                continue;
+            }
+            if d_next == 1 && (npos == start || cell_occ == 0) {
+                return true;
+            }
+            let nidx = occ.idx(npos);
+            if (next_turns, next_mp) < best_state[nidx] {
+                best_state[nidx] = (next_turns, next_mp);
+                heap.push(Reverse((next_turns, next_mp, next_steps, ny, nx)));
+            }
+        }
+    }
+
+    false
 }
