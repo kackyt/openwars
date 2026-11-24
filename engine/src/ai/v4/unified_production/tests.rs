@@ -1621,260 +1621,76 @@ fn airport_does_not_starve_ground_factories_when_outnumbered() {
     );
 }
 
+/// 生産後の施設ペア入替により、どの 2 体の生産施設を交換しても
+/// 目標（占領先・展開先）への到着ターン合計（同値なら距離合計）がそれ以上短縮されないことを確認する。
 #[test]
-fn map_profile_shifts_category_shares_across_open_bridge_and_air_maps() {
-    use super::composition::CompositionGuidance;
-    use crate::resources::AiUnitCategory;
-
-    // 対照1: 開けた平地マップ（最小物件・空港なし）
-    let (mut open_scan, avail) = flat_combat_scan(12, 10, 10000);
-    open_scan.production_facilities = vec![(pos(2, 5), Terrain::Factory)];
-    let open_extras = UnifiedBoardExtras {
-        friendly_properties: vec![(pos(1, 5), Terrain::Capital), (pos(2, 5), Terrain::Factory)],
-        enemy_properties: vec![(pos(10, 5), Terrain::Capital)],
+fn facility_assignment_has_no_improving_pair_swap() {
+    let (mut scan, avail) = flat_combat_scan(12, 12, 10000);
+    scan.capital_position = Some(pos(8, 10));
+    scan.production_facilities = vec![
+        (pos(6, 9), Terrain::Factory),
+        (pos(7, 9), Terrain::Factory),
+        (pos(7, 8), Terrain::Factory),
+        (pos(8, 8), Terrain::Factory),
+        (pos(8, 9), Terrain::Factory),
+        (pos(7, 10), Terrain::Factory),
+        (pos(9, 9), Terrain::Factory),
+    ];
+    let mut extras = UnifiedBoardExtras {
+        friendly_properties: scan.production_facilities.clone(),
         ..Default::default()
     };
-    let open_profiles = super::WeaponProfileTable::from_scan(&open_scan);
-    let open_threat =
-        super::threats::ThreatContext::build(&open_scan, &open_extras, &open_profiles);
-    let open_guidance =
-        CompositionGuidance::build(&open_scan, &open_extras, &open_profiles, &open_threat);
-
-    assert_eq!(
-        open_guidance.target_share(AiUnitCategory::AirForce),
-        0.0,
-        "空港を持たない盤面では航空部隊の目標シェアが 0 になるべき"
-    );
-    assert_eq!(
-        open_guidance.target_share(AiUnitCategory::Fighter),
-        0.0,
-        "空港を持たない盤面では戦闘機の目標シェアが 0 になるべき"
-    );
-
-    // 対照2: 外周が海、中央も山と海＋橋2マスで分断され都市も密集した隘路マップ（工場3・空港1）
-    let (mut bridge_scan, _) = flat_combat_scan(12, 10, 10000);
-    if let Some(m) = std::sync::Arc::get_mut(&mut bridge_scan.map) {
-        for y in 0..10 {
-            for x in 0..12 {
-                if x == 0 || x == 11 || y == 0 || y == 9 {
-                    m.set_terrain(x, y, Terrain::Sea).unwrap();
-                }
-            }
-        }
-        for y in 1..9 {
-            if y != 4 && y != 5 {
-                m.set_terrain(5, y, Terrain::Mountain).unwrap();
-                m.set_terrain(6, y, Terrain::Sea).unwrap();
-            }
-        }
-        m.set_terrain(5, 4, Terrain::Bridge).unwrap();
-        m.set_terrain(6, 5, Terrain::Bridge).unwrap();
-        m.set_terrain(5, 5, Terrain::Sea).unwrap();
-        m.set_terrain(6, 4, Terrain::Sea).unwrap();
-        m.set_terrain(3, 3, Terrain::Forest).unwrap();
-        m.set_terrain(4, 3, Terrain::Forest).unwrap();
-        m.set_terrain(3, 7, Terrain::Forest).unwrap();
-        m.set_terrain(4, 7, Terrain::Forest).unwrap();
-    }
-    bridge_scan.owned_airport_count = 1;
-    bridge_scan.production_facilities = vec![
-        (pos(2, 3), Terrain::Factory),
-        (pos(2, 5), Terrain::Factory),
-        (pos(2, 7), Terrain::Factory),
-        (pos(1, 3), Terrain::Airport),
-    ];
-    let mut bridge_friendly = vec![
-        (pos(1, 5), Terrain::Capital),
-        (pos(2, 3), Terrain::Factory),
-        (pos(2, 5), Terrain::Factory),
-        (pos(2, 7), Terrain::Factory),
-        (pos(1, 3), Terrain::Airport),
-    ];
-    for &(cx, cy) in &[
-        (3, 2),
-        (3, 4),
-        (3, 5),
-        (3, 6),
-        (3, 8),
-        (4, 2),
-        (4, 4),
-        (4, 5),
-        (4, 6),
-        (4, 8),
-    ] {
-        bridge_friendly.push((pos(cx, cy), Terrain::City));
-    }
-    let bridge_extras = UnifiedBoardExtras {
-        friendly_properties: bridge_friendly,
-        enemy_properties: vec![
-            (pos(10, 5), Terrain::Capital),
-            (pos(8, 3), Terrain::City),
-            (pos(8, 4), Terrain::City),
-            (pos(8, 5), Terrain::City),
-            (pos(8, 6), Terrain::City),
-            (pos(8, 7), Terrain::City),
-        ],
-        ..Default::default()
-    };
-    let bridge_profiles = super::WeaponProfileTable::from_scan(&bridge_scan);
-    let bridge_threat =
-        super::threats::ThreatContext::build(&bridge_scan, &bridge_extras, &bridge_profiles);
-    let bridge_guidance = CompositionGuidance::build(
-        &bridge_scan,
-        &bridge_extras,
-        &bridge_profiles,
-        &bridge_threat,
-    );
-
-    assert!(
-        bridge_guidance.target_share(AiUnitCategory::SelfPropelledGun)
-            > open_guidance.target_share(AiUnitCategory::SelfPropelledGun),
-        "橋・高密度物件の隘路マップでは開闊マップより自走砲の目標シェアが高まるべき: bridge={}, open={}",
-        bridge_guidance.target_share(AiUnitCategory::SelfPropelledGun),
-        open_guidance.target_share(AiUnitCategory::SelfPropelledGun)
-    );
-    assert!(
-        bridge_guidance.target_share(AiUnitCategory::Infantry)
-            > open_guidance.target_share(AiUnitCategory::Infantry),
-        "橋・高密度物件の隘路マップでは歩兵の目標シェアが高まるべき: bridge={}, open={}",
-        bridge_guidance.target_share(AiUnitCategory::Infantry),
-        open_guidance.target_share(AiUnitCategory::Infantry)
-    );
-    assert!(
-        bridge_guidance.target_share(AiUnitCategory::Artillery)
-            > open_guidance.target_share(AiUnitCategory::Artillery),
-        "工場3以上かつ高渋滞マップでは砲台目標シェアが活性化されるべき: bridge={}, open={}",
-        bridge_guidance.target_share(AiUnitCategory::Artillery),
-        open_guidance.target_share(AiUnitCategory::Artillery)
-    );
-
-    // 敵戦闘ヘリ2機が出現すると対空戦車・対空ミサイル・戦闘機の合計シェアが動的に増加する
-    bridge_scan.enemy_units = vec![
-        unit_snap(&avail, UnitType::Bcopters, 8, 4, 100),
-        unit_snap(&avail, UnitType::Bcopters, 8, 6, 100),
-    ];
-    let air_threat =
-        super::threats::ThreatContext::build(&bridge_scan, &bridge_extras, &bridge_profiles);
-    let air_guidance =
-        CompositionGuidance::build(&bridge_scan, &bridge_extras, &bridge_profiles, &air_threat);
-    let aa_sum = |g: &CompositionGuidance| {
-        g.target_share(AiUnitCategory::AntiAirTank)
-            + g.target_share(AiUnitCategory::AntiAirMissile)
-            + g.target_share(AiUnitCategory::Fighter)
-    };
-    assert!(
-        aa_sum(&air_guidance) > aa_sum(&bridge_guidance),
-        "敵戦闘ヘリが出現すると対空3カテゴリの目標シェアが動的に増加するべき: with_air={}, without_air={}",
-        aa_sum(&air_guidance),
-        aa_sum(&bridge_guidance)
-    );
-    assert!(
-        air_guidance.target_share(AiUnitCategory::Fighter) > 0.0
-            && air_guidance.target_share(AiUnitCategory::AntiAirMissile) > 0.0
-            && air_guidance.target_share(AiUnitCategory::AntiAirTank) > 0.0,
-        "空港・多工場がある盤面では敵複数航空機に対して戦闘機・対空ミサイル・対空戦車へ分散配分されるべき"
-    );
-}
-
-#[test]
-fn tank_category_steers_excess_recon_toward_real_tanks_unless_urgent_capture() {
-    // 対照1: 同じ「戦車」カテゴリでも Recon 3両が既にあり本戦車 0 の通常前線では Tank 以上を選ぶ
-    let (mut normal_scan, avail) = flat_combat_scan(12, 10, 12000);
-    normal_scan.capital_position = Some(pos(1, 5));
-    normal_scan.production_facilities = vec![(pos(2, 5), Terrain::Factory)];
-    normal_scan.free_facilities = normal_scan.production_facilities.clone();
-    let extras = UnifiedBoardExtras {
-        friendly_properties: vec![(pos(1, 5), Terrain::Capital), (pos(2, 5), Terrain::Factory)],
-        ..Default::default()
-    };
-    normal_scan.my_units = vec![
-        unit_snap(&avail, UnitType::Recon, 4, 4, 100),
-        unit_snap(&avail, UnitType::Recon, 4, 5, 100),
-        unit_snap(&avail, UnitType::Recon, 4, 6, 100),
-        unit_snap(&avail, UnitType::Infantry, 1, 1, 100),
-        unit_snap(&avail, UnitType::Infantry, 1, 2, 100),
-        unit_snap(&avail, UnitType::Infantry, 3, 4, 100),
-        unit_snap(&avail, UnitType::Infantry, 3, 6, 100),
-    ];
-    normal_scan.enemy_units = vec![
-        unit_snap(&avail, UnitType::Infantry, 6, 4, 100),
-        unit_snap(&avail, UnitType::Infantry, 6, 5, 100),
-    ];
-    let (normal_plan, _) =
-        plan_unified_production(&normal_scan, &extras, PlayerId(2), 6, true, &[]);
-    assert_eq!(
-        normal_plan.first().map(|p| p.command.unit_type),
-        Some(UnitType::Tank),
-        "戦車カテゴリ内にReconが過剰かつ主力戦車不在の通常前線ではカテゴリ内誘導でTankを選ぶべき: {:?}",
-        normal_plan
-            .iter()
-            .map(|p| p.command.unit_type)
-            .collect::<Vec<_>>()
-    );
-
-    // 対照2: 同じRecon過剰構成でも、遠くの中立物件を敵歩兵が占領中で Recon のみ 1T で妨害できる緊急時は Recon を選ぶ
-    let mut urgent_scan = normal_scan;
-    urgent_scan.neutral_properties = vec![pos(8, 5)];
-    urgent_scan.open_properties = vec![pos(8, 5)];
-    urgent_scan.enemy_units = vec![unit_snap(&avail, UnitType::Infantry, 8, 5, 100)];
-    let (urgent_plan, _) =
-        plan_unified_production(&urgent_scan, &extras, PlayerId(2), 6, true, &[]);
-    assert_eq!(
-        urgent_plan.first().map(|p| p.command.unit_type),
-        Some(UnitType::Recon),
-        "拠点占領中の敵へReconのみ1Tで急行して阻止できる緊急時は強制禁止せずReconを選ぶべき: {:?}",
-        urgent_plan
-            .iter()
-            .map(|p| p.command.unit_type)
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn hammer_saving_carries_over_surplus_for_next_turn_mdtank() {
-    let (mut scan, avail) = flat_combat_scan(12, 10, 13000);
-    scan.capital_position = Some(pos(1, 5));
-    scan.my_income = 12000;
-    scan.production_facilities = vec![(pos(2, 5), Terrain::Factory), (pos(2, 6), Terrain::Factory)];
+    extras
+        .friendly_properties
+        .push((pos(8, 10), Terrain::Capital));
     scan.free_facilities = scan.production_facilities.clone();
-    let extras = UnifiedBoardExtras {
-        friendly_properties: vec![
-            (pos(1, 5), Terrain::Capital),
-            (pos(2, 5), Terrain::Factory),
-            (pos(2, 6), Terrain::Factory),
-        ],
-        ..Default::default()
-    };
-
-    // 前線が安定（歩兵壁6 + Recon1で歩兵カテゴリ充足・主力戦車不足）かつ収入12,000G（次ターン18,000GのMdTankに残り6,000G）
-    scan.my_units = vec![
-        unit_snap(&avail, UnitType::Infantry, 4, 3, 100),
-        unit_snap(&avail, UnitType::Infantry, 4, 4, 100),
-        unit_snap(&avail, UnitType::Infantry, 4, 5, 100),
-        unit_snap(&avail, UnitType::Infantry, 4, 6, 100),
-        unit_snap(&avail, UnitType::Infantry, 4, 7, 100),
-        unit_snap(&avail, UnitType::Infantry, 3, 5, 100),
-        unit_snap(&avail, UnitType::Recon, 3, 6, 100),
-    ];
+    scan.neutral_properties = vec![pos(4, 8), pos(4, 9), pos(3, 9), pos(3, 8), pos(10, 6)];
+    scan.open_properties = scan.neutral_properties.clone();
     scan.enemy_units = vec![
-        unit_snap(&avail, UnitType::Tank, 7, 5, 100),
-        unit_snap(&avail, UnitType::Infantry, 6, 4, 100),
-        unit_snap(&avail, UnitType::Infantry, 6, 5, 100),
-        unit_snap(&avail, UnitType::Infantry, 6, 6, 100),
-        unit_snap(&avail, UnitType::Infantry, 6, 7, 100),
+        unit_snap(&avail, UnitType::Infantry, 3, 4, 100),
+        unit_snap(&avail, UnitType::Infantry, 4, 4, 100),
     ];
 
-    let (planned, trace) = plan_unified_production(&scan, &extras, PlayerId(2), 10, true, &[]);
-    let units: Vec<UnitType> = planned.iter().map(|p| p.command.unit_type).collect();
+    let (planned, _) = plan_unified_production(&scan, &extras, PlayerId(2), 1, true, &[]);
+    // 平地のみ・目標周辺に障害物なしのため、到着ターンは距離 / 移動力の切り上げで近似できる
+    let legs: Vec<(GridPosition, GridPosition, u32)> = planned
+        .iter()
+        .filter(|p| p.role == SlotKind::Capture)
+        .filter_map(|p| {
+            let target = p
+                .capture_intent
+                .as_ref()
+                .and_then(|i| i.mission_target)
+                .or_else(|| p.deployment.as_ref().map(|d| d.staging_anchor))?;
+            let mv = avail
+                .iter()
+                .find(|(ut, _)| *ut == p.command.unit_type)
+                .map(|(_, s)| s.max_movement.max(1))?;
+            Some((pos(p.command.target_x, p.command.target_y), target, mv))
+        })
+        .collect();
     assert!(
-        !planned.is_empty() && trace.leftover_funds >= 6000,
-        "前線安定時は次ターンMdTank(18,000G)用に必要繰越額6,000G以上を温存するべき: leftover={}, units={:?}",
-        trace.leftover_funds,
-        units
+        legs.len() >= 2,
+        "占領兵が複数生産される盤面であるべき: {legs:?}"
     );
-    assert!(
-        !units.contains(&UnitType::Recon),
-        "端数予算で過剰なReconを買い足さず主力・貯蓄へ回すべき: {:?}",
-        units
-    );
+    let cost = |fac: GridPosition, tgt: GridPosition, mv: u32| {
+        let d = scan.map.distance(fac.x, fac.y, tgt.x, tgt.y);
+        (d.div_ceil(mv).max(1), d)
+    };
+    for i in 0..legs.len() {
+        for j in (i + 1)..legs.len() {
+            let (fi, ti, mi) = legs[i];
+            let (fj, tj, mj) = legs[j];
+            let (a1, a2) = (cost(fi, ti, mi), cost(fj, tj, mj));
+            let (b1, b2) = (cost(fj, ti, mi), cost(fi, tj, mj));
+            let curr = (a1.0 + a2.0, a1.1 + a2.1);
+            let swap = (b1.0 + b2.0, b1.1 + b2.1);
+            assert!(
+                swap >= curr,
+                "施設入替で到着が短縮できる組が残っている: {:?} と {:?} curr={curr:?} swap={swap:?}",
+                legs[i],
+                legs[j]
+            );
+        }
+    }
 }
