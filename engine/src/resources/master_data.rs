@@ -144,6 +144,81 @@ pub struct CategoryRecord {
     pub category: String,
 }
 
+/// AI用の長期編成・比率誘導に用いるユニットカテゴリの総数。
+pub const AI_UNIT_CATEGORY_COUNT: usize = 12;
+
+/// AI用の長期編成・比率誘導に用いる12種類のユニットカテゴリ（`category_ai.csv` と1対1対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum AiUnitCategory {
+    /// 歩兵（軽歩兵・重歩兵）。
+    Infantry = 0,
+    /// 戦車（軽戦車・中戦車・重戦車・装甲車）。
+    Tank = 1,
+    /// 砲台。
+    Artillery = 2,
+    /// 自走砲（軽自走砲・重自走砲・ロケットランチャー）。
+    SelfPropelledGun = 3,
+    /// 対空ミサイル。
+    AntiAirMissile = 4,
+    /// 対空戦車。
+    AntiAirTank = 5,
+    /// 補給輸送車。
+    SupplyTruck = 6,
+    /// 戦闘機（軽戦闘機・重戦闘機）。
+    Fighter = 7,
+    /// 航空部隊（爆撃機・戦闘ヘリ・輸送ヘリ）。
+    AirForce = 8,
+    /// 戦艦。
+    Battleship = 9,
+    /// 空母。
+    Carrier = 10,
+    /// 輸送船。
+    Lander = 11,
+}
+
+impl AiUnitCategory {
+    /// 全12カテゴリをインデックス順（`0..AI_UNIT_CATEGORY_COUNT`）で並べた固定配列。
+    pub const ALL: [AiUnitCategory; AI_UNIT_CATEGORY_COUNT] = [
+        Self::Infantry,
+        Self::Tank,
+        Self::Artillery,
+        Self::SelfPropelledGun,
+        Self::AntiAirMissile,
+        Self::AntiAirTank,
+        Self::SupplyTruck,
+        Self::Fighter,
+        Self::AirForce,
+        Self::Battleship,
+        Self::Carrier,
+        Self::Lander,
+    ];
+
+    /// マスターデータ CSV 上の日本語カテゴリ名を返す。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Infantry => "歩兵",
+            Self::Tank => "戦車",
+            Self::Artillery => "砲台",
+            Self::SelfPropelledGun => "自走砲",
+            Self::AntiAirMissile => "対空ミサイル",
+            Self::AntiAirTank => "対空戦車",
+            Self::SupplyTruck => "補給輸送車",
+            Self::Fighter => "戦闘機",
+            Self::AirForce => "航空部隊",
+            Self::Battleship => "戦艦",
+            Self::Carrier => "空母",
+            Self::Lander => "輸送船",
+        }
+    }
+
+    /// 日本語カテゴリ名から `AiUnitCategory` を解決する。
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|cat| cat.as_str() == s)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadRecord {
     #[serde(rename = "輸送ユニット")]
@@ -281,6 +356,7 @@ pub struct MasterDataRegistry {
     pub movements: HashMap<crate::resources::MovementType, MovementRecord>,
     pub loads: HashMap<String, Vec<LoadRecord>>,
     pub categories: HashMap<String, Vec<crate::resources::UnitType>>,
+    pub ai_unit_categories: HashMap<crate::resources::UnitType, AiUnitCategory>,
     pub maps: HashMap<String, MapData>,
     pub rom_scenarios: HashMap<String, RomScenarioRecord>,
 }
@@ -419,6 +495,38 @@ impl MasterDataRegistry {
                 .push(u_type);
         }
 
+        // 6b. AI用12カテゴリ(category_ai.csv)データ読み込み
+        // 長期編成比率誘導に用いる排他的なユニットカテゴリを登録します。
+        let category_ai_csv = include_str!("master_data/category_ai.csv");
+        let mut rdr = csv::Reader::from_reader(category_ai_csv.as_bytes());
+        for result in rdr.deserialize() {
+            let record: CategoryRecord = result?;
+            let u_type = crate::resources::UnitType::from_str(&record.unit_name)
+                .ok_or_else(|| MasterDataError::InvalidUnitName(record.unit_name.clone()))?;
+            let ai_category = AiUnitCategory::from_str(&record.category)
+                .ok_or_else(|| MasterDataError::InvalidCategoryName(record.category.clone()))?;
+            if registry
+                .ai_unit_categories
+                .insert(u_type, ai_category)
+                .is_some()
+            {
+                return Err(MasterDataError::InvalidCategoryName(format!(
+                    "duplicate AI category mapping for {}",
+                    record.unit_name
+                )));
+            }
+        }
+        // 全登録ユニットがいずれかの AI カテゴリに割り当てられているか検証する
+        for unit_name in &registry.unit_order {
+            let u_type = registry.unit_type_for_name(&unit_name.0)?;
+            if !registry.ai_unit_categories.contains_key(&u_type) {
+                return Err(MasterDataError::InvalidCategoryName(format!(
+                    "missing AI category mapping for {}",
+                    unit_name.0
+                )));
+            }
+        }
+
         // 7. マップ初期配置データ読み込み
         // プレイヤーIDと地形IDが結合された数値を MapData としてパースします。
         for (name, content) in MAPS {
@@ -483,6 +591,11 @@ impl MasterDataRegistry {
     ) -> Result<crate::resources::UnitType, MasterDataError> {
         crate::resources::UnitType::from_str(name)
             .ok_or_else(|| MasterDataError::InvalidUnitName(name.to_string()))
+    }
+
+    /// ユニット種別に対応する AI 用12カテゴリを返す。
+    pub fn ai_category_for(&self, unit_type: crate::resources::UnitType) -> Option<AiUnitCategory> {
+        self.ai_unit_categories.get(&unit_type).copied()
     }
 
     pub fn get_unit(&self, name: &UnitName) -> Option<&UnitRecord> {
@@ -1162,6 +1275,98 @@ mod tests {
         assert_eq!(
             registry.can_repair_on_terrain(UnitType::Infantry, Terrain::Capital),
             registry.can_produce_unit(Terrain::Capital.as_str(), UnitType::Infantry)
+        );
+    }
+
+    #[test]
+    fn test_load_ai_unit_categories() {
+        use crate::resources::{UNIT_TYPE_MAP, UnitType};
+        let registry = MasterDataRegistry::load().unwrap();
+
+        assert_eq!(registry.ai_unit_categories.len(), UNIT_TYPE_MAP.len());
+        assert_eq!(
+            registry.ai_category_for(UnitType::Infantry),
+            Some(AiUnitCategory::Infantry)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Mech),
+            Some(AiUnitCategory::Infantry)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Recon),
+            Some(AiUnitCategory::Tank)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Tank),
+            Some(AiUnitCategory::Tank)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::MdTank),
+            Some(AiUnitCategory::Tank)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::TankZ),
+            Some(AiUnitCategory::Tank)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Artillery),
+            Some(AiUnitCategory::Artillery)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::LightSpGun),
+            Some(AiUnitCategory::SelfPropelledGun)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::HeavySpGun),
+            Some(AiUnitCategory::SelfPropelledGun)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Rockets),
+            Some(AiUnitCategory::SelfPropelledGun)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Missiles),
+            Some(AiUnitCategory::AntiAirMissile)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::AntiAir),
+            Some(AiUnitCategory::AntiAirTank)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::SupplyTruck),
+            Some(AiUnitCategory::SupplyTruck)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Fighter),
+            Some(AiUnitCategory::Fighter)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::HeavyFighter),
+            Some(AiUnitCategory::Fighter)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Bomber),
+            Some(AiUnitCategory::AirForce)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Bcopters),
+            Some(AiUnitCategory::AirForce)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::TransportHelicopter),
+            Some(AiUnitCategory::AirForce)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Battleship),
+            Some(AiUnitCategory::Battleship)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Carrier),
+            Some(AiUnitCategory::Carrier)
+        );
+        assert_eq!(
+            registry.ai_category_for(UnitType::Lander),
+            Some(AiUnitCategory::Lander)
         );
     }
 }

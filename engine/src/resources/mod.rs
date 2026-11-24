@@ -1,7 +1,7 @@
 pub mod grid;
 pub mod master_data;
 pub use grid::{GridGeometry, GridTopology, HexGrid, SquareGrid};
-pub use master_data::MasterDataRegistry;
+pub use master_data::{AI_UNIT_CATEGORY_COUNT, AiUnitCategory, MasterDataRegistry};
 
 use crate::components::PlayerId;
 use bevy_ecs::prelude::*;

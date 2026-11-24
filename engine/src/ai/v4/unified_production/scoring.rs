@@ -5,10 +5,12 @@
 //! 同時隣接可能数 `firing_slots`・射点の 1T/2T 被弾・残枠あたり予算）のみに基づき、
 //! 優先順位順に空き施設へ兵種を割り当てる。
 
-use super::reach::{OCC_ENEMY, OCC_FRIENDLY, ReachMap, reachable_tiles, unit_turn_distance_field};
-use super::threats::{
-    ThreatContext, expected_damage, is_immobile_unit, max_base_damage, terrain_def_at,
+use super::composition::{
+    CompositionGuidance, HAMMER_UNIT_MIN_COST, can_hit_armor, can_hit_ground, is_aa_specialized,
+    is_non_combat_transport, resolve_ai_category,
 };
+use super::reach::{OCC_ENEMY, OCC_FRIENDLY, ReachMap, reachable_tiles, unit_turn_distance_field};
+use super::threats::{ThreatContext, expected_damage, is_immobile_unit, terrain_def_at};
 use super::{UnifiedBoardExtras, WeaponProfileTable};
 use crate::ai::islands::IslandMap;
 use crate::ai::production::commit::PurchasePurpose;
@@ -23,7 +25,7 @@ use crate::collections::{HashMap, HashSet};
 use crate::components::{GridPosition, PlayerId, UnitStats};
 use crate::events::ProduceUnitCommand;
 use crate::resources::master_data::supply_types;
-use crate::resources::{MovementType, Terrain, UnitType};
+use crate::resources::{AI_UNIT_CATEGORY_COUNT, AiUnitCategory, MovementType, Terrain, UnitType};
 use crate::systems::production::PRODUCTION_RANGE;
 use bevy_ecs::prelude::Entity;
 
@@ -32,6 +34,43 @@ const FULL_UNIT_HP: u32 = 100;
 
 /// 対空・迎撃枠の候補として認める、満タン敵航空機の最大撃墜攻撃回数（3発以内）。
 const MAX_AA_STRIKES_TO_KILL: u32 = 3;
+
+/// 対空カテゴリ誘導乗数の適用下限（実効コスト調整が極端に歪まないよう制限）。
+const AA_CATEGORY_MULT_MIN: f32 = 0.50;
+
+/// 対空カテゴリ誘導乗数の適用上限。
+const AA_CATEGORY_MULT_MAX: f32 = 1.80;
+
+/// 対空特化ユニット（対空戦車・ミサイル・戦闘機）の最大同時保持上限（敵航空大編隊対策）。
+const MAX_SPECIALIZED_AA_UNITS: usize = 4;
+
+/// 間接火網における目標コスト重みの上限（軽戦車・中戦車等への優先度を穏やかに上げる）。
+const INDIRECT_TARGET_COST_WEIGHT_CAP: f32 = 3.5;
+
+/// 直接戦闘における目標コスト重みの上限。
+const DIRECT_TARGET_COST_WEIGHT_CAP: f32 = 2.0;
+
+/// 直接戦闘で反撃損害へ乗じる自軍／目標コスト比の上下限（高コスト機の無謀突撃を抑止しつつ廉価歩兵の被反撃過小評価を防ぐ）。
+const DIRECT_COST_RATIO_MIN: f32 = 1.00;
+const DIRECT_COST_RATIO_MAX: f32 = 1.60;
+
+/// 上位主力戦車（中戦車級以上）の到達基準コスト（Gold）。間接砲枠が蓄えた予算を崩すのを抑止する基準にも使用する。
+const MD_TANK_TIER_MIN_COST: u32 = 18_000;
+
+/// 資金に十分余裕がある前線均衡〜優位時の、占領可能ユニットに対する直接戦闘スロット評価割引率。
+const RICH_SLOT_CAPTURE_UNIT_DISCOUNT: f32 = 0.65;
+
+/// 資金余裕スロットとみなすための 1 地上工場あたり確保基準資金（Gold）。
+const RICH_MOBILE_SLOT_MIN_GOLD: u32 = 6_000;
+
+/// 直接戦闘で高コスト機に対する反撃コスト比補正を適用する最小反撃ダメージ（%HP）。
+const DIRECT_COST_RATIO_MIN_COUNTER_DMG: u32 = 20;
+
+/// 直接・間接両用ユニット（重戦車等：`max_range > 1`）が射程2以上で待機射撃を行う際に許容する敵1T直接被弾上限（%HP）。
+const STANDOFF_SAFE_1T_DMG_LIMIT: u32 = 60;
+
+/// 固定砲台の非補給平地展開を許可する最低総地上工場数（多工場時の隘路固定向け）。
+const IMMOBILE_UNSUPPLIED_MIN_GROUND_FACS: usize = 4;
 
 /// 同一盤面内で `(始点, 移動タイプ, 移動力, 燃料)` ごとの最小ターン数場をキャッシュする。
 #[derive(Default)]
@@ -90,6 +129,13 @@ struct AllocationContext<'a> {
     existing_air_transports: usize,
     enemy_rem_hp: Vec<u32>,
     assigned_enemy_counts: Vec<usize>,
+    guidance: CompositionGuidance,
+    category_counts: [f32; AI_UNIT_CATEGORY_COUNT],
+    light_tank_cat_val: u32,
+    armor_tank_cat_val: u32,
+    armor_tank_cnt: f32,
+    light_tank_cnt: usize,
+    has_hammer_unit: bool,
 }
 
 struct PurchaseOrder<'a> {
@@ -103,6 +149,7 @@ struct PurchaseOrder<'a> {
 }
 
 struct AntiAirCandidate<'a> {
+    adjusted_cost_gold: u32,
     total_cost_gold: u32,
     cost: u32,
     total_turns: u32,
@@ -170,6 +217,25 @@ impl<'a> AllocationContext<'a> {
         if stats.movement_type == MovementType::Air && stats.max_cargo > 0 {
             self.existing_air_transports += 1;
         }
+        let cat = resolve_ai_category(
+            &self.scan.master_data,
+            &self.scan.damage_chart,
+            profiles,
+            stats,
+        );
+        self.category_counts[cat as usize] += 1.0;
+        if stats.cost >= HAMMER_UNIT_MIN_COST {
+            self.has_hammer_unit = true;
+        }
+        if cat == AiUnitCategory::Tank {
+            if can_hit_armor(&self.scan.damage_chart, stats.unit_type) {
+                self.armor_tank_cat_val = self.armor_tank_cat_val.saturating_add(stats.cost);
+                self.armor_tank_cnt += 1.0;
+            } else {
+                self.light_tank_cat_val = self.light_tank_cat_val.saturating_add(stats.cost);
+                self.light_tank_cnt += 1;
+            }
+        }
 
         let cmd = ProduceUnitCommand {
             player_id: self.player_id,
@@ -231,6 +297,35 @@ pub(in crate::ai::v4) fn plan_unified_production(
     let island_map = IslandMap::analyze(&scan.map);
     let mut dist_cache = TurnDistCache::default();
 
+    let guidance = CompositionGuidance::build(scan, extras, &profiles, &threat_ctx);
+    let mut category_counts = [0.0_f32; AI_UNIT_CATEGORY_COUNT];
+    let mut light_tank_cat_val = 0_u32;
+    let mut armor_tank_cat_val = 0_u32;
+    let mut armor_tank_cnt = 0.0_f32;
+    let mut light_tank_cnt = 0_usize;
+    let mut has_hammer_unit = false;
+    for u in scan.my_units.iter().chain(&scan.ferried_units) {
+        if u.hp == 0 {
+            continue;
+        }
+        let cat = resolve_ai_category(&scan.master_data, &scan.damage_chart, &profiles, &u.stats);
+        let unit_weight = u.hp as f32 / FULL_UNIT_HP as f32;
+        let weighted_val = u.stats.cost.saturating_mul(u.hp) / FULL_UNIT_HP;
+        category_counts[cat as usize] += unit_weight;
+        if u.stats.cost >= HAMMER_UNIT_MIN_COST {
+            has_hammer_unit = true;
+        }
+        if cat == AiUnitCategory::Tank {
+            if can_hit_armor(&scan.damage_chart, u.stats.unit_type) {
+                armor_tank_cat_val = armor_tank_cat_val.saturating_add(weighted_val);
+                armor_tank_cnt += unit_weight;
+            } else {
+                light_tank_cat_val = light_tank_cat_val.saturating_add(weighted_val);
+                light_tank_cnt += 1;
+            }
+        }
+    }
+
     let my_direct_cnt = threat_ctx.f_direct_units.len();
     let my_indirect_cnt = scan
         .my_units
@@ -258,6 +353,13 @@ pub(in crate::ai::v4) fn plan_unified_production(
         existing_air_transports,
         enemy_rem_hp,
         assigned_enemy_counts,
+        guidance,
+        category_counts,
+        light_tank_cat_val,
+        armor_tank_cat_val,
+        armor_tank_cnt,
+        light_tank_cnt,
+        has_hammer_unit,
     };
 
     // Phase 1: 占領・空輸枠（獲れる未所有物件の到着短縮分だけ：初動の占領工場を対空枠で塞がない）
@@ -300,6 +402,15 @@ pub(in crate::ai::v4) fn plan_unified_production(
         &available_types,
         &profiles,
         &threat_ctx,
+        &mut dist_cache,
+    );
+
+    // 同一ターン内の施設割り当てねじれをコスト0のペア入替で解消し、展開到着ターンを最小化する
+    optimize_unified_facility_assignments(
+        scan,
+        &profiles,
+        &mut alloc.commands,
+        &mut alloc.plan_trace,
         &mut dist_cache,
     );
 
@@ -432,7 +543,10 @@ fn allocate_anti_air_phase(
         .iter()
         .filter(|u| is_aa_specialized(chart, u.stats.unit_type))
         .count();
-    let max_aa_specialized = combat_air_indices.len().div_ceil(2).min(2);
+    let max_aa_specialized = combat_air_indices
+        .len()
+        .div_ceil(2)
+        .min(MAX_SPECIALIZED_AA_UNITS);
     // 通常盤面では1ターンの対空連打による地上戦線崩壊を防ぐため追加は最大1体に制限する（全敵が航空機の盤面を除く）
     let max_purchases_this_turn = if threat_ctx.enemies.iter().all(|e| e.is_air) {
         usize::MAX
@@ -605,11 +719,18 @@ fn allocate_anti_air_phase(
                     };
                     let strikes_to_kill = rem_hp.div_ceil(dmg.max(1));
                     let total_turns = ready_turns.saturating_add(strikes_to_kill);
-                    // 撃墜までに敵航空機が与える期待損害額 ＋ 購入額（同一 Gold 単位）を最小化する
+                    // 撃墜までに敵航空機が与える期待損害額 ＋ 購入額（同一 Gold 単位）を 12 カテゴリ倍率で重み付けして最小化する
                     let expected_loss_until_kill_gold =
                         enemy_air_dmg_gold_per_turn[ei].saturating_mul(total_turns);
                     let total_cost_gold = expected_loss_until_kill_gold.saturating_add(stats.cost);
+                    let cat = resolve_ai_category(&scan.master_data, chart, profiles, stats);
+                    let cat_mult = alloc
+                        .guidance
+                        .category_score_multiplier(&alloc.category_counts, cat, false)
+                        .clamp(AA_CATEGORY_MULT_MIN, AA_CATEGORY_MULT_MAX);
+                    let adjusted_cost_gold = ((total_cost_gold as f32) / cat_mult).round() as u32;
                     let cand_key = (
+                        adjusted_cost_gold,
                         total_cost_gold,
                         stats.cost,
                         total_turns,
@@ -620,6 +741,7 @@ fn allocate_anti_air_phase(
                     );
                     let replace = best_choice.as_ref().is_none_or(|b| {
                         let b_key = (
+                            b.adjusted_cost_gold,
                             b.total_cost_gold,
                             b.cost,
                             b.total_turns,
@@ -632,6 +754,7 @@ fn allocate_anti_air_phase(
                     });
                     if replace {
                         best_choice = Some(AntiAirCandidate {
+                            adjusted_cost_gold,
                             total_cost_gold,
                             cost: stats.cost,
                             total_turns,
@@ -1247,8 +1370,8 @@ fn allocate_capture_and_airlift_phase(
 /// 間接砲1門の後方射点を敵地上部隊の回り込みから ZOC・占有で塞ぐために必要な前衛部隊数の下限（砲1門あたり前衛2体）。
 const MIN_SCREEN_UNITS_PER_INDIRECT: usize = 2;
 
-/// 前線突破力を損なわずに間接火網を維持できる総門数上限。
-const MAX_INDIRECT_UNITS: usize = 4;
+/// 対車両用・高価間接砲の投入を認める敵戦闘車両の最低コスト（軽戦車6,000G・対空戦車5,500G相当）。
+const INDIRECT_TARGET_MIN_VEHICLE_COST: u32 = 5_500;
 
 /// Phase 3 & Phase 4: 前衛安全条件を満たし安全な射点と有効目標がある場合のみ間接火網を 1 門割り当てる。
 fn allocate_indirect_phase(
@@ -1259,7 +1382,17 @@ fn allocate_indirect_phase(
     threat_ctx: &ThreatContext,
 ) {
     let scan = alloc.scan;
-    if threat_ctx.enemies.is_empty() || alloc.my_indirect_cnt >= MAX_INDIRECT_UNITS {
+    if threat_ctx.enemies.is_empty()
+        || (!alloc.guidance.allows_indirect_category(
+            &alloc.category_counts,
+            AiUnitCategory::SelfPropelledGun,
+            alloc.my_indirect_cnt,
+        ) && !alloc.guidance.allows_indirect_category(
+            &alloc.category_counts,
+            AiUnitCategory::Artillery,
+            alloc.my_indirect_cnt,
+        ))
+    {
         return;
     }
     // 既存間接が前衛比上限に達している（砲1門あたり前衛2体未満になる）場合は新規追加しない
@@ -1310,6 +1443,31 @@ fn allocate_indirect_phase(
         if !profiles.is_indirect(ut) || !can_hit_ground(chart, ut) || stats.cost == 0 {
             continue;
         }
+        let cat = resolve_ai_category(&scan.master_data, chart, profiles, stats);
+        if !alloc.guidance.allows_indirect_category(
+            &alloc.category_counts,
+            cat,
+            alloc.my_indirect_cnt,
+        ) {
+            continue;
+        }
+        // 既に間接砲を 1 門保有し、かつ中戦車級（18,000G+）向け予算を確保できている段階で
+        // 上位ハンマー未配備なら、廉価自走砲の先行購入で 18,000G ラインを割り込まないよう抑止する
+        if alloc.my_indirect_cnt >= 1
+            && !alloc.has_hammer_unit
+            && alloc.rem_funds >= MD_TANK_TIER_MIN_COST
+            && stats.cost < HAMMER_UNIT_MIN_COST
+            && alloc.rem_funds.saturating_sub(stats.cost) < MD_TANK_TIER_MIN_COST
+            && alloc
+                .guidance
+                .smoothed_share(&alloc.category_counts, AiUnitCategory::SelfPropelledGun)
+                >= alloc
+                    .guidance
+                    .target_share(AiUnitCategory::SelfPropelledGun)
+                    * 0.60
+        {
+            continue;
+        }
         // Phase 3 前衛安全チェック：数的劣勢時は残資金の過半を使う高価間接を買わない
         if outnumbered
             && (stats.cost.saturating_mul(2) > alloc.rem_funds
@@ -1319,11 +1477,10 @@ fn allocate_indirect_phase(
         }
         // 数が同等以下の場合も、高価な間接1門で全予算を使い切って残りの空き地上工場をすべて遊ばせないよう、
         // 空き地上工場が2つ以上ある場合は少なくとも残りの空き地上工場数（上限3）分の最低地上兵生産費を残す。
-        // また、敵に直接戦闘車両（戦車以上）が1両もおらず歩兵・間接中心の段階では、残資金の過半を1門の間接砲に投じない。
-        let has_enemy_heavy_armor = threat_ctx
-            .enemies
-            .iter()
-            .any(|e| !e.is_indirect && !e.is_air && e.stats.cost >= 10_000);
+        // また、敵に直接戦闘車両（対空戦車・軽戦車以上）が1両もおらず歩兵・間接中心の段階では、残資金の過半を1門の間接砲に投じない。
+        let has_enemy_heavy_armor = threat_ctx.enemies.iter().any(|e| {
+            !e.is_indirect && !e.is_air && e.stats.cost >= INDIRECT_TARGET_MIN_VEHICLE_COST
+        });
         if !has_enemy_heavy_armor && stats.cost.saturating_mul(2) > alloc.rem_funds {
             continue;
         }
@@ -1350,10 +1507,10 @@ fn allocate_indirect_phase(
             if alloc.used_facs.contains(&fac) || !scan.can_produce(terrain, ut) {
                 continue;
             }
-            if !immobile || total_ground_facs >= 3 {
+            if !immobile {
                 candidate_tiles.push((fac, fac, 0));
             }
-            if !immobile {
+            if !immobile || (stats.max_movement >= 1 && stats.max_fuel >= 1) {
                 let r1 = reachable_tiles(
                     map,
                     &scan.master_data,
@@ -1367,15 +1524,23 @@ fn allocate_indirect_phase(
                     Some(&vacatable_direct),
                 );
                 for (p, _) in r1.iter() {
-                    if p != fac {
-                        candidate_tiles.push((p, fac, 1));
+                    if p == fac {
+                        continue;
                     }
+                    if immobile
+                        && (threat_ctx.ground_facility_set.contains(&p)
+                            || !(threat_ctx.is_ground_supply(p)
+                                || total_ground_facs >= IMMOBILE_UNSUPPLIED_MIN_GROUND_FACS))
+                    {
+                        continue;
+                    }
+                    candidate_tiles.push((p, fac, 1));
                 }
             }
         }
 
         for (fpos, fac, delay) in candidate_tiles {
-            if is_immobile_unit(stats) && threat_ctx.ground_facility_set.contains(&fpos) {
+            if immobile && threat_ctx.ground_facility_set.contains(&fpos) {
                 continue;
             }
             let tile_threat = threat_ctx.firing_tile_threat(scan, profiles, fpos, stats);
@@ -1391,10 +1556,11 @@ fn allocate_indirect_phase(
                 continue;
             }
 
-            // 射程内ターゲットへの有効期待ダメージ集計（隘路 enemy 2x・直接支援価値）
+            // 射程内ターゲットへの有効期待ダメージ集計（敵単価重み・隘路 enemy 2x・カテゴリ倍率）
             let (rmin, rmax) = (stats.min_range, stats.max_range);
             let mut weighted_dmg = 0_u32;
             let mut max_single_dmg = 0_u32;
+            let mut has_choke_target = false;
             let mut target_pairs: Vec<(u32, usize, Option<Entity>)> = Vec::new();
 
             for (ei, et) in threat_ctx.enemies.iter().enumerate() {
@@ -1446,14 +1612,26 @@ fn allocate_indirect_phase(
                 }
                 let eff = dmg.min(rem_hp);
                 max_single_dmg = max_single_dmg.max(eff);
-                // 橋・山隘路など隣接攻撃枠が少ない敵ほど間接火網の価値が高い
-                let choke_mult = if et.firing_slots <= 2 { 2 } else { 1 };
-                let score_e = eff * choke_mult;
+                // 橋・山隘路など隣接攻撃枠が少ない敵、および高価値戦車目標に対する火網価値を重み付けする
+                let choke_mult = if et.firing_slots <= 2 {
+                    has_choke_target = true;
+                    2
+                } else {
+                    1
+                };
+                let target_val_weight = ((et.stats.cost.max(1_000) as f32) / 1_000.0)
+                    .sqrt()
+                    .clamp(1.0, INDIRECT_TARGET_COST_WEIGHT_CAP);
+                let score_e =
+                    (((eff as f32) * target_val_weight).round() as u32).saturating_mul(choke_mult);
                 weighted_dmg = weighted_dmg.saturating_add(score_e);
                 target_pairs.push((score_e, ei, et.entity));
             }
 
             if max_single_dmg < 25 && weighted_dmg < 45 {
+                continue;
+            }
+            if immobile && !threat_ctx.is_ground_supply(fpos) && !has_choke_target {
                 continue;
             }
 
@@ -1464,7 +1642,13 @@ fn allocate_indirect_phase(
             let off_facility = !threat_ctx.ground_facility_set.contains(&fpos);
             // 生産施設ではない補給都市（補給砲座）から射撃できる配置は毎ターン弾薬・HP補給と地形防御30%を得られるため遅延ペナルティを軽減する
             let delay_weight = if is_supply && off_facility { 5 } else { 15 };
-            let eff_score = weighted_dmg * 100 / (100 + delay * delay_weight);
+            let raw_eff = weighted_dmg * 100 / (100 + delay * delay_weight);
+            let cat_mult = alloc.guidance.category_score_multiplier(
+                &alloc.category_counts,
+                cat,
+                false,
+            );
+            let eff_score = ((raw_eff as f32) * cat_mult).round() as u32;
             let cand_key = (eff_score, is_supply, off_facility, u32::MAX - delay);
             let replace = best_indirect.as_ref().is_none_or(|b| {
                 let b_key = (
@@ -1622,6 +1806,18 @@ fn allocate_direct_combat_phase(
                 .is_some_and(|(_, s)| is_mobile_ground_combat(chart, profiles, s))
         });
 
+    /// 中盤以降、歩兵枠が充足済みの場合に後続地上工場の歩兵予約を抑制する最低直接部隊数。
+    const MIDGAME_RESERVE_MIN_DIRECT_UNITS: usize = 6;
+
+    let hammer_save_floor = alloc.guidance.hammer_saving_floor(
+        scan,
+        &alloc.category_counts,
+        alloc.armor_tank_cat_val,
+        alloc.my_direct_cnt,
+        threat_ctx.e_direct_cnt,
+        profiles,
+    );
+
     for idx in 0..rem_facs.len() {
         if alloc.rem_funds == 0 {
             break;
@@ -1632,13 +1828,32 @@ fn allocate_direct_combat_phase(
             .filter(|&&(_, _, is_air)| !is_air)
             .count();
 
+        // 頭数に劣っておらず、残り全地上スロットを 6,000G 級の機動戦力で埋められる潤沢な予算がある局面では
+        // 直接戦闘枠における占領可能ユニット（歩兵・重歩兵）への過大評価を抑えて質的向上を優先する
+        let rich_mobile_surplus = alloc.my_direct_cnt >= threat_ctx.e_direct_cnt
+            && min_mobile_ground_cost > 0
+            && alloc.rem_funds
+                >= min_mobile_ground_cost
+                    .max(RICH_MOBILE_SLOT_MIN_GOLD)
+                    .saturating_mul(rem_ground_after as u32 + 1);
+
         // 残る地上工場でも頭数を出せるよう、必要数分の最低資金だけは残して上限を決める。
-        // 空港が先に処理される際も、頭数劣勢または前線地上枠が空いているなら残り地上工場の最低歩兵生産費を確保する。
+        // 頭数・歩兵壁が既に充足している中盤以降は後続予約を抑えて高単価突破戦力（Bomber/MdTank等）を出せるようにする。
         let mut reserve = if alloc.rem_funds < min_ground_cost {
             0
         } else {
             let needed_after = if alloc.my_direct_cnt < threat_ctx.e_direct_cnt {
                 rem_ground_after.min(threat_ctx.e_direct_cnt - alloc.my_direct_cnt)
+            } else if alloc.my_direct_cnt >= MIDGAME_RESERVE_MIN_DIRECT_UNITS
+                && alloc
+                    .guidance
+                    .is_category_satisfied(&alloc.category_counts, AiUnitCategory::Infantry)
+            {
+                let air_hungry = is_air_fac
+                    && !alloc
+                        .guidance
+                        .is_category_satisfied(&alloc.category_counts, AiUnitCategory::AirForce);
+                rem_ground_after.min(if air_hungry { 1 } else { 2 })
             } else {
                 rem_ground_after
             };
@@ -1682,6 +1897,7 @@ fn allocate_direct_combat_phase(
             {
                 continue;
             }
+            let cat = resolve_ai_category(&scan.master_data, chart, profiles, stats);
             let is_air = stats.movement_type == MovementType::Air;
             let is_ship = stats.movement_type == MovementType::Ship;
             if !is_air
@@ -1746,9 +1962,26 @@ fn allocate_direct_combat_phase(
             let mut best_target_score = 0.0_f32;
             let mut best_ei_opt: Option<usize> = None;
             let mut best_eff_dmg = 0_u32;
+            let mut best_target_urgent_anti_cap = false;
             let mut target_rankings: Vec<(f32, GridPosition, Option<Entity>)> = Vec::new();
 
             for (ei, et) in threat_ctx.enemies.iter().enumerate() {
+                let rem_hp = if any_enemy_left {
+                    alloc.enemy_rem_hp[ei]
+                } else {
+                    et.hp / (1 + alloc.assigned_enemy_counts[ei] as u32)
+                };
+                if rem_hp == 0 {
+                    continue;
+                }
+
+                let cost_scale = (stats.cost as f32 / et.stats.cost.max(2_000) as f32)
+                    .clamp(DIRECT_COST_RATIO_MIN, DIRECT_COST_RATIO_MAX);
+                let mut best_mode_score = 0.0_f32;
+                let mut best_mode_eff_dmg = 0_u32;
+                let mut best_mode_urgent = false;
+
+                // 1) 隣接（距離 1）による直接攻撃評価
                 let deal = expected_damage(
                     chart,
                     profiles,
@@ -1760,142 +1993,236 @@ fn allocate_direct_combat_phase(
                     1,
                     false,
                 );
-                if deal == 0 {
-                    continue;
-                }
-                let best_adj = map
-                    .get_adjacent(et.pos_proj.x, et.pos_proj.y)
-                    .into_iter()
-                    .filter_map(|(ax, ay)| {
-                        let adj = GridPosition { x: ax, y: ay };
-                        dist_cache
-                            .turns_between(
-                                scan,
-                                fac,
-                                adj,
-                                stats.movement_type,
-                                stats.max_movement,
-                                stats.max_fuel,
-                            )
-                            .map(|t| (t, terrain_def_at(map, &scan.master_data, adj), adj))
-                    })
-                    .min_by_key(|&(t, tdef, adj)| (t, std::cmp::Reverse(tdef), adj.y, adj.x));
-                let Some((move_turns, atk_def, atk_tile)) = best_adj else {
-                    continue;
-                };
-
-                // 航空ユニットは攻撃対象（`et`）を今回の攻撃（`deal`）で削った・撃破した後の盤面において、
-                // 攻撃地点周囲で 1T 以内に残存敵から受ける対空／迎撃ダメージ合計が重大（>= 80%）なら特攻出撃させない。
-                // 対空戦車自身を爆撃機で直接叩き潰す場合（92%ダメージ）は、その対空戦車からの反撃が激減するため候補に残る。
-                if is_air {
-                    let lethal_aa_sum: u32 = threat_ctx
-                        .live_reaches
-                        .iter()
-                        .filter_map(|lr| {
-                            let eu = lr.unit.stats.unit_type;
-                            let rem_enemy_hp =
-                                if lr.unit.pos == et.pos0 && lr.unit.entity == et.entity {
-                                    lr.unit.hp.saturating_sub(deal)
-                                } else {
-                                    lr.unit.hp
-                                };
-                            if rem_enemy_hp == 0 {
-                                return None;
-                            }
-                            let eval_dist = if profiles.is_indirect(eu) {
-                                let d = map.distance(
-                                    lr.unit.pos.x,
-                                    lr.unit.pos.y,
-                                    atk_tile.x,
-                                    atk_tile.y,
-                                );
-                                (d >= lr.unit.stats.min_range && d <= lr.unit.stats.max_range)
-                                    .then_some(d)
-                            } else if lr.unit.stats.movement_type == MovementType::Air {
-                                // 敵ターンは他敵が退避して射線を開けられるため航空迎撃は移動圏+1で判定
-                                (map.distance(lr.unit.pos.x, lr.unit.pos.y, atk_tile.x, atk_tile.y)
-                                    <= lr.unit.stats.max_movement.saturating_add(1))
-                                .then_some(1)
-                            } else {
-                                map.get_adjacent(atk_tile.x, atk_tile.y)
-                                    .into_iter()
-                                    .any(|(ax, ay)| {
-                                        lr.reach_1t.contains(GridPosition { x: ax, y: ay })
-                                    })
-                                    .then_some(1)
-                            }?;
-                            let dmg = expected_damage(
-                                chart,
-                                profiles,
-                                eu,
-                                rem_enemy_hp,
-                                lr.ammo,
-                                ut,
-                                atk_def,
-                                eval_dist,
-                                false,
-                            );
-                            (dmg > 0).then_some(dmg)
+                if deal > 0 {
+                    let best_adj = map
+                        .get_adjacent(et.pos_proj.x, et.pos_proj.y)
+                        .into_iter()
+                        .filter_map(|(ax, ay)| {
+                            let adj = GridPosition { x: ax, y: ay };
+                            dist_cache
+                                .turns_between(
+                                    scan,
+                                    fac,
+                                    adj,
+                                    stats.movement_type,
+                                    stats.max_movement,
+                                    stats.max_fuel,
+                                )
+                                .map(|t| (t, terrain_def_at(map, &scan.master_data, adj), adj))
                         })
-                        .sum();
-                    if lethal_aa_sum >= 80 {
-                        continue;
+                        .min_by_key(|&(t, tdef, adj)| (t, std::cmp::Reverse(tdef), adj.y, adj.x));
+
+                    if let Some((move_turns, atk_def, atk_tile)) = best_adj {
+                        // 航空ユニットは攻撃対象（`et`）を削った後の盤面において、
+                        // 攻撃地点周囲で 1T 以内に残存敵から受ける対空／迎撃ダメージ合計が重大（>= 80%）なら特攻出撃させない。
+                        let aa_net_safe = if is_air {
+                            let lethal_aa_sum: u32 = threat_ctx
+                                .live_reaches
+                                .iter()
+                                .filter_map(|lr| {
+                                    let eu = lr.unit.stats.unit_type;
+                                    let rem_enemy_hp =
+                                        if lr.unit.pos == et.pos0 && lr.unit.entity == et.entity {
+                                            lr.unit.hp.saturating_sub(deal)
+                                        } else {
+                                            lr.unit.hp
+                                        };
+                                    if rem_enemy_hp == 0 {
+                                        return None;
+                                    }
+                                    let eval_dist = if profiles.is_indirect(eu) {
+                                        let d = map.distance(
+                                            lr.unit.pos.x,
+                                            lr.unit.pos.y,
+                                            atk_tile.x,
+                                            atk_tile.y,
+                                        );
+                                        (d >= lr.unit.stats.min_range
+                                            && d <= lr.unit.stats.max_range)
+                                            .then_some(d)
+                                    } else if lr.unit.stats.movement_type == MovementType::Air {
+                                        (map.distance(
+                                            lr.unit.pos.x,
+                                            lr.unit.pos.y,
+                                            atk_tile.x,
+                                            atk_tile.y,
+                                        ) <= lr.unit.stats.max_movement.saturating_add(1))
+                                        .then_some(1)
+                                    } else {
+                                        map.get_adjacent(atk_tile.x, atk_tile.y)
+                                            .into_iter()
+                                            .any(|(ax, ay)| {
+                                                lr.reach_1t.contains(GridPosition { x: ax, y: ay })
+                                            })
+                                            .then_some(1)
+                                    }?;
+                                    let dmg = expected_damage(
+                                        chart,
+                                        profiles,
+                                        eu,
+                                        rem_enemy_hp,
+                                        lr.ammo,
+                                        ut,
+                                        atk_def,
+                                        eval_dist,
+                                        false,
+                                    );
+                                    (dmg > 0).then_some(dmg)
+                                })
+                                .sum();
+                            lethal_aa_sum < 80
+                        } else {
+                            true
+                        };
+
+                        if aa_net_safe {
+                            let eff_deal = deal.min(rem_hp);
+                            let post_hp = et.hp.saturating_sub(deal.min(et.hp));
+                            let counter_dmg = if !et.is_indirect && post_hp > 0 {
+                                let c100 = expected_damage(
+                                    chart,
+                                    profiles,
+                                    et.stats.unit_type,
+                                    100,
+                                    et.ammo,
+                                    ut,
+                                    atk_def,
+                                    1,
+                                    true,
+                                );
+                                (c100 * post_hp) / 100
+                            } else {
+                                0
+                            };
+
+                            let effective_cost_scale =
+                                if counter_dmg >= DIRECT_COST_RATIO_MIN_COUNTER_DMG {
+                                    cost_scale
+                                } else {
+                                    cost_scale.min(1.0)
+                                };
+                            let exchange_score =
+                                deal as f32 - 0.75 * effective_cost_scale * counter_dmg as f32;
+                            if exchange_score > 0.0 || max_spend <= min_ground_cost {
+                                let base_exchange =
+                                    exchange_score.max(1.0) * (eff_deal as f32 / deal as f32);
+                                let is_urgent_anti_cap = et.threatens_property && deal >= et.hp / 2;
+                                let anti_cap_mult = if is_urgent_anti_cap { 2.0 } else { 1.0 };
+                                let target_weight = if is_urgent_anti_cap {
+                                    1.0
+                                } else {
+                                    (0.75
+                                        + 0.25
+                                            * ((et.stats.cost.max(1_000) as f32) / 1_000.0).sqrt())
+                                    .clamp(1.0, DIRECT_TARGET_COST_WEIGHT_CAP)
+                                };
+                                let eta_denom = move_turns.max(1) as f32;
+                                let s = (base_exchange * target_weight * anti_cap_mult) / eta_denom;
+                                if s > best_mode_score {
+                                    best_mode_score = s;
+                                    best_mode_eff_dmg = eff_deal;
+                                    best_mode_urgent = is_urgent_anti_cap;
+                                }
+                            }
+                        }
                     }
                 }
 
-                let rem_hp = if any_enemy_left {
-                    alloc.enemy_rem_hp[ei]
-                } else {
-                    et.hp / (1 + alloc.assigned_enemy_counts[ei] as u32)
-                };
-                if rem_hp == 0 {
+                // 2) 直接・間接両用ユニット（重戦車等：`max_range > 1`）の射程 2..=max_range 待機射撃（反撃 0）評価
+                if stats.max_range > 1 && !is_air {
+                    let rmin_ind = stats.min_range.max(2);
+                    let rmax_ind = stats.max_range;
+                    let min_x = et.pos_proj.x.saturating_sub(rmax_ind as usize);
+                    let max_x =
+                        (et.pos_proj.x + rmax_ind as usize).min(map.width.saturating_sub(1));
+                    let min_y = et.pos_proj.y.saturating_sub(rmax_ind as usize);
+                    let max_y =
+                        (et.pos_proj.y + rmax_ind as usize).min(map.height.saturating_sub(1));
+                    for ty in min_y..=max_y {
+                        for tx in min_x..=max_x {
+                            let d = map.distance(tx, ty, et.pos_proj.x, et.pos_proj.y);
+                            if d < rmin_ind || d > rmax_ind {
+                                continue;
+                            }
+                            let tile = GridPosition { x: tx, y: ty };
+                            if threat_ctx.occ.at(tile) == OCC_ENEMY {
+                                continue;
+                            }
+                            let Some(move_turns) = dist_cache.turns_between(
+                                scan,
+                                fac,
+                                tile,
+                                stats.movement_type,
+                                stats.max_movement,
+                                stats.max_fuel,
+                            ) else {
+                                continue;
+                            };
+                            let ind_deal = expected_damage(
+                                chart,
+                                profiles,
+                                ut,
+                                100,
+                                (stats.max_ammo1, stats.max_ammo2),
+                                et.stats.unit_type,
+                                et.def_proj,
+                                d,
+                                false,
+                            );
+                            if ind_deal == 0 {
+                                continue;
+                            }
+                            if threat_ctx
+                                .firing_tile_threat(scan, profiles, tile, stats)
+                                .direct_1t_dmg
+                                >= STANDOFF_SAFE_1T_DMG_LIMIT
+                            {
+                                continue;
+                            }
+                            let eff_deal = ind_deal.min(rem_hp);
+                            // 移動後のターンに間接射撃するため遅延は move_turns + 1（工場上なら 1）
+                            let eta_denom = if tile == fac {
+                                1.0
+                            } else {
+                                (move_turns.max(1) + 1) as f32
+                            };
+                            let target_weight = (0.75
+                                + 0.25 * ((et.stats.cost.max(1_000) as f32) / 1_000.0).sqrt())
+                            .clamp(1.0, DIRECT_TARGET_COST_WEIGHT_CAP);
+                            let s = ((eff_deal as f32) * target_weight) / eta_denom;
+                            if s > best_mode_score {
+                                best_mode_score = s;
+                                best_mode_eff_dmg = eff_deal;
+                                best_mode_urgent = false;
+                            }
+                        }
+                    }
+                }
+
+                if best_mode_score <= 0.0 {
                     continue;
                 }
-                let eff_deal = deal.min(rem_hp);
-                let post_hp = et.hp.saturating_sub(deal.min(et.hp));
-                let counter_dmg = if !et.is_indirect && post_hp > 0 {
-                    let c100 = expected_damage(
-                        chart,
-                        profiles,
-                        et.stats.unit_type,
-                        100,
-                        et.ammo,
-                        ut,
-                        atk_def,
-                        1,
-                        true,
-                    );
-                    (c100 * post_hp) / 100
-                } else {
-                    0
-                };
 
-                // 物理的交換成果：与えた有効ダメージが半減された反撃損耗を上回ること（歩兵の対車両特攻等を抑止）
-                let exchange_score = deal as f32 - 0.75 * counter_dmg as f32;
-                if exchange_score <= 0.0 && max_spend > min_ground_cost {
-                    continue;
-                }
-                let base_exchange =
-                    exchange_score.max(1.0) * (eff_deal as f32 / deal.max(1) as f32);
-                // 占領中の敵占領役の占領力を 1 撃で半減させる高速打撃（例: Recon 66% vs Infantry）を優先
-                let anti_cap_mult = if et.threatens_property && deal >= et.hp / 2 {
-                    2.0
-                } else {
-                    1.0
-                };
-                // 航空機は地形や地上戦線の渋滞を受けずに直行できるため到着遅延を低く保つ
-                let eta_denom = move_turns.max(1) as f32;
-                let t_score = (base_exchange * anti_cap_mult) / eta_denom;
-
-                target_rankings.push((t_score, et.pos_proj, et.entity));
-                if t_score > best_target_score {
-                    best_target_score = t_score;
+                target_rankings.push((best_mode_score, et.pos_proj, et.entity));
+                if best_mode_score > best_target_score {
+                    best_target_score = best_mode_score;
                     best_ei_opt = Some(ei);
-                    best_eff_dmg = eff_deal;
+                    best_eff_dmg = best_mode_eff_dmg;
+                    best_target_urgent_anti_cap = best_mode_urgent;
                 }
             }
 
             if best_target_score <= 0.0 {
+                if should_defer_for_hammer_saving(
+                    alloc,
+                    hammer_save_floor,
+                    cat,
+                    stats.cost,
+                    min_ground_cost,
+                    false,
+                ) {
+                    continue;
+                }
                 // 既存の有利目標がない場合でも頭数劣勢または多工場時は廉価前衛で埋める
                 if alloc.my_direct_cnt >= threat_ctx.e_direct_cnt && stats.cost > min_ground_cost {
                     continue;
@@ -1922,16 +2249,64 @@ fn allocate_direct_combat_phase(
                 continue;
             }
 
+            if should_defer_for_hammer_saving(
+                alloc,
+                hammer_save_floor,
+                cat,
+                stats.cost,
+                min_ground_cost,
+                best_target_urgent_anti_cap,
+            ) {
+                continue;
+            }
+
             target_rankings.sort_by(|a, b| b.0.total_cmp(&a.0));
             // 1体の柔らかい目標（例: 歩兵）に対する瞬間スコアだけでなく、上位複数目標への汎用打撃力も評価し、
-            // 敵の戦車・車両に対処できない偵察車ばかりの偏重を防ぐ。
+            // 12カテゴリ目標比率倍率とカテゴリ内質的バランス倍率を掛けて長期的編成を誘導する。
             let secondary_versatility: f32 = target_rankings
                 .iter()
                 .skip(1)
                 .take(2)
                 .map(|(s, _, _)| *s * 0.25)
                 .sum();
-            let candidate_score = best_target_score + secondary_versatility;
+            let cat_mult = alloc.guidance.category_score_multiplier(
+                &alloc.category_counts,
+                cat,
+                best_target_urgent_anti_cap,
+            );
+            // 戦車カテゴリ内で装甲車が先に溜まっていても、主力戦車自体の保有数が目標未達なら過度に抑制しない
+            let mut effective_cat_mult =
+                if cat == AiUnitCategory::Tank && can_hit_armor(chart, stats.unit_type) {
+                    let mut armor_only_counts = alloc.category_counts;
+                    armor_only_counts[AiUnitCategory::Tank as usize] = alloc.armor_tank_cnt;
+                    let armor_only_mult = alloc.guidance.category_score_multiplier(
+                        &armor_only_counts,
+                        cat,
+                        best_target_urgent_anti_cap,
+                    );
+                    cat_mult.max(armor_only_mult)
+                } else {
+                    cat_mult
+                };
+            if rich_mobile_surplus && stats.can_capture {
+                effective_cat_mult = effective_cat_mult.min(1.0);
+            }
+            let intra_mult = alloc.guidance.intra_category_multiplier(
+                chart,
+                stats,
+                cat,
+                alloc.light_tank_cat_val,
+                alloc.armor_tank_cat_val,
+                alloc.light_tank_cnt,
+                alloc.my_direct_cnt,
+                threat_ctx.e_direct_cnt,
+                best_target_urgent_anti_cap,
+            );
+            let mut candidate_score =
+                (best_target_score + secondary_versatility) * effective_cat_mult * intra_mult;
+            if rich_mobile_surplus && stats.can_capture {
+                candidate_score *= RICH_SLOT_CAPTURE_UNIT_DISCOUNT;
+            }
             let anchor = target_rankings.first().map_or(fac, |t| t.1);
             let mut seen = HashSet::default();
             let priority_enemies: Vec<Entity> = target_rankings
@@ -1996,6 +2371,193 @@ fn allocate_direct_combat_phase(
     }
 }
 
+/// 前線安定時に、過剰なカテゴリや中価格帯ユニットへの端数支出を抑えて次ターンの上位ハンマー資金を残すべきか判定する。
+#[inline]
+fn should_defer_for_hammer_saving(
+    alloc: &AllocationContext<'_>,
+    hammer_save_floor: u32,
+    cat: AiUnitCategory,
+    cost: u32,
+    min_ground_cost: u32,
+    urgent_anti_cap: bool,
+) -> bool {
+    if alloc.commands.is_empty() || hammer_save_floor == 0 || urgent_anti_cap {
+        return false;
+    }
+    if alloc.rem_funds.saturating_sub(cost) >= hammer_save_floor {
+        return false;
+    }
+    let over_target = alloc
+        .guidance
+        .is_category_over_target(&alloc.category_counts, cat);
+    let mid_tier = cost > min_ground_cost && cost < HAMMER_UNIT_MIN_COST;
+    over_target || mid_tier
+}
+
+/// 同一ターン内の複数生産コマンドについて、各ユニットの展開／占領目標への到達ターン数合計が
+/// 短縮されるペアがある場合に生産施設の割り当てを相互に入れ替え、工場と目標の前後ねじれを解消する。
+fn optimize_unified_facility_assignments(
+    scan: &BoardScan,
+    profiles: &WeaponProfileTable,
+    commands: &mut [PlannedProduction],
+    plan_trace: &mut ProductionPlanTrace,
+    dist_cache: &mut TurnDistCache,
+) {
+    if commands.len() <= 1 {
+        return;
+    }
+    let stats_by_type: HashMap<UnitType, &UnitStats> =
+        scan.available_types.iter().map(|(t, s)| (*t, s)).collect();
+
+    /// 施設から目標位置までの実移動到達ターン数とヘックス直線距離を返す。
+    /// 通常は `TurnDistCache` の実地形ターン数を優先し、両比較対象とも到達不能な地形上目標のみ理論下限で比較する。
+    fn assignment_eta_and_dist(
+        scan: &BoardScan,
+        dist_cache: &mut TurnDistCache,
+        from: GridPosition,
+        target: GridPosition,
+        stats: &UnitStats,
+    ) -> (Option<u32>, u32) {
+        let dist = scan.map.distance(from.x, from.y, target.x, target.y);
+        let turns = dist_cache
+            .turns_between(
+                scan,
+                from,
+                target,
+                stats.movement_type,
+                stats.max_movement,
+                stats.max_fuel,
+            )
+            .map(|t| t.max(1));
+        (turns, dist)
+    }
+
+    let mut improved = true;
+    let mut iterations = 0_usize;
+    while improved && iterations < 32 {
+        improved = false;
+        iterations += 1;
+        for i in 0..commands.len() {
+            for j in (i + 1)..commands.len() {
+                let unit_i = commands[i].command.unit_type;
+                let unit_j = commands[j].command.unit_type;
+                // 間接砲は安全性検査済みの射点と施設をセットで選んでいるため位置入替の対象外とする
+                if profiles.is_indirect(unit_i) || profiles.is_indirect(unit_j) {
+                    continue;
+                }
+                let Some(&stats_i) = stats_by_type.get(&unit_i) else {
+                    continue;
+                };
+                let Some(&stats_j) = stats_by_type.get(&unit_j) else {
+                    continue;
+                };
+
+                let target_i = commands[i]
+                    .capture_intent
+                    .as_ref()
+                    .and_then(|intent| intent.mission_target)
+                    .or_else(|| commands[i].deployment.as_ref().map(|d| d.staging_anchor));
+                let target_j = commands[j]
+                    .capture_intent
+                    .as_ref()
+                    .and_then(|intent| intent.mission_target)
+                    .or_else(|| commands[j].deployment.as_ref().map(|d| d.staging_anchor));
+                let (Some(target_i), Some(target_j)) = (target_i, target_j) else {
+                    continue;
+                };
+
+                let pos_i = GridPosition {
+                    x: commands[i].command.target_x,
+                    y: commands[i].command.target_y,
+                };
+                let pos_j = GridPosition {
+                    x: commands[j].command.target_x,
+                    y: commands[j].command.target_y,
+                };
+                if pos_i == pos_j {
+                    continue;
+                }
+
+                let terrain_i = scan
+                    .map
+                    .get_terrain(pos_i.x, pos_i.y)
+                    .unwrap_or(Terrain::Factory);
+                let terrain_j = scan
+                    .map
+                    .get_terrain(pos_j.x, pos_j.y)
+                    .unwrap_or(Terrain::Factory);
+                if !scan.can_produce(terrain_j, unit_i) || !scan.can_produce(terrain_i, unit_j) {
+                    continue;
+                }
+
+                let (t_i_curr, d_i_curr) =
+                    assignment_eta_and_dist(scan, dist_cache, pos_i, target_i, stats_i);
+                let (t_j_curr, d_j_curr) =
+                    assignment_eta_and_dist(scan, dist_cache, pos_j, target_j, stats_j);
+                let (t_i_swap, d_i_swap) =
+                    assignment_eta_and_dist(scan, dist_cache, pos_j, target_i, stats_i);
+                let (t_j_swap, d_j_swap) =
+                    assignment_eta_and_dist(scan, dist_cache, pos_i, target_j, stats_j);
+
+                // 元は到達可能だったユニットを未到達施設へ飛ばす入替は絶対に許可しない
+                if (t_i_curr.is_some() && t_i_swap.is_none())
+                    || (t_j_curr.is_some() && t_j_swap.is_none())
+                {
+                    continue;
+                }
+
+                let eta_i_curr =
+                    t_i_curr.unwrap_or_else(|| d_i_curr.div_ceil(stats_i.max_movement.max(1)));
+                let eta_j_curr =
+                    t_j_curr.unwrap_or_else(|| d_j_curr.div_ceil(stats_j.max_movement.max(1)));
+                let eta_i_swap =
+                    t_i_swap.unwrap_or_else(|| d_i_swap.div_ceil(stats_i.max_movement.max(1)));
+                let eta_j_swap =
+                    t_j_swap.unwrap_or_else(|| d_j_swap.div_ceil(stats_j.max_movement.max(1)));
+
+                let curr_key = (
+                    eta_i_curr.saturating_add(eta_j_curr),
+                    d_i_curr.saturating_add(d_j_curr),
+                );
+                let swap_key = (
+                    eta_i_swap.saturating_add(eta_j_swap),
+                    d_i_swap.saturating_add(d_j_swap),
+                );
+
+                if swap_key < curr_key {
+                    commands[i].command.target_x = pos_j.x;
+                    commands[i].command.target_y = pos_j.y;
+                    if let Some(intent) = commands[i].capture_intent.as_mut() {
+                        intent.command.target_x = pos_j.x;
+                        intent.command.target_y = pos_j.y;
+                    }
+
+                    commands[j].command.target_x = pos_i.x;
+                    commands[j].command.target_y = pos_i.y;
+                    if let Some(intent) = commands[j].capture_intent.as_mut() {
+                        intent.command.target_x = pos_i.x;
+                        intent.command.target_y = pos_i.y;
+                    }
+
+                    if commands.len() == plan_trace.steps.len() {
+                        if let ProductionDecision::Produced { facility, .. } =
+                            &mut plan_trace.steps[i].decision
+                        {
+                            *facility = pos_j;
+                        }
+                        if let ProductionDecision::Produced { facility, .. } =
+                            &mut plan_trace.steps[j].decision
+                        {
+                            *facility = pos_i;
+                        }
+                    }
+                    improved = true;
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 fn is_ground_fac(
     terrain: Terrain,
@@ -2005,28 +2567,6 @@ fn is_ground_fac(
         .get_landscape_by_name(terrain.as_str())
         .and_then(|r| r.supply_type.as_deref())
         == Some(supply_types::GROUND)
-}
-
-#[inline]
-fn can_hit_ground(chart: &crate::resources::DamageChart, ut: UnitType) -> bool {
-    max_base_damage(chart, ut, UnitType::Infantry) > 0
-        || max_base_damage(chart, ut, UnitType::Tank) > 0
-}
-
-/// 敵装甲車両（軽戦車級）に対して有効な打撃力（基礎ダメージ20以上）を持つか判定する。
-#[inline]
-fn can_hit_armor(chart: &crate::resources::DamageChart, ut: UnitType) -> bool {
-    max_base_damage(chart, ut, UnitType::Tank) >= 20
-}
-
-/// 対装甲能力を持たず、もっぱら対空迎撃を担う対空特化ユニット（対空戦車・ミサイル・戦闘機等）か判定する。
-/// 歩兵のマシンガン等（対ヘリ15%以下）を誤って対空特化として数えないよう、有効な対空打撃力の有無も確認する。
-#[inline]
-fn is_aa_specialized(chart: &crate::resources::DamageChart, ut: UnitType) -> bool {
-    !can_hit_armor(chart, ut)
-        && (max_base_damage(chart, ut, UnitType::Bcopters) >= 34
-            || max_base_damage(chart, ut, UnitType::Bomber) >= 34
-            || max_base_damage(chart, ut, UnitType::Fighter) >= 34)
 }
 
 /// 占領兵ではなく対地直接攻撃を担う地上機動戦闘車両（装甲車・戦車等）か判定する。
@@ -2042,13 +2582,6 @@ fn is_mobile_ground_combat(
         && can_hit_ground(chart, ut)
         && !matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
         && !is_non_combat_transport(chart, stats)
-}
-
-#[inline]
-fn is_non_combat_transport(chart: &crate::resources::DamageChart, stats: &UnitStats) -> bool {
-    stats.max_cargo > 0
-        && (matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
-            || !can_hit_ground(chart, stats.unit_type))
 }
 
 fn nearest_open_property_or(scan: &BoardScan, fallback_origin: GridPosition) -> GridPosition {

@@ -4,6 +4,7 @@
 //! 共通の評価スケール（共有 `rem_hp` ＋ 占領時間割引収入 ＋ スクリーン維持）へ乗せ、
 //! 全空き生産施設・残存資金の範囲でビームサーチにより一括決定する。
 
+mod composition;
 mod reach;
 mod scoring;
 mod threats;
