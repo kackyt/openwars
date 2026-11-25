@@ -75,7 +75,6 @@ fn value_of(demand: &Demand, candidate: &Candidate, ledger: &Ledger) -> i64 {
 // ---- 手番の区間 ----
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn turn_window_len_and_intersection() {
     assert_eq!(window(5, 30).len(), 26);
     assert_eq!(window(5, 5).len(), 1);
@@ -85,7 +84,6 @@ fn turn_window_len_and_intersection() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn service_timing_for_holders_and_indirect_fire() {
     // 保持型: T3 に買い 1 手番で着けば T4 から満たす。
     assert_eq!(
@@ -116,7 +114,6 @@ fn service_timing_for_holders_and_indirect_fire() {
 // ---- 時間: 遅く着くほど満たせる手番が減る ----
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn buying_later_loses_exactly_the_missed_turns() {
     let need = forest_cover();
     let ledger = Ledger::default();
@@ -136,7 +133,6 @@ fn buying_later_loses_exactly_the_missed_turns() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn a_farther_facility_costs_the_extra_travel_turns() {
     let need = forest_cover();
     // 首都 (5,3) から砲座まで 2 手番 → T6 から撃てる。
@@ -145,7 +141,6 @@ fn a_farther_facility_costs_the_extra_travel_turns() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn a_later_deadline_makes_buying_now_or_next_turn_equal() {
     // 敵が T8 に着く需要なら、T3 でも T4 でも撃ち始めに間に合い、同じ価値になる。
     let need = demand(2, 8, LAST_TURN, 100);
@@ -157,7 +152,6 @@ fn a_later_deadline_makes_buying_now_or_next_turn_equal() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn arriving_after_the_last_turn_is_worth_nothing() {
     let need = forest_cover();
     let too_late = rocket(&need, cell(4, 5), cell(3, 5), LAST_TURN, 1);
@@ -167,7 +161,6 @@ fn arriving_after_the_last_turn_is_worth_nothing() {
 // ---- 地理: 道中の危険 ----
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn transit_loss_is_subtracted() {
     let need = forest_cover();
     let mut exposed = rocket(&need, cell(4, 5), cell(3, 5), 3, 1);
@@ -178,7 +171,6 @@ fn transit_loss_is_subtracted() {
 // ---- 占有: 同じマスには同時に 1 体 ----
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn a_second_unit_on_the_same_site_adds_nothing() {
     let need = forest_cover();
     let first = rocket(&need, cell(4, 5), cell(3, 5), 3, 1);
@@ -191,7 +183,6 @@ fn a_second_unit_on_the_same_site_adds_nothing() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn a_partly_used_cell_counts_only_the_free_turns() {
     let need = forest_cover();
     let mut ledger = Ledger::default();
@@ -203,7 +194,6 @@ fn a_partly_used_cell_counts_only_the_free_turns() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn a_demand_already_served_from_another_site_adds_nothing() {
     let need = forest_cover();
     let mut ledger = Ledger::default();
@@ -220,7 +210,6 @@ fn a_demand_already_served_from_another_site_adds_nothing() {
 // ---- 生産施設を塞ぐ損 ----
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn a_battery_on_a_production_city_pays_for_the_blocked_turns() {
     let need = forest_cover();
     let block: HashMap<_, _> = [(cell(4, 5), FundsValue(40))].into_iter().collect();
@@ -268,7 +257,6 @@ fn select(demands: &[Demand], candidates: &[Candidate], budget: u32, seeds: usiz
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn fixture_gains_are_as_documented() {
     let (demands, candidates) = rocket_or_two_infantry();
     let ledger = Ledger::default();
@@ -283,7 +271,6 @@ fn fixture_gains_are_as_documented() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn plain_greedy_falls_back_to_the_best_single_item() {
     let (demands, candidates) = rocket_or_two_infantry();
     // 比率順の貪欲法は歩兵 2 体（1,700）で止まる。単品最良のロケット（2,600）の方が大きい。
@@ -294,7 +281,6 @@ fn plain_greedy_falls_back_to_the_best_single_item() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn seeding_the_first_pick_finds_rocket_plus_infantry() {
     let (demands, candidates) = rocket_or_two_infantry();
     // ロケットを最初に固定すると、残り 1,000 で比率最良の歩兵が入る（3,500）。
@@ -305,7 +291,6 @@ fn seeding_the_first_pick_finds_rocket_plus_infantry() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn one_facility_builds_only_one_unit_per_turn() {
     let hold_a = demand(10, 1, 9, 100);
     let hold_b = demand(11, 1, 8, 100);
@@ -321,7 +306,6 @@ fn one_facility_builds_only_one_unit_per_turn() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn a_stale_gain_is_recomputed_after_a_site_is_taken() {
     let need = forest_cover();
     let other_need = demand(3, 5, LAST_TURN, 100);
@@ -340,7 +324,6 @@ fn a_stale_gain_is_recomputed_after_a_site_is_taken() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn candidates_with_no_positive_gain_are_never_picked() {
     let need = forest_cover();
     let block: HashMap<_, _> = [(cell(4, 5), FundsValue(1000))].into_iter().collect();
@@ -361,7 +344,6 @@ fn candidates_with_no_positive_gain_are_never_picked() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn existing_units_in_the_initial_ledger_are_respected() {
     let need = forest_cover();
     let candidates = vec![rocket(&need, cell(4, 5), cell(3, 5), 3, 1)];
@@ -385,7 +367,6 @@ fn existing_units_in_the_initial_ledger_are_respected() {
 // ---- 上界 ----
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn fractional_upper_bound_fills_by_ratio() {
     let gains = [
         (FundsValue(2600), ROCKET_COST),
@@ -400,7 +381,6 @@ fn fractional_upper_bound_fills_by_ratio() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn fractional_upper_bound_ignores_non_positive_gains() {
     let gains = [
         (FundsValue(-500), 1000),
@@ -414,7 +394,6 @@ fn fractional_upper_bound_ignores_non_positive_gains() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn upper_bound_is_never_below_the_greedy_result() {
     let (demands, candidates) = rocket_or_two_infantry();
     let ledger = Ledger::default();

@@ -3,12 +3,8 @@
 //! 計画書 `docs/07-project-management/plans/v4-demand-based-production.md` の 3.1 節に対応する。
 //! 座標やマップ固有の定数は持たず、陣地線 `L`・敵側の列 `E`・自陣側 `home`・射程・距離関数だけを使う。
 //!
-//! Step 1 では関数の形と単体テスト（`fire_support/tests.rs`）だけを先に用意している。
-//! 本体は未実装（`todo!()`）で、テストは `#[ignore]` にしてある。実装したら
-//! 各テストの `#[ignore]` と、このファイル先頭の `allow` を外すこと。
-
-// Step 3 で生産へ接続するまでは呼び出し元がなく、本体も未実装のため一時的に許可する。
-#![allow(dead_code, unused_variables)]
+// Step 3 で生産へ接続するまで呼び出し元がないため、一時的に許可する。
+#![allow(dead_code)]
 
 use crate::collections::HashSet;
 use crate::components::GridPosition;
@@ -58,7 +54,7 @@ pub(crate) struct BatterySite {
 ///
 /// 条件:
 /// - `home` に含まれる。
-/// - `E` のどのマスにも隣接しない（陣地線を保持していれば敵の直接攻撃を受けない）。
+/// - `E` に含まれず、`E` のどのマスにも隣接しない（陣地線を保持していれば敵の直接攻撃を受けない）。
 /// - `L ∪ E` のうち射程内のマスが1つ以上ある（最小射程より近いマスは覆えない）。
 ///
 /// 生産口かどうかでは除外しない。生産口を塞ぐ損は需要価値（`demand_value`）の占有コストで比べる。
@@ -70,7 +66,31 @@ pub(crate) fn battery_sites<D>(
 where
     D: Fn(GridPosition, GridPosition) -> u32,
 {
-    todo!("Step 1: 砲座候補の列挙")
+    let mut targets: Vec<_> = input.line.iter().chain(input.enemy_side).copied().collect();
+    targets.sort_unstable_by_key(|p| (p.y, p.x));
+    targets.dedup();
+
+    let mut sites = Vec::new();
+    for &position in input.home {
+        if input
+            .enemy_side
+            .iter()
+            .any(|&enemy| position == enemy || (input.distance)(position, enemy) == 1)
+        {
+            continue;
+        }
+
+        let covered: Vec<_> = targets
+            .iter()
+            .copied()
+            .filter(|&target| range.contains((input.distance)(position, target)))
+            .collect();
+        if !covered.is_empty() {
+            sites.push(BatterySite { position, covered });
+        }
+    }
+    sites.sort_unstable_by_key(|site| (site.position.y, site.position.x));
+    sites
 }
 
 /// 砲座へ着いた次の手番から撃つ間接部隊について、購入期限（この手番までに買えば間に合う）を返す。
@@ -81,5 +101,5 @@ where
 /// 買った手番には動けず、移動した手番には撃てないため、撃ち始めは `購入手番 + 移動手番数 + 1`。
 /// これが敵の到着手番以下になる最後の購入手番を返す。手番 0 より前になる（もう間に合わない）なら `None`。
 pub(crate) fn purchase_deadline(enemy_arrival_turn: u32, travel_turns: u32) -> Option<u32> {
-    todo!("Step 1: 購入期限")
+    enemy_arrival_turn.checked_sub(travel_turns)?.checked_sub(1)
 }

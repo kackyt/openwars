@@ -137,15 +137,13 @@ v(u, f, t) = w_k × |[max(a, s_k), e_k] のうち占有できる手番|
 
 ### 4.1. Step 1 の進捗（2026-11-25）
 
-単体テストを先に用意した。型・関数の形は確定し、本体は `todo!()`、テストは `#[ignore = "Step 1 実装待ち"]`。
+Step 1 の純粋関数を実装し、単体テスト 30 件を有効化した。
 
-| モジュール | 内容 | テスト |
-|---|---|---|
-| `engine/src/ai/v4/hold_line/fire_support.rs` | `battery_sites`（砲座候補と射程被覆）、`purchase_deadline` | `fire_support/tests.rs`（9 件、うち 8 件 ignore） |
-| `engine/src/ai/v4/demand_value.rs` | `TurnWindow`, `ServiceTiming`, `Ledger`（占有・満たし済み）、`marginal_value`, `select_greedy`（`seeds` 0/1）、`fractional_upper_bound` | `demand_value/tests.rs`（21 件、すべて ignore） |
+| モジュール | 内容 | 進捗 | テスト |
+|---|---|---|---|
+| `engine/src/ai/v4/hold_line/fire_support.rs` | `battery_sites`（砲座候補と射程被覆）、`purchase_deadline` | 実装済み | `fire_support/tests.rs`（9 件） |
+| `engine/src/ai/v4/demand_value.rs` | `TurnWindow`, `ServiceTiming`, `Ledger`（占有・満たし済み）、`marginal_value`, `select_greedy`（`seeds` 0/1）、`fractional_upper_bound` | 実装済み | `demand_value/tests.rs`（21 件） |
 
-- 期待値は使い捨ての参照実装で全 30 件が通ることを確認済み（参照実装はコミットしていない）。
-- 実装者は各テストの `#[ignore]` と、両ファイル先頭の `#![allow(dead_code, unused_variables)]` を外す（後者は Step 3 で呼び出し元ができるまで `dead_code` だけ残してよい）。
 - 未着手: `w_k` の算出（陣地線保持・占領・脅威敵）、盤面（`World`）から需要と候補を組み立てる部分、`F_TRACE` の出力。これらは試行錯誤が要るため Step 2 と合わせて進める。
 - 既知の性質（テストで固定）: `seeds = 0` は「比率順の貪欲法」と「単品最良」の大きい方で、ロケット 1 門 + 歩兵 1 体（3,500）を取り逃がし単品（2,600）になる。`seeds = 1` で解消する。
 

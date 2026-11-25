@@ -56,7 +56,6 @@ impl Fixture {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn rockets_use_rows_4_to_6_and_never_the_capital_row() {
     let sites = Fixture::map_42_p2().sites(ROCKETS);
     let positions: Vec<_> = sites.iter().map(|site| site.position).collect();
@@ -69,7 +68,6 @@ fn rockets_use_rows_4_to_6_and_never_the_capital_row() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn front_city_outside_production_range_covers_forest_and_plain() {
     let sites = Fixture::map_42_p2().sites(ROCKETS);
     // 前線都市 (3,5): 森 (2..=4, 7) と平地 (3, 8) を撃てる。
@@ -81,7 +79,6 @@ fn front_city_outside_production_range_covers_forest_and_plain() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn plain_behind_the_line_is_a_site_because_it_does_not_touch_the_enemy_side() {
     let sites = Fixture::map_42_p2().sites(ROCKETS);
     // (5,6) は L に隣接するが E には隣接しない。真正面の森 (5,7) は距離 1 で最小射程の内側。
@@ -101,7 +98,6 @@ fn plain_behind_the_line_is_a_site_because_it_does_not_touch_the_enemy_side() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn line_cells_in_home_are_excluded_because_they_touch_the_enemy_side() {
     let mut fixture = Fixture::map_42_p2();
     // home に陣地線が含まれていても、E に隣接するので砲座にはならない。
@@ -111,7 +107,6 @@ fn line_cells_in_home_are_excluded_because_they_touch_the_enemy_side() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn minimum_range_dead_zone_moves_heavy_guns_back() {
     let sites = Fixture::map_42_p2().sites(HEAVY_SP_GUN);
     // 射程 3..=5 では y = 3 からも森 (x, 7) を撃てる（距離 4）。
@@ -125,7 +120,6 @@ fn minimum_range_dead_zone_moves_heavy_guns_back() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn no_line_means_no_sites() {
     let home: HashSet<_> = (3..=6).flat_map(row).collect();
     let sites = battery_sites(
@@ -141,7 +135,6 @@ fn no_line_means_no_sites() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn purchase_deadline_matches_the_map_42_rocket_table() {
     // 敵が T5 に着く森を、1 手番先の砲座から撃つ: T3 に買えば T4 に布陣、T5 に撃てる。
     assert_eq!(purchase_deadline(5, 1), Some(3));
@@ -152,7 +145,6 @@ fn purchase_deadline_matches_the_map_42_rocket_table() {
 }
 
 #[test]
-#[ignore = "Step 1 実装待ち"]
 fn purchase_deadline_is_none_when_it_is_already_too_late() {
     assert_eq!(purchase_deadline(1, 1), None);
     assert_eq!(purchase_deadline(2, 1), Some(0));
