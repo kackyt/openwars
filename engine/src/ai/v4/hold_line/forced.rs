@@ -1,0 +1,255 @@
+//! 検証専用: 陣地線（地形の切断面）の空きマスへ、占領担当も含む歩兵を強制的に向かわせて保持させる。
+//!
+//! 「人間のように森の列を歩兵で埋め続ければ勝てるか」という効果の上限を測るための実験スイッチ。
+//! `OPENWARS_V4_FORCE_LINE_HOLD=1` のときだけ有効で、未設定時は何もしない（既定の挙動は変わらない）。
+//! 陣地線は座標を与えず、初期地形から選んだ切断面（[`super::terrain`]）をそのまま使う。
+//! 割当は手番をまたいで保持し、届く手番はそのマスで止まり、届かない手番はそのマスへ近づく。
+
+use crate::collections::{HashMap, HashSet};
+use crate::components::{GridPosition, PlayerId};
+use bevy_ecs::prelude::*;
+use std::collections::BTreeMap;
+
+/// 強制保持を有効にする環境変数。
+const FORCE_ENV: &str = "OPENWARS_V4_FORCE_LINE_HOLD";
+
+/// 強制保持の実験スイッチが有効か。
+pub(crate) fn enabled() -> bool {
+    std::env::var(FORCE_ENV).as_deref() == Ok("1")
+}
+
+/// 森マスへの出発合図: そのマスに敵地上部隊が入っているか、隣接しているマスだけを返す。
+///
+/// 人間の勝ち局では、敵が森の列に触れた手番に歩兵を森へ入れている。最悪の到着手番で見積もると
+/// 占領中の敵まで数えて早すぎるため、盤面上で実際に接したことだけを合図にする（調整用の定数は持たない）。
+/// `enemies` は敵地上部隊の位置、`adjacent` は盤面の隣接関係。
+pub(crate) fn contested_cells(
+    cells: &[GridPosition],
+    enemies: &HashSet<GridPosition>,
+    adjacent: impl Fn(GridPosition) -> Vec<GridPosition>,
+) -> HashSet<GridPosition> {
+    cells
+        .iter()
+        .copied()
+        .filter(|cell| {
+            enemies.contains(cell) || adjacent(*cell).iter().any(|next| enemies.contains(next))
+        })
+        .collect()
+}
+
+/// 歩兵だけでなく対地間接部隊も配置する実験か。
+pub(crate) fn with_batteries() -> bool {
+    std::env::var("OPENWARS_V4_FORCE_LINE_BATTERY").as_deref() == Ok("1")
+}
+
+/// 自陣側で線に最も近い都市のうち、自軍が占領した都市だけを砲座候補にする。
+/// 所有権を絞る前に距離を比べることで、未占領のときに後方の都市を砲座にしない。
+pub(crate) fn forward_battery_sites(cities: &[(GridPosition, u32, bool)]) -> Vec<GridPosition> {
+    let nearest = cities.iter().map(|(_, distance, _)| *distance).min();
+    cities
+        .iter()
+        .filter(|(_, distance, owned)| *owned && Some(*distance) == nearest)
+        .map(|(pos, _, _)| *pos)
+        .collect()
+}
+
+/// プレイヤーごとの「兵 → 保持マス」の割当。手番をまたいで同じ兵に同じマスを持たせ続ける。
+#[derive(Resource, Default)]
+pub(crate) struct ForcedLineHold {
+    assignments: HashMap<PlayerId, BTreeMap<Entity, GridPosition>>,
+}
+
+/// 前回までの割当を読む。未記録なら空。
+pub(crate) fn previous(world: &World, player: PlayerId) -> BTreeMap<Entity, GridPosition> {
+    world
+        .get_resource::<ForcedLineHold>()
+        .and_then(|hold| hold.assignments.get(&player))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// 今回の割当を記録する。
+pub(crate) fn store(
+    world: &mut World,
+    player: PlayerId,
+    assignments: BTreeMap<Entity, GridPosition>,
+) {
+    world
+        .get_resource_or_insert_with(ForcedLineHold::default)
+        .assignments
+        .insert(player, assignments);
+}
+
+/// 割当の入力。
+pub(crate) struct AssignInput<'a> {
+    /// 陣地線の全マス。
+    pub(crate) line: &'a [GridPosition],
+    /// 今は割り当てられないマス（敵がいる、保持対象外の味方がいる）。
+    pub(crate) unavailable: &'a HashSet<GridPosition>,
+    /// 新たに割り当ててよい兵（この手番に動ける歩兵）。
+    pub(crate) pool: &'a [Entity],
+}
+
+/// 前回の割当を引き継ぎ、空いた陣地線マスへ近い兵から1対1で割り当てる。
+///
+/// - `retained(兵)` が偽の兵（死亡・回復優先など保持資格を失った兵）の割当は外す。
+/// - 割当マスが使えなくなった（敵が入った等）兵は割当を外し、改めて候補に戻す。
+/// - `cost(兵, マス)` は到達までの（ターン数, 消費移動力）。到達不能なら `None`。
+///   全組から最小のものを順に確定する（同値は兵・マスの順で決定的に選ぶ）。
+pub(crate) fn assign(
+    previous: &BTreeMap<Entity, GridPosition>,
+    input: &AssignInput,
+    retained: impl Fn(Entity) -> bool,
+    mut cost: impl FnMut(Entity, GridPosition) -> Option<(u32, u32)>,
+) -> BTreeMap<Entity, GridPosition> {
+    let mut result: BTreeMap<Entity, GridPosition> = previous
+        .iter()
+        .filter(|(unit, cell)| {
+            retained(**unit) && input.line.contains(cell) && !input.unavailable.contains(cell)
+        })
+        .map(|(unit, cell)| (*unit, *cell))
+        .collect();
+    let mut taken: HashSet<GridPosition> = result.values().copied().collect();
+    let open: Vec<GridPosition> = input
+        .line
+        .iter()
+        .copied()
+        .filter(|cell| !taken.contains(cell) && !input.unavailable.contains(cell))
+        .collect();
+    let mut pairs = Vec::new();
+    for &unit in input.pool.iter().filter(|unit| !result.contains_key(unit)) {
+        for &cell in &open {
+            if let Some(distance) = cost(unit, cell) {
+                pairs.push((distance, unit, (cell.y, cell.x), cell));
+            }
+        }
+    }
+    // 近い組から確定する。同じ兵・同じマスは一度だけ使う。
+    pairs.sort_unstable_by_key(|(distance, unit, key, _)| (*distance, *unit, *key));
+    for (_, unit, _, cell) in pairs {
+        if result.contains_key(&unit) || taken.contains(&cell) {
+            continue;
+        }
+        taken.insert(cell);
+        result.insert(unit, cell);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(x: usize, y: usize) -> GridPosition {
+        GridPosition { x, y }
+    }
+
+    fn entities(n: u32) -> Vec<Entity> {
+        let mut world = World::new();
+        (0..n).map(|_| world.spawn_empty().id()).collect()
+    }
+
+    #[test]
+    fn 敵が接したマスだけ出発の合図を出す() {
+        let line = [cell(1, 7), cell(2, 7), cell(3, 7)];
+        // 一次元の隣接（x±1, 同じ y）で十分に判定を確かめられる。
+        let adjacent = |c: GridPosition| {
+            [c.x.wrapping_sub(1), c.x + 1]
+                .into_iter()
+                .map(|x| cell(x, c.y))
+                .collect::<Vec<_>>()
+        };
+        // 敵が遠い間は合図なし。
+        let far = HashSet::from_iter([cell(9, 7)]);
+        assert!(contested_cells(&line, &far, adjacent).is_empty());
+        // (4,7) の敵は (3,7) にだけ隣接する。(2,7) に入った敵はそのマスと両隣を合図にする。
+        let near = HashSet::from_iter([cell(4, 7)]);
+        assert_eq!(
+            contested_cells(&line, &near, adjacent),
+            HashSet::from_iter([cell(3, 7)])
+        );
+        let inside = HashSet::from_iter([cell(2, 7)]);
+        assert_eq!(contested_cells(&line, &inside, adjacent).len(), 3);
+    }
+
+    #[test]
+    fn 前線都市を取るまでは後方都市を砲座と見なさない() {
+        let (front, rear) = (cell(3, 5), cell(3, 3));
+        assert!(forward_battery_sites(&[(front, 2, false), (rear, 4, true)]).is_empty());
+        assert_eq!(
+            forward_battery_sites(&[(front, 2, true), (rear, 4, true)]),
+            vec![front]
+        );
+    }
+
+    #[test]
+    fn 近い兵から空きマスへ1対1で割り当てる() {
+        let units = entities(3);
+        let line = [cell(1, 7), cell(2, 7)];
+        let unavailable = HashSet::default();
+        let input = AssignInput {
+            line: &line,
+            unavailable: &unavailable,
+            pool: &units,
+        };
+        // 兵0はどちらも遠く、兵1は(1,7)に、兵2は(2,7)に近い。
+        let result = assign(
+            &BTreeMap::new(),
+            &input,
+            |_| true,
+            |unit, c| {
+                Some(match (units.iter().position(|u| *u == unit)?, c.x) {
+                    (0, _) => (3, 0),
+                    (1, 1) | (2, 2) => (1, 0),
+                    _ => (2, 0),
+                })
+            },
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[&units[1]], cell(1, 7));
+        assert_eq!(result[&units[2]], cell(2, 7));
+    }
+
+    #[test]
+    fn 前回の割当を引き継ぎ_外れた兵と使えないマスは解放する() {
+        let units = entities(3);
+        let line = [cell(1, 7), cell(2, 7), cell(3, 7)];
+        let mut unavailable = HashSet::default();
+        unavailable.insert(cell(3, 7));
+        let previous = BTreeMap::from([
+            (units[0], cell(1, 7)),
+            (units[1], cell(2, 7)),
+            (units[2], cell(3, 7)),
+        ]);
+        let input = AssignInput {
+            line: &line,
+            unavailable: &unavailable,
+            pool: &units,
+        };
+        // 兵1は上位の仕事へ移った。兵2のマスには敵が入った。
+        let result = assign(
+            &previous,
+            &input,
+            |unit| unit != units[1],
+            |_, _| Some((1, 0)),
+        );
+        // 兵0は引き継ぐ。敵の入った(3,7)は誰にも割り当てず、空いた(2,7)は候補の誰か1体が埋める。
+        assert_eq!(result[&units[0]], cell(1, 7));
+        assert!(!result.values().any(|c| *c == cell(3, 7)));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn 到達できないマスには割り当てない() {
+        let units = entities(1);
+        let line = [cell(1, 7)];
+        let unavailable = HashSet::default();
+        let input = AssignInput {
+            line: &line,
+            unavailable: &unavailable,
+            pool: &units,
+        };
+        let result = assign(&BTreeMap::new(), &input, |_| true, |_, _| None);
+        assert!(result.is_empty());
+    }
+}

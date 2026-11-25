@@ -255,7 +255,13 @@ pub(crate) fn decide_squad_action_v4(
     if permitted.is_empty() {
         return None;
     }
-    let batch = super::evaluate_actions(world, player_id, skip_entities, Some(&permitted));
+    let batch = super::evaluate_actions(
+        world,
+        player_id,
+        skip_entities,
+        Some(&permitted),
+        super::LineHoldMode::from_env(),
+    );
     // Squadの巡回は基準順として残す。Squad内も既存の優先度・score順（同点は評価順）。
     let mut order = Vec::new();
     let mut owners = HashMap::default();

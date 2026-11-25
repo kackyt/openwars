@@ -473,6 +473,7 @@ class IslandCampaignCollectionTests(unittest.TestCase):
             1: {"player_id": 1, "missions": [{"eta": 1}]},
             2: {"player_id": 2, "missions": []},
         }
+        hold_line = {"moves_first": False, "strict_line": [{"x": 4, "y": 7}]}
 
         def tool(name, arguments=None, req_id=1):
             nonlocal active_index
@@ -516,6 +517,7 @@ class IslandCampaignCollectionTests(unittest.TestCase):
                     "island_campaign": campaigns[player_id],
                     "deployment_audit": deployment_audits[player_id],
                     "emergency_plan": emergency_plans[player_id],
+                    "hold_line": hold_line if player_id == 2 else None,
                 }
                 active_index = 1 - active_index
                 return response
@@ -580,6 +582,9 @@ class IslandCampaignCollectionTests(unittest.TestCase):
         self.assertEqual(deployment_audits[2], lines[1]["deployment_audit"])
         self.assertEqual(emergency_plans[1], lines[0]["emergency_plan"])
         self.assertEqual(emergency_plans[2], lines[1]["emergency_plan"])
+        self.assertNotIn("hold_line", lines[0])
+        self.assertEqual((58001, 1, 2), tuple(lines[1][key] for key in ("seed", "round", "player_id")))
+        self.assertEqual(hold_line, lines[1]["hold_line"])
 
 
 class ObjectiveReportTests(unittest.TestCase):

@@ -34,6 +34,7 @@ use crate::ai::tactics::small_map::squad_executor::coordinated_support_destinati
 use crate::ai::squad::{MissionType, SquadManager};
 use crate::ai::strategy_profile::{V4StrategyProfile, current_profile};
 use crate::ai::turn_distance::TurnDistance;
+use crate::ai::v4::hold_line::planner::{self, EligibleHolder, HoldDecision};
 use crate::collections::HashSet;
 use crate::components::{GridPosition, Health, PlayerId};
 use crate::resources::Terrain;
@@ -52,7 +53,13 @@ pub(crate) fn decide_action(
     skip_entities: &HashSet<Entity>,
     permitted: Option<&HashSet<Entity>>,
 ) -> Option<(Entity, AiCommand)> {
-    let batch = evaluate_actions(world, player_id, skip_entities, permitted);
+    let batch = evaluate_actions(
+        world,
+        player_id,
+        skip_entities,
+        permitted,
+        LineHoldMode::Off,
+    );
     let mut best = None;
     for (index, action) in batch.actions.iter().enumerate() {
         if best.is_none_or(|previous: usize| action.rank > batch.actions[previous].rank) {
@@ -69,6 +76,8 @@ struct EvaluatedAction {
     pub command: AiCommand,
     pub rank: Rank,
     pub movement: Option<execution_order::MovementIntent>,
+    hold: Option<HoldDecision>,
+    forced_target: Option<GridPosition>,
 }
 
 /// 同じ盤面を使って一度だけ評価した候補群。通知は最終選択時にだけ発行する。
@@ -80,6 +89,17 @@ struct EvaluatedActions {
 impl EvaluatedActions {
     pub fn choose(mut self, world: &mut World, index: usize) -> (Entity, AiCommand) {
         let action = self.actions.swap_remove(index);
+        if let Some(hold) = action.hold {
+            hold.trace_execution(world, self.board.player_id);
+        }
+        if let Some(target) = action.forced_target {
+            trace_forced_hold(world, self.board.player_id, || {
+                format!(
+                    "selected unit={:?} target={target:?} command={:?}",
+                    action.entity, action.command
+                )
+            });
+        }
         super::scoring::report_evaluated_action(
             world,
             &self.board,
@@ -91,6 +111,59 @@ impl EvaluatedActions {
     }
 }
 
+/// 陣地線保持の実験スイッチ。既定は `Off`（既存の行動を変えない）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum LineHoldMode {
+    Off,
+    /// 砲座への脅威を減らす配置だけを保持する（CP B0、`OPENWARS_V4_PARTIAL_HOLD_LINE=1`）。
+    Partial,
+    /// 陣地線の空きマスへ占領担当も含む歩兵を強制的に向かわせる上限実験
+    /// （`OPENWARS_V4_FORCE_LINE_HOLD=1`）。
+    Forced,
+}
+
+impl LineHoldMode {
+    /// 保持モードごとの任務の差し替え可否。
+    fn allows_mission(
+        self,
+        mission: Option<&MissionType>,
+        campaign: Option<(&MissionType, bool)>,
+        explicit_route: bool,
+        active_capture: bool,
+    ) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Partial => {
+                has_only_enemy_pursuit(mission, campaign, explicit_route, active_capture)
+            }
+            // 上限実験では占領担当も使う。防衛・輸送・出発待ちまでは上書きしない。
+            Self::Forced => {
+                matches!(
+                    mission,
+                    None | Some(MissionType::Attack | MissionType::Reserve | MissionType::Capture)
+                ) && campaign.is_none_or(|(kind, can_depart)| {
+                    can_depart
+                        && matches!(
+                            kind,
+                            MissionType::Attack | MissionType::Reserve | MissionType::Capture
+                        )
+                })
+            }
+        }
+    }
+
+    /// 環境変数から読む。強制保持を部分保持より優先する。
+    pub(super) fn from_env() -> Self {
+        if crate::ai::v4::hold_line::forced::enabled() {
+            Self::Forced
+        } else if std::env::var("OPENWARS_V4_PARTIAL_HOLD_LINE").as_deref() == Ok("1") {
+            Self::Partial
+        } else {
+            Self::Off
+        }
+    }
+}
+
 /// 既存の兵種別候補・採点・所属を変えずに、各部隊の最良手を集める。
 /// 依存先を調べるための再帰的な採点や、未実行候補の評価イベント送信は行わない。
 fn evaluate_actions(
@@ -98,6 +171,7 @@ fn evaluate_actions(
     player_id: PlayerId,
     skip_entities: &HashSet<Entity>,
     permitted: Option<&HashSet<Entity>>,
+    hold_mode: LineHoldMode,
 ) -> EvaluatedActions {
     let (movable_units, occupancy) =
         movable_units_and_occupancy(world, player_id, skip_entities, permitted);
@@ -108,30 +182,397 @@ fn evaluate_actions(
     let squads = SquadRoles::for_small_map(world, player_id, manager);
     let tactical = TacticalBoard::observe(world, player_id, occupancy, squads);
     let board = SmallMapBoard::observe(world, tactical);
-    let actions = with_turn_distances(world, &board.tactical, |world, distances| {
-        movable_units
+    let joint_hold =
+        hold_mode == LineHoldMode::Forced && crate::ai::v4::hold_line::forced::with_batteries();
+    let battery_sites = if joint_hold {
+        forced_forward_battery_sites(world, &board.tactical)
+    } else {
+        Vec::new()
+    };
+    let (actions, forced) = with_turn_distances(world, &board.tactical, |world, distances| {
+        let hold = (hold_mode == LineHoldMode::Partial)
+            .then(|| first_hold_decision(world, &board, &movable_units, distances))
+            .flatten();
+        // 森への出発時期はマスごとに敵の到着手番から決める（forced_line_targets）。
+        let forced = (hold_mode == LineHoldMode::Forced)
+            .then(|| forced_line_targets(world, &board, &movable_units, distances));
+        let batteries = forced_battery_targets(
+            world,
+            &board.tactical,
+            &movable_units,
+            &battery_sites,
+            distances,
+        );
+        let actions = movable_units
             .into_iter()
             .filter_map(|entity| {
-                let unit = SmallMapUnit::observe(world, &board, entity, distances)?;
-                let (rank, command) =
-                    best_action_for_unit(world, &board, &unit, distances).into_inner()?;
-                let movement = execution_order::MovementIntent::observe(
-                    world, &board, &unit, &command, distances,
-                );
+                let mut unit = SmallMapUnit::observe(world, &board, entity, distances)?;
+                let holding = hold.filter(|hold| hold.unit() == entity);
+                let battery = batteries.get(&entity).copied();
+                let forced_target =
+                    battery.or_else(|| forced.as_ref().and_then(|f| f.get(&entity)).copied());
+                if let Some(hold) = holding {
+                    unit.restrict_to_hold(hold.target());
+                } else if let Some(target) = forced_target {
+                    unit.march_to_hold(&board, target, distances);
+                }
+                let best = best_action_for_unit(world, &board, &unit, distances)
+                    .into_inner()
+                    .or_else(|| {
+                        battery.and_then(|_| unit.wait_for_forced_battery(&board.tactical))
+                    });
+                if let Some(target) = forced_target {
+                    trace_forced_hold(world, player_id, || {
+                        format!(
+                            "evaluated unit={entity:?} target={target:?} stops={:?} command={:?}",
+                            unit.candidate_tiles,
+                            best.as_ref().map(|(_, command)| command)
+                        )
+                    });
+                }
+                let (rank, command) = best?;
+                // 保持側の処理は既に順序付き。退去依存の再探索で停止マスを上書きしない。
+                let movement = (holding.is_none() && forced_target.is_none())
+                    .then(|| {
+                        execution_order::MovementIntent::observe(
+                            world, &board, &unit, &command, distances,
+                        )
+                    })
+                    .flatten();
                 Some(EvaluatedAction {
                     entity,
                     origin: unit.state.position,
                     command,
                     rank,
                     movement,
+                    hold: holding,
+                    forced_target,
                 })
             })
-            .collect()
+            .collect();
+        (actions, forced)
     });
+    // 強制保持の割当は手番をまたいで引き継ぐため、評価のたびに記録し直す。
+    if let Some(assignments) = forced {
+        crate::ai::v4::hold_line::forced::store(world, player_id, assignments);
+    }
     EvaluatedActions {
         actions,
         board: board.tactical,
     }
+}
+
+/// 盤面上の敵地上部隊の位置（輸送中・航空・艦船は除く）。森マスへの出発合図に使う。
+fn enemy_ground_positions(world: &World, board: &TacticalBoard) -> HashSet<GridPosition> {
+    use crate::resources::MovementType;
+    board
+        .action_targets
+        .units()
+        .iter()
+        .filter(|enemy| enemy.faction != board.player_id && !enemy.is_transporting)
+        .filter(|enemy| {
+            world
+                .get::<crate::components::UnitStats>(enemy.entity)
+                .is_some_and(|stats| {
+                    !matches!(stats.movement_type, MovementType::Air | MovementType::Ship)
+                })
+        })
+        .map(|enemy| enemy.position)
+        .collect()
+}
+
+/// 陣地線の自陣側にある、最前列の所有済み都市を砲座として使う。
+fn forced_forward_battery_sites(world: &World, board: &TacticalBoard) -> Vec<GridPosition> {
+    let Some(line) = world
+        .get_resource::<planner::InitialHoldSites>()
+        .and_then(|sites| sites.line(board))
+    else {
+        return Vec::new();
+    };
+    let cities = board
+        .properties
+        .iter()
+        .filter_map(|(position, terrain, owner)| {
+            if *terrain != Terrain::City || !line.home.contains(position) {
+                return None;
+            }
+            let distance = line
+                .cells
+                .iter()
+                .map(|cell| board.map.distance(position.x, position.y, cell.x, cell.y))
+                .min()?;
+            Some((*position, distance, *owner == Some(board.player_id)))
+        })
+        .collect::<Vec<_>>();
+    crate::ai::v4::hold_line::forced::forward_battery_sites(&cities)
+}
+
+/// 砲を空き都市に一門ずつ割り当て、すでに布陣した砲には現位置を優先する。
+fn forced_battery_targets(
+    world: &World,
+    board: &TacticalBoard,
+    movable: &[Entity],
+    sites: &[GridPosition],
+    distances: &mut ApproachDistances,
+) -> std::collections::BTreeMap<Entity, GridPosition> {
+    use crate::ai::v4::hold_line::forced;
+    use crate::resources::UnitType;
+    if sites.is_empty() {
+        return Default::default();
+    }
+    let states = movable
+        .iter()
+        .filter_map(|&entity| UnitState::observe(world, board, entity))
+        .filter(|state| {
+            !state.combat_ineffective
+                && matches!(
+                    state.stats.unit_type,
+                    UnitType::Artillery
+                        | UnitType::LightSpGun
+                        | UnitType::HeavySpGun
+                        | UnitType::Rockets
+                )
+        })
+        .collect::<Vec<_>>();
+    let pool = states.iter().map(|state| state.entity).collect::<Vec<_>>();
+    let unavailable = HashSet::default();
+    forced::assign(
+        &Default::default(),
+        &forced::AssignInput {
+            line: sites,
+            unavailable: &unavailable,
+            pool: &pool,
+        },
+        |_| true,
+        |entity, site| {
+            let state = states.iter().find(|state| state.entity == entity)?;
+            if site != state.position && board.occupancy.contains_key(&(site.x, site.y)) {
+                return None;
+            }
+            let distance = distances.turns(&state.stats, state.position, site, 0);
+            Some((distance.turns, distance.used_mp))
+        },
+    )
+}
+
+/// 強制保持の経路・候補・命令を、診断を有効にした対局だけに記録する。
+fn trace_forced_hold(world: &World, player: PlayerId, message: impl FnOnce() -> String) {
+    if std::env::var("OPENWARS_TRACE_HOLD_LINE").as_deref() != Ok("1") {
+        return;
+    }
+    let turn = world
+        .resource::<crate::resources::MatchState>()
+        .current_turn_number
+        .0;
+    eprintln!("FORCED_HOLD turn={turn} player={} {}", player.0, message());
+}
+
+/// 強制保持の上限実験: 占領担当も含め、陣地線の空きマスに向かう兵の割当を更新する。
+/// 防衛・回復・輸送・出発待ちは従来どおり優先する。
+fn forced_line_targets(
+    world: &World,
+    board: &SmallMapBoard,
+    movable: &[Entity],
+    distances: &mut ApproachDistances,
+) -> std::collections::BTreeMap<Entity, GridPosition> {
+    use crate::ai::v4::hold_line::forced;
+    let tactical = &board.tactical;
+    let Some(line) = world
+        .get_resource::<planner::InitialHoldSites>()
+        .and_then(|sites| sites.line(tactical))
+    else {
+        trace_forced_hold(world, tactical.player_id, || "no_line".into());
+        return Default::default();
+    };
+    let previous = forced::previous(world, tactical.player_id);
+    let units = movable
+        .iter()
+        .filter_map(|&entity| SmallMapUnit::observe(world, board, entity, distances))
+        .collect::<Vec<_>>();
+    let pool_units = units
+        .iter()
+        .filter(|unit| is_line_holder(world, board, unit, LineHoldMode::Forced))
+        .collect::<Vec<_>>();
+    let pool = pool_units
+        .iter()
+        .map(|unit| unit.state.entity)
+        .collect::<Vec<_>>();
+    let pool_set = pool.iter().copied().collect::<HashSet<_>>();
+    let movable_set = movable.iter().copied().collect::<HashSet<_>>();
+    // 敵がいるマスと、保持対象でない味方（戦車・間接・占領中の兵など）がいるマスは割り当てない。
+    let unavailable = tactical
+        .action_targets
+        .units()
+        .iter()
+        .filter(|unit| {
+            !unit.is_transporting
+                && line.cells.contains(&unit.position)
+                && (unit.faction != tactical.player_id
+                    || !(pool_set.contains(&unit.entity) || previous.contains_key(&unit.entity)))
+        })
+        .map(|unit| unit.position)
+        .collect::<HashSet<_>>();
+    // 行動済みで今は動けない兵の割当は保持する。動ける兵は資格を失ったら外す。
+    let retained = |entity: Entity| {
+        world.get::<Health>(entity).is_some_and(|hp| hp.current > 0)
+            && (!movable_set.contains(&entity) || pool_set.contains(&entity))
+    };
+    let input = forced::AssignInput {
+        line: &line.cells,
+        unavailable: &unavailable,
+        pool: &pool,
+    };
+    // 敵地上部隊が入った・隣接したマスだけ、新たに出発させる。それまでは本来の仕事を続ける。
+    let enemies = enemy_ground_positions(world, tactical);
+    let contested = forced::contested_cells(&line.cells, &enemies, |cell| {
+        tactical
+            .map
+            .get_adjacent(cell.x, cell.y)
+            .into_iter()
+            .map(|(x, y)| GridPosition { x, y })
+            .collect()
+    });
+    let assignments = forced::assign(&previous, &input, retained, |entity, cell| {
+        if !contested.contains(&cell) {
+            return None;
+        }
+        let unit = pool_units.iter().find(|unit| unit.state.entity == entity)?;
+        let distance = distances.turns(&unit.state.stats, unit.state.position, cell, 0);
+        Some((distance.turns, distance.used_mp))
+    });
+    trace_forced_hold(world, tactical.player_id, || {
+        let infantry = units
+            .iter()
+            .filter(|unit| unit.state.stats.can_capture)
+            .map(|unit| {
+                let state = &unit.state;
+                (
+                    state.entity,
+                    (state.position.x, state.position.y),
+                    tactical.squads.mission(state.entity),
+                    unit.campaign
+                        .as_ref()
+                        .map(|c| (&c.mission_type, c.departure_authorized)),
+                    unit.is_capture_mission,
+                    unit.has_capture_target,
+                    unit.route.tactical_target.flatten().is_some()
+                        || unit.route.advance_destination.is_some(),
+                    state.combat_ineffective,
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "assign movable={} observed={} infantry={infantry:?} pool={pool:?} unavailable={unavailable:?} assignments={assignments:?} contested={contested:?}",
+            movable.len(),
+            units.len()
+        )
+    });
+    assignments
+}
+
+/// 攻撃Squadへの所属だけでは確約としない。出発待ち・占領・具体的な進軍指令は優先する。
+fn has_only_enemy_pursuit(
+    mission: Option<&MissionType>,
+    campaign: Option<(&MissionType, bool)>,
+    explicit_route: bool,
+    active_capture: bool,
+) -> bool {
+    !explicit_route
+        && !active_capture
+        && matches!(
+            mission,
+            None | Some(MissionType::Attack | MissionType::Reserve)
+        )
+        && campaign.is_none_or(|(kind, may_replace)| *kind == MissionType::Attack && may_replace)
+}
+
+/// 仮盤面で決めた順序の先頭だけを評価に渡す。実行後は次の実盤面から再計画する。
+fn first_hold_decision(
+    world: &World,
+    board: &SmallMapBoard,
+    movable: &[Entity],
+    distances: &mut ApproachDistances,
+) -> Option<HoldDecision> {
+    let units = movable
+        .iter()
+        .filter_map(|&entity| SmallMapUnit::observe(world, board, entity, distances))
+        .collect::<Vec<_>>();
+    // 行動済みでも契約は有効。正規の占領所属と未所有の合法目標を両方確認する。
+    // 通常攻撃Squadがたまたま指す敵施設を、将来の砲座とは見なさない。
+    let tactical = &board.tactical;
+    let capture_sites = tactical
+        .action_targets
+        .units()
+        .iter()
+        .filter_map(|unit| {
+            if unit.faction != tactical.player_id
+                || unit.is_transporting
+                || tactical.squads.mission(unit.entity) != Some(&MissionType::Capture)
+            {
+                return None;
+            }
+            let state = UnitState::observe(world, tactical, unit.entity)?;
+            if state.hp == 0 {
+                return None;
+            }
+            let target = crate::ai::v4::capital_route::tactical::capital_route_tactical_target(
+                world,
+                tactical.player_id,
+                unit.entity,
+            )
+            .flatten();
+            small_map_capture_target(world, board, &state, target)
+        })
+        .collect();
+    let holders = units
+        .iter()
+        .filter(|unit| is_line_holder(world, board, unit, LineHoldMode::Partial))
+        .map(|unit| EligibleHolder {
+            state: &unit.state,
+            stops: &unit.candidate_tiles,
+        })
+        .collect::<Vec<_>>();
+    planner::plan(world, &board.tactical, &holders, &capture_sites)
+        .first()
+        .copied()
+}
+
+/// 隣接攻撃と占領ができる健全な地上兵に限定し、任務の差し替え可否は保持モードで決める。
+fn is_line_holder(
+    world: &World,
+    board: &SmallMapBoard,
+    unit: &SmallMapUnit,
+    mode: LineHoldMode,
+) -> bool {
+    let state = &unit.state;
+    // 緊急迎撃は占領不可兵に限られ、首都防衛もこの戦術の呼び出し前に解決する。
+    let campaign = unit.campaign.as_ref().map(|context| {
+        (
+            &context.mission_type,
+            context.departure_authorized
+                && campaign_position_is_on_target_island(world, context, state.position),
+        )
+    });
+    state.stats.can_capture
+        && state.stats.min_range <= 1
+        && state.stats.max_range >= 1
+        && !state.combat_ineffective
+        && mode.allows_mission(
+            board.tactical.squads.mission(state.entity),
+            campaign,
+            unit.route.tactical_target.flatten().is_some()
+                || unit.route.advance_destination.is_some(),
+            unit.is_capture_mission || unit.has_capture_target,
+        )
+        && !matches!(
+            state.stats.movement_type,
+            crate::resources::MovementType::Air | crate::resources::MovementType::Ship
+        )
+        && !crate::ai::v4::capital_route::tactical::capital_route_is_recovering(
+            world,
+            board.tactical.player_id,
+            state.entity,
+        )
 }
 
 /// 小規模マップの行動選択で全unitが共有する盤面の事実。
@@ -295,6 +736,111 @@ struct SmallMapUnit {
 }
 
 impl SmallMapUnit {
+    fn restrict_to_hold(&mut self, target: GridPosition) {
+        // 移動・待機・移動後攻撃の入口をひとつの停止位置に絞る。
+        self.candidate_tiles
+            .retain(|&(x, y)| x == target.x && y == target.y);
+        self.retarget_to_hold(target);
+    }
+
+    /// 強制保持の上限実験: 保持マスに届くならそこで止まり、届かなければ保持マスまでの
+    /// ターン距離が最小の移動先だけを残す（移動後の攻撃は残した移動先から行える）。
+    /// 自軍生産口での待機は既存規則で禁止されるため、他に候補があれば生産口を除く。
+    fn march_to_hold(
+        &mut self,
+        board: &SmallMapBoard,
+        target: GridPosition,
+        distances: &mut ApproachDistances,
+    ) {
+        // 試験で選んだ兵は占領・進軍の戦術目標を保持目標へ差し替える。
+        self.route = RouteOrders {
+            tactical_target: None,
+            advance_destination: None,
+        };
+        self.is_capture_mission = false;
+        self.capture_contract = None;
+        self.has_capture_target = false;
+        let tactical = &board.tactical;
+        let state = &self.state;
+        let origin = (state.position.x, state.position.y);
+        self.candidate_tiles = calculate_reachable_tiles(
+            &tactical.map,
+            &tactical.occupancy,
+            origin,
+            state.stats.movement_type,
+            state.stats.max_movement,
+            state.fuel,
+            tactical.player_id,
+            state.stats.unit_type,
+            &tactical.registry,
+        )
+        .into_iter()
+        .filter(|tile| *tile == origin || !tactical.occupancy.contains_key(tile))
+        .collect();
+        (
+            self.has_non_production_wait_destination,
+            self.can_end_turn_off_production,
+        ) = production_exits(board, state, &self.candidate_tiles);
+        if self.candidate_tiles.contains(&(target.x, target.y)) {
+            self.restrict_to_hold(target);
+            return;
+        }
+        let off_production = self
+            .candidate_tiles
+            .iter()
+            .copied()
+            .filter(|&tile| !board.own_production.contains(tile))
+            .collect::<Vec<_>>();
+        let tiles = if off_production.is_empty() {
+            std::mem::take(&mut self.candidate_tiles)
+        } else {
+            off_production
+        };
+        let keyed = tiles
+            .into_iter()
+            .map(|(x, y)| {
+                let distance = distances.turns(&self.state.stats, GridPosition { x, y }, target, 0);
+                ((distance.turns, distance.used_mp), (x, y))
+            })
+            .collect::<Vec<_>>();
+        let best = keyed.iter().map(|(key, _)| *key).min();
+        self.candidate_tiles = keyed
+            .into_iter()
+            .filter(|(key, _)| Some(*key) == best)
+            .map(|(_, tile)| tile)
+            .collect();
+        self.retarget_to_hold(target);
+    }
+
+    /// 試験用の砲座では生産枠を空ける通常の待機制約よりも布陣を優先する。
+    /// ただしエンジンが待機を許す移動先だけを使う。
+    fn wait_for_forced_battery(&self, board: &TacticalBoard) -> Option<(Rank, AiCommand)> {
+        self.candidate_tiles.iter().find_map(|&(x, y)| {
+            let target_pos = GridPosition { x, y };
+            board
+                .action_targets
+                .action_targets_at(
+                    self.state.entity,
+                    &self.state.stats,
+                    target_pos,
+                    target_pos != self.state.position,
+                )
+                .can_wait
+                .then_some(((ActionPriority::Normal, 0), AiCommand::Wait { target_pos }))
+        })
+    }
+
+    /// 局地戦術の目標を保持マスへ差し替える。所属や出発許可は変えない。
+    fn retarget_to_hold(&mut self, target: GridPosition) {
+        self.squad_target = Some(target);
+        self.deployment_target = None;
+        self.has_offensive_mission = false;
+        if let Some(campaign) = &mut self.campaign {
+            // 局地戦術の敵追跡だけを差し替える。所属や出発許可は変えない。
+            campaign.target = Some(target);
+        }
+    }
+
     /// 必要な状態が欠けているunit、またはcampaign所属に具体Squadが無くDAGの実行区間も
     /// 持たないunit（作戦再構築へ戻す）は、この手番の候補にしない。
     fn observe(
@@ -1218,3 +1764,54 @@ fn prefer_fire_in_place(
 
 mod execution_order;
 pub(crate) mod squad_executor;
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    #[test]
+    fn forced_hold_can_reassign_an_infantry_capture_contract() {
+        let capture = MissionType::Capture;
+        let campaign = Some((&capture, true));
+        assert!(!LineHoldMode::Partial.allows_mission(Some(&capture), campaign, true, true));
+        assert!(LineHoldMode::Forced.allows_mission(Some(&capture), campaign, true, true));
+        assert!(!LineHoldMode::Forced.allows_mission(
+            Some(&MissionType::Defense),
+            None,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn hold_line_can_replace_only_unconstrained_pursuit() {
+        let attack = MissionType::Attack;
+        let capture = MissionType::Capture;
+        assert!(has_only_enemy_pursuit(
+            Some(&attack),
+            Some((&attack, true)),
+            false,
+            false
+        ));
+        assert!(!has_only_enemy_pursuit(
+            Some(&attack),
+            Some((&attack, false)),
+            false,
+            false
+        ));
+        assert!(!has_only_enemy_pursuit(
+            Some(&attack),
+            Some((&capture, true)),
+            false,
+            false
+        ));
+        assert!(!has_only_enemy_pursuit(Some(&attack), None, true, false));
+        assert!(!has_only_enemy_pursuit(Some(&attack), None, false, true));
+        assert!(!has_only_enemy_pursuit(
+            Some(&MissionType::Defense),
+            None,
+            false,
+            false
+        ));
+    }
+}

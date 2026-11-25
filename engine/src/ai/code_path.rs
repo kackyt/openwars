@@ -9,7 +9,7 @@
 //! （`deterministic_parallel` を参照）。
 
 use crate::ai::ai_version::AiVersion;
-use crate::ai::strategy_profile::{V4StrategyProfile, profile_for};
+use crate::ai::strategy_profile::{V4StrategyProfile, inspect_profile, profile_for};
 use crate::collections::HashSet;
 use crate::components::PlayerId;
 use bevy_ecs::prelude::{Res, Resource, World};
@@ -47,13 +47,21 @@ pub struct CodePathRegistry {
     extended_players: HashSet<PlayerId>,
 }
 
+fn allows_extended(profile: V4StrategyProfile) -> bool {
+    profile == V4StrategyProfile::SmallMapExpansion
+        && std::env::var_os("OPENWARS_FORCE_MAIN").is_none()
+}
+
+/// 台帳を更新せずに、小規模マップ専用の経路を選ぶかを確認する。
+pub(crate) fn would_use_extended(world: &World, player_id: PlayerId) -> bool {
+    crate::ai::resolve_player_ai_version(world, player_id) == AiVersion::V4
+        && allows_extended(inspect_profile(world, player_id))
+}
+
 /// プレイヤーのAIバージョンと盤面から実装経路を決め、台帳へ記録する。
 pub fn for_player(world: &mut World, player_id: PlayerId) -> CodePath {
     let is_v4 = crate::ai::resolve_player_ai_version(world, player_id) == AiVersion::V4;
-    if is_v4
-        && profile_for(world, player_id) == V4StrategyProfile::SmallMapExpansion
-        && std::env::var_os("OPENWARS_FORCE_MAIN").is_none()
-    {
+    if is_v4 && allows_extended(profile_for(world, player_id)) {
         world
             .get_resource_or_insert_with(CodePathRegistry::default)
             .extended_players

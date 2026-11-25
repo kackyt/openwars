@@ -538,6 +538,12 @@ impl OpenWarsAiServer {
                 None,
             );
 
+            // 陣地線の診断は両軍とも移動・生産する前の、当該プレイヤーの手番開始盤面を使う。
+            let hold_line = (std::env::var("OPENWARS_TRACE_HOLD_LINE").as_deref() == Ok("1"))
+                .then(|| {
+                    engine::ai::v4::hold_line_diagnostics_for_player(&state.world, active_player_id)
+                })
+                .flatten();
             let mut actions_taken = vec![];
             let mut invasion_events = vec![];
             let mut step = 0usize;
@@ -642,7 +648,7 @@ impl OpenWarsAiServer {
                 None,
             );
 
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "actions_taken": actions_taken,
                 "invasion_events": invasion_events,
                 "transport_squads": transport_squads,
@@ -662,8 +668,11 @@ impl OpenWarsAiServer {
                 "after_score": after_metrics.total_score,
                 "before_metrics": before_metrics,
                 "after_metrics": after_metrics
-            })
-            .to_string())
+            });
+            if let Some(hold_line) = hold_line {
+                result["hold_line"] = hold_line;
+            }
+            Ok(result.to_string())
         } else {
             Err("Map not loaded".into())
         }

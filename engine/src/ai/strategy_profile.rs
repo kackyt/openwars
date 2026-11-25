@@ -41,13 +41,27 @@ impl V4StrategyProfileRegistry {
     }
 }
 
-/// ターン開始時に決めたプロファイルを返す。未決定なら盤面構造から一度だけ確定する。
-pub fn profile_for(world: &mut World, player_id: crate::components::PlayerId) -> V4StrategyProfile {
-    if let Some(profile) = world
+fn cached_profile(
+    world: &World,
+    player_id: crate::components::PlayerId,
+) -> Option<V4StrategyProfile> {
+    world
         .get_resource::<V4StrategyProfileRegistry>()
         .and_then(|registry| registry.profiles.get(&player_id))
         .copied()
-    {
+}
+
+/// 診断用にプロファイルを読む。初手でも経路を識別できるが、台帳には記録しない。
+pub(crate) fn inspect_profile(
+    world: &World,
+    player_id: crate::components::PlayerId,
+) -> V4StrategyProfile {
+    cached_profile(world, player_id).unwrap_or_else(|| classify_profile(world))
+}
+
+/// ターン開始時に決めたプロファイルを返す。未決定なら盤面構造から一度だけ確定する。
+pub fn profile_for(world: &mut World, player_id: crate::components::PlayerId) -> V4StrategyProfile {
+    if let Some(profile) = cached_profile(world, player_id) {
         return profile;
     }
 

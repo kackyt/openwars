@@ -195,6 +195,8 @@ def write_trace_jsonl(path, results):
             record["actions"] = entry.get("actions")
             record["transport_squads"] = entry.get("transport_squads", [])
             record["loaded_transports"] = entry.get("loaded_transports", [])
+            if "hold_line" in entry:
+                record["hold_line"] = entry["hold_line"]
 
         # 欠測（V1〜V3 は生産トレースを持たない）を挟んでも順序が崩れないよう -1 で埋める。
         for key in sorted(
@@ -564,6 +566,10 @@ def run_single_game(
                 ],
             }
         )
+        # 手番開始時の診断は、同じ手番の行動と併せて保存する。
+        hold_line = ai_result.get("hold_line")
+        if hold_line is not None:
+            action_history[-1]["hold_line"] = hold_line
         acts_dict = defaultdict(int)
         for action in actions:
             action_str = str(action)

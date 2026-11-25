@@ -129,6 +129,29 @@ impl AiTacticalSnapshot {
         }
     }
 
+    /// 仮盤面でも実盤面と同じ武器規則で、指定兵種を撃てるか調べる。
+    pub(crate) fn can_hit_type(
+        &self,
+        attacker: Entity,
+        target: UnitType,
+        distance: u32,
+        moved: bool,
+    ) -> bool {
+        let Some(unit) = self.unit_indices.get(&attacker).map(|&i| self.units[i]) else {
+            return false;
+        };
+        let Some((primary, secondary)) = self.weapons.get(&unit.unit_type) else {
+            return false;
+        };
+        [(primary, unit.ammo1), (secondary, unit.ammo2)]
+            .into_iter()
+            .any(|(weapon, ammo)| {
+                weapon.as_ref().is_some_and(|record| {
+                    attack_weapon_rejection(record, target, ammo, distance, moved).is_none()
+                })
+            })
+    }
+
     pub(crate) fn action_targets_at(
         &self,
         attacker: Entity,
@@ -228,18 +251,7 @@ impl AiTacticalSnapshot {
                         (target.position.x, target.position.y),
                     );
                     let mut weapon_can_attack = |weapon: &WeaponRecord, ammo: u32, slot: &str| {
-                        // 元のANDの順序を維持し、最初に実際に落ちた条件だけを記録する。
-                        let reason = if weapon.damages.get(target.unit_type.as_str()).copied().unwrap_or(0) == 0 {
-                            Some("attack_weapon_zero_damage")
-                        } else if ammo == 0 {
-                            Some("attack_weapon_no_ammo")
-                        } else if distance > 1 && is_moved {
-                            Some("attack_ranged_after_move")
-                        } else if distance < weapon.range_min {
-                            Some("attack_inside_min_range")
-                        } else if distance > weapon.range_max {
-                            Some("attack_outside_max_range")
-                        } else { None };
+                        let reason = attack_weapon_rejection(weapon, target.unit_type, ammo, distance, is_moved);
                         if let Some(reason) = reason {
                             if let Some(p) = probe.as_deref_mut() {
                                 p.reject(reason, position, || serde_json::json!({"target_id":target.entity.to_bits(),
@@ -267,6 +279,29 @@ impl AiTacticalSnapshot {
             can_repair: !is_occupied_by_other && can_repair,
             can_wait: !is_occupied_by_other || !is_moved,
         }
+    }
+}
+
+/// 元の判定順を共有し、診断では最初に落ちた条件を返す。
+fn attack_weapon_rejection(
+    weapon: &WeaponRecord,
+    target: UnitType,
+    ammo: u32,
+    distance: u32,
+    moved: bool,
+) -> Option<&'static str> {
+    if weapon.damages.get(target.as_str()).copied().unwrap_or(0) == 0 {
+        Some("attack_weapon_zero_damage")
+    } else if ammo == 0 {
+        Some("attack_weapon_no_ammo")
+    } else if distance > 1 && moved {
+        Some("attack_ranged_after_move")
+    } else if distance < weapon.range_min {
+        Some("attack_inside_min_range")
+    } else if distance > weapon.range_max {
+        Some("attack_outside_max_range")
+    } else {
+        None
     }
 }
 

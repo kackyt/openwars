@@ -159,6 +159,10 @@ pub(in crate::ai::v4) fn commit_turn_production(
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
 /// true のときだけ委譲される。V1/V2/V3 の経路には一切影響しない。
 pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
+    // 診断用: 環境変数で購入列を指定したときだけ、その列をそのまま発行する。
+    if let Some(commands) = forced_production::forced_purchases(world, player_id) {
+        return commands;
+    }
     let policy = ProductionPolicy::for_current_path();
     let turn = world
         .get_resource::<crate::resources::MatchState>()

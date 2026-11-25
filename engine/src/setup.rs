@@ -215,6 +215,9 @@ pub fn initialize_world_from_master_data_with_topology(
     let island_map = crate::ai::islands::IslandMap::analyze(&ecs_map);
     world.insert_resource(ecs_map);
     world.insert_resource(island_map);
+    // 陣地線は占領後の所有ではなく、初期生産拠点を端点にする。
+    let initial_hold_sites = crate::ai::v4::hold_line::planner::InitialHoldSites::observe(&world);
+    world.insert_resource(initial_hold_sites);
 
     let mut player_list = vec![];
     // P1, P2 は最低限保証
