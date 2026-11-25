@@ -10,6 +10,7 @@ use crate::systems::movement::{OccupantInfo, get_valid_movement_cost};
 use bevy_ecs::prelude::World;
 use serde_json::{Value, json};
 
+pub(crate) mod fire_support;
 pub(crate) mod forced;
 pub(crate) mod planner;
 pub(crate) mod terrain;

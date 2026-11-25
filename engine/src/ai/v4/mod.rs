@@ -21,6 +21,7 @@ pub mod campaign_execution;
 mod candidate;
 mod combat_input;
 mod combat_profile;
+pub(crate) mod demand_value;
 pub mod deployment;
 mod forced_production;
 pub(crate) mod forming_capture;
