@@ -154,6 +154,23 @@ pub(in crate::ai::v4) fn commit_turn_production(
     issue_from_turn_plan(world, turn, turn_plan)
 }
 
+/// 診断用: 購入命令の組を共通の点数 f で測って出力する（`OPENWARS_F_TRACE=1` のときだけ）。
+fn trace_f(world: &World, player_id: PlayerId, label: &str, commands: &[ProduceUnitCommand]) {
+    let picks: Vec<_> = commands
+        .iter()
+        .map(|command| {
+            (
+                command.unit_type,
+                crate::components::GridPosition {
+                    x: command.target_x,
+                    y: command.target_y,
+                },
+            )
+        })
+        .collect();
+    super::demand_value::trace::trace_purchases(world, player_id, label, &picks);
+}
+
 /// V4 の生産意思決定エントリポイント。
 ///
 /// `decide_production` から `AiVersion::uses_operation_driven_production()` が
@@ -161,6 +178,9 @@ pub(in crate::ai::v4) fn commit_turn_production(
 pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<ProduceUnitCommand> {
     // 診断用: 環境変数で購入列を指定したときだけ、その列をそのまま発行する。
     if let Some(commands) = forced_production::forced_purchases(world, player_id) {
+        if !commands.is_empty() {
+            trace_f(world, player_id, "forced", &commands);
+        }
         return commands;
     }
     let policy = ProductionPolicy::for_current_path();
@@ -294,6 +314,10 @@ pub fn decide_production_v4(world: &mut World, player_id: PlayerId) -> Vec<Produ
         )
     };
     plan_trace.enemy_production_forecast = enemy_production_forecast;
+    if super::demand_value::trace::enabled() {
+        let commands: Vec<_> = planned.iter().map(|plan| plan.command.clone()).collect();
+        trace_f(world, player_id, "v4", &commands);
+    }
     if policy.uses_joint_capture() {
         world.insert_resource(contract_registry);
     }

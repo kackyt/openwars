@@ -17,8 +17,10 @@ use std::collections::BinaryHeap;
 use crate::collections::{HashMap, HashSet};
 use crate::components::GridPosition;
 
+pub(crate) mod board;
 #[cfg(test)]
 mod tests;
+pub(crate) mod trace;
 
 /// 資金換算の価値。損（負の値）も表せる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -104,6 +106,22 @@ pub(crate) struct Candidate {
     pub(crate) timing: ServiceTiming,
     /// 道中で敵の攻撃圏を通る場合の期待損害。
     pub(crate) transit_loss: FundsValue,
+    /// この手番を最後にマスを離れる（占領のように用が済めば空ける部隊）。`None` なら需要の終端までとどまる。
+    ///
+    /// 指定した場合、占有区間のどこかが既に使用中なら需要を満たせない（追加価値 0）。
+    pub(crate) release_after: Option<u32>,
+}
+
+impl Candidate {
+    /// とどまるマスを使う区間 `[occupy_from, min(release_after, 需要の終端)]`。
+    fn occupancy(&self, demand: &Demand) -> TurnWindow {
+        TurnWindow {
+            start: self.timing.occupy_from,
+            end: self
+                .release_after
+                .map_or(demand.window.end, |last| last.min(demand.window.end)),
+        }
+    }
 }
 
 /// 確定済みの占有と、需要ごとに満たし済みの手番の記録。
@@ -121,16 +139,10 @@ impl Ledger {
         }
     }
 
-    /// 候補を確定する: とどまるマスを `[occupy_from, 需要の終端]` で占有し、
+    /// 候補を確定する: とどまるマスを占有区間（既定は `[occupy_from, 需要の終端]`）で占有し、
     /// 需要の `[max(serve_from, 需要の始端), 需要の終端]` を満たし済みにする。
     pub(crate) fn commit(&mut self, demand: &Demand, candidate: &Candidate) {
-        self.claim_cell(
-            candidate.occupy,
-            TurnWindow {
-                start: candidate.timing.occupy_from,
-                end: demand.window.end,
-            },
-        );
+        self.claim_cell(candidate.occupy, candidate.occupancy(demand));
         let served = service_window(demand, candidate);
         if served.start <= served.end {
             self.served.entry(demand.id).or_default().push(served);
@@ -141,14 +153,15 @@ impl Ledger {
 /// 候補を今の記録に追加したときの価値（追加価値）。
 ///
 /// ```text
+/// 占有区間   = [occupy_from, min(release_after, 需要の終端)]（release_after が無ければ需要の終端まで）
 /// 満たす手番 = [max(serve_from, 需要の始端), 需要の終端] のうち、
-///              とどまるマスが空いていて、需要がまだ満たされていない手番
-/// 塞ぐ手番   = [occupy_from, 需要の終端] のうち、購入手番より後で、とどまるマスが空いている手番
+///              占有区間内ならとどまるマスが空いていて、需要がまだ満たされていない手番
+/// 塞ぐ手番   = 占有区間のうち、購入手番より後で、とどまるマスが空いている手番
 /// 価値 = per_turn × 満たす手番数 − 塞ぐコスト(マス) × 塞ぐ手番数 − transit_loss
 /// ```
 ///
 /// `production_block_per_turn` は生産施設のマスを1手番塞ぐごとに失う価値（生産施設でないマスは含めない）。
-/// 部隊は需要の終端までそのマスにとどまるものとして数える。
+/// `release_after` を持つ候補は、占有区間のどこかが既に使用中なら 0 を返す。
 pub(crate) fn marginal_value(
     demand: &Demand,
     candidate: &Candidate,
@@ -171,10 +184,20 @@ fn evaluate(
     ledger: &Ledger,
     production_block_per_turn: &HashMap<GridPosition, FundsValue>,
 ) -> (FundsValue, FundsValue) {
-    let cells = ledger
+    let occupancy = candidate.occupancy(demand);
+    // とどまるマスの使用中区間のうち、この候補が実際にマスを使う区間に重なる部分だけを見る。
+    let cells: Vec<TurnWindow> = ledger
         .cells
         .get(&candidate.occupy)
-        .map_or(&[][..], Vec::as_slice);
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|claim| claim.intersect(occupancy))
+        .filter(|claim| claim.start <= claim.end)
+        .collect();
+    if candidate.release_after.is_some() && !cells.is_empty() {
+        // 用が済めば空ける部隊（占領など）は、途中でマスを使えないと需要を満たせない。
+        return (FundsValue(0), FundsValue(0));
+    }
     let served = ledger.served.get(&demand.id).map_or(&[][..], Vec::as_slice);
     let served_turns = free_turns(
         service_window(demand, candidate),
@@ -189,7 +212,7 @@ fn evaluate(
         free_turns(
             TurnWindow {
                 start: candidate.timing.occupy_from.max(candidate.buy_turn + 1),
-                end: demand.window.end,
+                end: occupancy.end,
             },
             cells.iter(),
         )

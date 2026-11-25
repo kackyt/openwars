@@ -48,6 +48,7 @@ fn rocket(
         occupy: site,
         timing: ServiceTiming::indirect_fire(buy_turn, travel_turns),
         transit_loss: FundsValue(0),
+        release_after: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn holder(demand: &Demand, facility: GridPosition, cell: GridPosition, buy_turn:
         occupy: cell,
         timing: ServiceTiming::occupy(buy_turn, 1),
         transit_loss: FundsValue(0),
+        release_after: None,
     }
 }
 
@@ -411,4 +413,45 @@ fn upper_bound_is_never_below_the_greedy_result() {
         "bound={bound:?} greedy={:?}",
         best.total
     );
+}
+
+// ---- 用が済めば空ける部隊（占領） ----
+
+/// 前線都市 (3,5) を T2 に買った歩兵で占領する候補（T3 着、T3〜T4 で占領、T5 から収入）。
+fn capture(need: &Demand) -> Candidate {
+    Candidate {
+        demand: need.id,
+        facility: cell(4, 5),
+        cost: INFANTRY_COST,
+        buy_turn: 2,
+        occupy: cell(3, 5),
+        timing: ServiceTiming {
+            occupy_from: 3,
+            serve_from: 5,
+        },
+        transit_loss: FundsValue(0),
+        release_after: Some(4),
+    }
+}
+
+#[test]
+fn a_released_cell_can_take_a_battery_afterwards() {
+    let income = demand(20, 0, LAST_TURN, 100);
+    let mut ledger = Ledger::default();
+    // 占領の価値: T5〜T30 の 26 手番の収入。
+    assert_eq!(value_of(&income, &capture(&income), &ledger), 2600);
+    ledger.commit(&income, &capture(&income));
+    // 占領後の T5 以降は (3,5) が空くので、T5 に着いて T6 から撃つ砲は 25 手番分の価値がある。
+    let need = forest_cover();
+    let battery = rocket(&need, cell(4, 5), cell(3, 5), 4, 1);
+    assert_eq!(value_of(&need, &battery, &ledger), 2500);
+}
+
+#[test]
+fn a_capture_is_impossible_while_its_cell_is_in_use() {
+    let income = demand(20, 0, LAST_TURN, 100);
+    let mut ledger = Ledger::default();
+    // 占領の途中 T4 に別の部隊がそのマスにいる。
+    ledger.claim_cell(cell(3, 5), window(4, 4));
+    assert_eq!(value_of(&income, &capture(&income), &ledger), 0);
 }

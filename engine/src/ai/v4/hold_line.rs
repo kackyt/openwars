@@ -412,3 +412,17 @@ pub fn hold_line_diagnostics_for_player(world: &World, player_id: PlayerId) -> O
         "tiles": tiles,
     }))
 }
+
+/// 敵の地上部隊（首都からの増援を含む）が各マスへ着くまでの手番数の最小値。
+///
+/// 陣地線の診断と同じ見積もり（総移動コスト÷移動力の近似）を、需要の有効期間の始端に使う。
+pub(crate) fn enemy_ground_arrivals(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<HashMap<GridPosition, u32>> {
+    let map = world.get_resource::<Map>()?;
+    let master = world.get_resource::<MasterDataRegistry>()?;
+    let board = GroundBoard::collect(world, player_id, master)?;
+    let [_, theirs] = board.arrivals(map, master, player_id);
+    Some(theirs)
+}
