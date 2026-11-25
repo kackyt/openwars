@@ -389,9 +389,35 @@ fn forced_line_targets(
         .iter()
         .filter_map(|&entity| SmallMapUnit::observe(world, board, entity, distances))
         .collect::<Vec<_>>();
+    // 占領中（捕獲ポイントが減っている拠点の上）の兵は森へ引き抜かない。
+    let capturing_sites: HashSet<GridPosition> = world
+        .iter_entities()
+        .filter_map(|entity| {
+            let pos = entity.get::<GridPosition>()?;
+            let prop = entity.get::<crate::components::Property>()?;
+            forced::is_capturing_in_progress(
+                prop.owner_id,
+                tactical.player_id,
+                prop.capture_points,
+                prop.max_capture_points,
+            )
+            .then_some(*pos)
+        })
+        .collect();
+    let owned_front_cities: HashSet<GridPosition> = forced_forward_battery_sites(world, tactical)
+        .into_iter()
+        .collect();
     let pool_units = units
         .iter()
-        .filter(|unit| is_line_holder(world, board, unit, LineHoldMode::Forced))
+        .filter(|unit| {
+            let has_capture_duty = unit.is_capture_mission || unit.has_capture_target;
+            forced::can_hold_line_in_forced_mode(
+                capturing_sites.contains(&unit.state.position),
+                previous.contains_key(&unit.state.entity),
+                owned_front_cities.contains(&unit.state.position),
+                has_capture_duty,
+            ) && is_line_holder(world, board, unit, LineHoldMode::Forced)
+        })
         .collect::<Vec<_>>();
     let pool = pool_units
         .iter()
@@ -423,6 +449,7 @@ fn forced_line_targets(
         pool: &pool,
     };
     // 敵地上部隊が入った・隣接したマスだけ、新たに出発させる。それまでは本来の仕事を続ける。
+    // ただし所有済みの前線都市上にいる歩兵（占領完了・前線生産）は線へ解放する。
     let enemies = enemy_ground_positions(world, tactical);
     let contested = forced::contested_cells(&line.cells, &enemies, |cell| {
         tactical
@@ -433,10 +460,11 @@ fn forced_line_targets(
             .collect()
     });
     let assignments = forced::assign(&previous, &input, retained, |entity, cell| {
-        if !contested.contains(&cell) {
+        let unit = pool_units.iter().find(|unit| unit.state.entity == entity)?;
+        let on_owned_front_city = owned_front_cities.contains(&unit.state.position);
+        if !contested.contains(&cell) && !on_owned_front_city {
             return None;
         }
-        let unit = pool_units.iter().find(|unit| unit.state.entity == entity)?;
         let distance = distances.turns(&unit.state.stats, unit.state.position, cell, 0);
         Some((distance.turns, distance.used_mp))
     });
@@ -733,6 +761,8 @@ struct SmallMapUnit {
     support_destination: Option<GridPosition>,
     /// 戦闘不能unitが向かえる回復拠点（修理滞在中の味方がいる拠点を除く）。
     repair_sites: Vec<GridPosition>,
+    /// 強制保持（または砲座配置）の行軍中。移動途中の占領に横取りされない。
+    is_forced_hold: bool,
 }
 
 impl SmallMapUnit {
@@ -753,6 +783,7 @@ impl SmallMapUnit {
         distances: &mut ApproachDistances,
     ) {
         // 試験で選んだ兵は占領・進軍の戦術目標を保持目標へ差し替える。
+        self.is_forced_hold = true;
         self.route = RouteOrders {
             tactical_target: None,
             advance_destination: None,
@@ -1018,6 +1049,7 @@ impl SmallMapUnit {
             can_end_turn_off_production,
             support_destination,
             repair_sites,
+            is_forced_hold: false,
         })
     }
 }
@@ -1380,7 +1412,8 @@ fn consider_capture(
     tile: &TileCandidate,
     best: &mut BestAction,
 ) {
-    if !tile.actions.can_capture
+    if unit.is_forced_hold
+        || !tile.actions.can_capture
         || !crate::ai::v4::capital_route::tactical::capital_route_allows_capture_at(
             world,
             board.tactical.player_id,
@@ -1613,23 +1646,24 @@ fn consider_wait(
     if !holds_blockade && tile.blockade.starts_on_site && !state.combat_ineffective {
         score -= tile.blockade.site_value as i32 * 2;
     }
-    let moves_away_from_campaign = unit.campaign.as_ref().is_some_and(|context| {
-        if tile.is_stationary
-            || (repair_site.is_some() && state.combat_ineffective)
-            || holds_blockade
-        {
-            return false;
-        }
-        unit.route
-            .tactical_target
-            .flatten()
-            .or(context.target)
-            .is_none_or(|target| {
-                distances
-                    .target_progress(&state.stats, state.position, tile.position, target, 0)
-                    .moves_away()
-            })
-    });
+    let moves_away_from_campaign = !unit.is_forced_hold
+        && unit.campaign.as_ref().is_some_and(|context| {
+            if tile.is_stationary
+                || (repair_site.is_some() && state.combat_ineffective)
+                || holds_blockade
+            {
+                return false;
+            }
+            unit.route
+                .tactical_target
+                .flatten()
+                .or(context.target)
+                .is_none_or(|target| {
+                    distances
+                        .target_progress(&state.stats, state.position, tile.position, target, 0)
+                        .moves_away()
+                })
+        });
     if moves_away_from_campaign {
         return;
     }

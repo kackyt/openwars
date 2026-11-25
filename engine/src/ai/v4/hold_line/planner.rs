@@ -52,17 +52,26 @@ impl InitialHoldSites {
     }
 
     pub(crate) fn line(&self, board: &TacticalBoard) -> Option<&TerrainLine> {
+        self.line_for(board.player_id, &board.map, &board.registry)
+    }
+
+    pub(crate) fn line_for(
+        &self,
+        player_id: PlayerId,
+        map: &Map,
+        registry: &MasterDataRegistry,
+    ) -> Option<&TerrainLine> {
         self.lines
-            .get(&board.player_id)?
+            .get(&player_id)?
             .get_or_init(|| {
-                let ours = self.sites.get(&board.player_id)?;
+                let ours = self.sites.get(&player_id)?;
                 let theirs = self
                     .sites
                     .iter()
-                    .filter(|(id, _)| **id != board.player_id)
+                    .filter(|(id, _)| **id != player_id)
                     .flat_map(|(_, positions)| positions.iter().copied())
                     .collect::<Vec<_>>();
-                select_terrain_line(&board.map, &board.registry, ours, &theirs)
+                select_terrain_line(map, registry, ours, &theirs)
             })
             .as_ref()
     }

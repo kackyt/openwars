@@ -53,6 +53,63 @@ pub(crate) fn forward_battery_sites(cities: &[(GridPosition, u32, bool)]) -> Vec
         .collect()
 }
 
+/// 自陣側で陣地線に最も近い距離にある都市（前線都市）の集合を返す。
+/// 所有・未所有を問わずに最小距離を決めることで、未占領の間も前線都市だけを選べる。
+pub(crate) fn front_cities(cities: &[(GridPosition, u32)]) -> HashSet<GridPosition> {
+    let Some(nearest) = cities.iter().map(|(_, distance)| *distance).min() else {
+        return HashSet::default();
+    };
+    cities
+        .iter()
+        .filter(|(_, distance)| *distance == nearest)
+        .map(|(pos, _)| *pos)
+        .collect()
+}
+
+/// 強制保持時の占領目標順: 前線都市を先に並べ、それぞれ最寄りの歩兵が近い順に並べる。
+pub(crate) fn sort_capture_targets_front_first(
+    targets: &mut [GridPosition],
+    front_cities: &HashSet<GridPosition>,
+    nearest_infantry_distance: impl Fn(GridPosition) -> usize,
+) {
+    targets.sort_unstable_by_key(|target| {
+        (
+            !front_cities.contains(target),
+            nearest_infantry_distance(*target),
+            target.y,
+            target.x,
+        )
+    });
+}
+
+/// 占領中の拠点上か（未所有かつ捕獲ポイントが最大値より減っている）。
+pub(crate) fn is_capturing_in_progress(
+    owner_id: Option<PlayerId>,
+    player_id: PlayerId,
+    capture_points: u32,
+    max_capture_points: u32,
+) -> bool {
+    owner_id != Some(player_id) && capture_points < max_capture_points
+}
+
+/// 強制保持で陣地線への割当対象にしてよいか。
+///
+/// - 占領中の拠点上の兵は引き抜かない。
+/// - すでに陣地線へ割当済みの兵は、次手番に占領任務を再付与されても維持する。
+/// - 所有済み前線都市の上にいる兵（占領完了・前線生産）は線へ解放する。
+/// - それ以外の場所で占領任務を持つ兵は、占領完了を優先し引き抜かない。
+pub(crate) fn can_hold_line_in_forced_mode(
+    capturing_in_progress: bool,
+    already_assigned: bool,
+    on_owned_front_city: bool,
+    has_capture_duty: bool,
+) -> bool {
+    if capturing_in_progress {
+        return false;
+    }
+    already_assigned || on_owned_front_city || !has_capture_duty
+}
+
 /// プレイヤーごとの「兵 → 保持マス」の割当。手番をまたいで同じ兵に同じマスを持たせ続ける。
 #[derive(Resource, Default)]
 pub(crate) struct ForcedLineHold {
@@ -251,5 +308,53 @@ mod tests {
         };
         let result = assign(&BTreeMap::new(), &input, |_| true, |_, _| None);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn 前線都市を先に並べその中を最寄り歩兵の距離順にする() {
+        // y=5 が前線都市（距離2）、y=3 が後方都市（距離4）。歩兵は中央 (5,4) 付近にいる想定。
+        let front = front_cities(&[
+            (cell(1, 5), 2),
+            (cell(5, 5), 2),
+            (cell(9, 5), 2),
+            (cell(5, 3), 4),
+        ]);
+        assert!(front.contains(&cell(1, 5)));
+        assert!(front.contains(&cell(5, 5)));
+        assert!(front.contains(&cell(9, 5)));
+        assert!(!front.contains(&cell(5, 3)));
+
+        let mut targets = vec![cell(5, 3), cell(9, 5), cell(1, 5), cell(5, 5)];
+        let infantry = cell(5, 4);
+        sort_capture_targets_front_first(&mut targets, &front, |target| {
+            infantry.x.abs_diff(target.x) + infantry.y.abs_diff(target.y)
+        });
+        // 後方都市 (5,3) は歩兵に近くても前線都市より後ろ。前線都市の中では中央 (5,5) が先頭。
+        assert_eq!(targets[0], cell(5, 5));
+        assert_eq!(targets[3], cell(5, 3));
+    }
+
+    #[test]
+    fn 占領中の拠点は未所有かつ捕獲ポイント減少で判定する() {
+        let me = PlayerId(2);
+        let enemy = PlayerId(1);
+        assert!(is_capturing_in_progress(None, me, 10, 20));
+        assert!(is_capturing_in_progress(Some(enemy), me, 10, 20));
+        assert!(!is_capturing_in_progress(None, me, 20, 20));
+        assert!(!is_capturing_in_progress(Some(me), me, 10, 20));
+    }
+
+    #[test]
+    fn 占領任務中の兵は引き抜かず_前線都市の兵と割当済みの兵だけを線に向ける() {
+        // 占領中（捕獲ポイント減少）は常に不可
+        assert!(!can_hold_line_in_forced_mode(true, true, true, true));
+        // 占領任務を持って移動中の兵は引き抜かない
+        assert!(!can_hold_line_in_forced_mode(false, false, false, true));
+        // 所有済み前線都市上の兵は占領任務があっても解放する
+        assert!(can_hold_line_in_forced_mode(false, false, true, true));
+        // すでに線へ割当済みの兵は、占領任務を再付与されても維持する
+        assert!(can_hold_line_in_forced_mode(false, true, false, true));
+        // 占領任務のないフリー歩兵は対象になる
+        assert!(can_hold_line_in_forced_mode(false, false, false, false));
     }
 }

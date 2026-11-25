@@ -40,6 +40,53 @@ pub(super) fn sort_small_map_capture_targets(
         super::formation::sort_capture_targets_by_nearest_infantry(targets, context);
         return;
     }
+    if crate::ai::v4::hold_line::forced::enabled() {
+        let city_positions: Vec<GridPosition> = {
+            let mut properties = world.query::<(&GridPosition, &Property)>();
+            properties
+                .iter(world)
+                .filter(|(_, property)| property.terrain == Terrain::City)
+                .map(|(position, _)| *position)
+                .collect()
+        };
+        if let Some(line) = world
+            .get_resource::<crate::ai::v4::hold_line::planner::InitialHoldSites>()
+            .and_then(|sites| sites.line_for(player, context.map, context.registry))
+        {
+            let cities = city_positions
+                .into_iter()
+                .filter_map(|pos| {
+                    if !line.home.contains(&pos) {
+                        return None;
+                    }
+                    let distance = line
+                        .cells
+                        .iter()
+                        .map(|cell| context.map.distance(pos.x, pos.y, cell.x, cell.y))
+                        .min()?;
+                    Some((pos, distance))
+                })
+                .collect::<Vec<_>>();
+            let front_cities = crate::ai::v4::hold_line::forced::front_cities(&cities);
+            if !front_cities.is_empty() {
+                crate::ai::v4::hold_line::forced::sort_capture_targets_front_first(
+                    targets,
+                    &front_cities,
+                    |target| {
+                        context
+                            .infantry
+                            .iter()
+                            .map(|(_, pos, _)| {
+                                context.map.distance(pos.x, pos.y, target.x, target.y) as usize
+                            })
+                            .min()
+                            .unwrap_or(usize::MAX)
+                    },
+                );
+                return;
+            }
+        }
+    }
     let enemy_capital = {
         let mut properties = world.query::<(&GridPosition, &Property)>();
         properties.iter(world).find_map(|(position, property)| {
