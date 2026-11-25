@@ -1,4 +1,43 @@
-# Handoff: map_42 後攻 V4 — 前線都市優先・占領優先・間接火力連携（強制上限実験）
+# Handoff: V4 需要ベース生産（Step 2 途中）
+
+**Updated**: 2026-11-25
+**Branch**: `claude/zealous-pascal-4qbfjq`（`feature/v4-unified-production-lean` の続き）
+**計画書（正本）**: `docs/07-project-management/plans/v4-demand-based-production.md`（4.1・4.2 節が進捗）
+
+## 現在地
+
+- Step 1（純粋関数とテスト）完了: `engine/src/ai/v4/hold_line/fire_support.rs`（砲座候補・購入期限）、`engine/src/ai/v4/demand_value.rs`（需要価値・占有・遅延評価の貪欲法・上界）
+- Step 2 途中: `demand_value/board.rs`（盤面から需要と候補を組み立て）と `demand_value/trace.rs`（`OPENWARS_F_TRACE=1` で `F_TRACE` を出力）を実装。既定の挙動は不変（F_TRACE 有無で map_42 seed 2,3 の行動列が一致）
+- 判定: **G2 不合格（No-Go）**。f の需要が保持・砲座・占領の 3 種だけで、V4 が買う Recon/Mech/Bcopters/AntiAir/Tank を f = 0 と評価する。砲座の価値も射程内の敵数で頭打ちにしておらず過大
+- G1 未判定: 勝った強制購入列 `purchases.json`（旧 `.tmp/lean/hold-line-jit-t12/`）がクラウド側に無い。中身・作成手順も未確認
+
+## 次にやること
+
+1. f の需要を見直す: 敵部隊の撃破・物件防衛・対空の需要を追加、砲座の価値を射程内の敵数で頭打ち（値はルールから導き、定数を足さない）
+2. G1〜G3 を測り直す（`OPENWARS_F_TRACE_ALT` に購入列を渡せば同じ実行で G1 も測れる）
+3. G1 用の購入列の扱いをユーザーと決める（人間ログ `battle_map42_v200_vs_human.jsonl` から作る／作り直す／後回し）
+
+## 計測の再現
+
+```bash
+cargo build --release -p mcp-server && mkdir -p .tmp/step2/bin && cp target/release/mcp-server .tmp/step2/bin/mcp-server-f1
+export OPENWARS_UNIFIED_PRODUCTION=1 OPENWARS_F_TRACE=1 OPENWARS_TRACE_AI_STEPS=1
+python3 -X utf8 scripts/eval_matchup.py --mode batch --map map_42 --p1 V4 --p2 V200 --seeds 2,3 \
+  --player-order swapped --max-turns 8 --grid-type hex --jobs 4 \
+  --mcp-server-bin .tmp/step2/bin/mcp-server-f1 --output .tmp/step2/map_42/report.md --json-output .tmp/step2/map_42/results.json
+# F_TRACE は .tmp/step2/map_42/report_logs/servers/*.stderr.log に出る（--jobs 2 以上で出力される）
+```
+
+## 注意
+
+- 全組合せ列挙は使わない（ユーザー方針）。調整用の定数を増やさない
+- マスの形（square/hex）は対局モードで変わる。生産口は square なら前線都市 `x=4..6`、hex なら `x=3..7`
+
+---
+
+# 以前の Handoff（map_42 強制保持の実験、参考）
+
+## map_42 後攻 V4 — 前線都市優先・占領優先・間接火力連携（強制上限実験）
 
 **Generated**: 2026-11-25（夜）
 **Branch**: `feature/v4-unified-production-lean`
