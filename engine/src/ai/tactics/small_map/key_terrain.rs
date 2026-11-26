@@ -234,13 +234,22 @@ pub(super) fn evaluate_actions(
         .collect();
 
     let focus_targets = collect_focus_kill_targets(world, board, &observed_units);
+    let relay_units = collect_relay_capture_units(board, &context, &observed_units, distances);
 
     observed_units
         .into_iter()
         .filter_map(|unit| {
             let entity = unit.state.entity;
             let origin = unit.state.position;
-            let best = evaluate_unit(world, board, &context, &focus_targets, &unit, distances);
+            let best = evaluate_unit(
+                world,
+                board,
+                &context,
+                &focus_targets,
+                &relay_units,
+                &unit,
+                distances,
+            );
             let (rank, command) = best.into_inner()?;
             Some(EvaluatedAction {
                 entity,
@@ -253,6 +262,79 @@ pub(super) fn evaluate_actions(
             })
         })
         .collect()
+}
+
+/// 占領中の歩兵が今ターン前線へ届き、かつ後続の歩兵が1ターンでその都市を引き継げる場合にリレー対象とする。
+fn collect_relay_capture_units(
+    board: &SmallMapBoard,
+    context: &KeyTerrainContext,
+    units: &[SmallMapUnit],
+    distances: &mut ApproachDistances,
+) -> HashSet<Entity> {
+    let mut relays = HashSet::default();
+    if context.is_push_phase || context.open_front_cells.is_empty() {
+        return relays;
+    }
+    let reaches_open_front = |u: &SmallMapUnit| {
+        u.candidate_tiles.iter().any(|&(cx, cy)| {
+            context
+                .open_front_cells
+                .contains(&GridPosition { x: cx, y: cy })
+        })
+    };
+
+    for unit in units {
+        let state = &unit.state;
+        if !state.stats.can_capture || state.combat_ineffective {
+            continue;
+        }
+        let pos = state.position;
+        let can_capture_here = board
+            .tactical
+            .action_targets
+            .action_targets_at(state.entity, &state.stats, pos, false)
+            .can_capture;
+        if !can_capture_here {
+            continue;
+        }
+        // 生産施設は1ターン遅らせないようリレー対象から外す。
+        let is_prod = board
+            .tactical
+            .map
+            .get_terrain(pos.x, pos.y)
+            .is_some_and(|t| matches!(t, Terrain::Factory | Terrain::Airport | Terrain::Port));
+        if is_prod || !reaches_open_front(unit) {
+            continue;
+        }
+        let has_successor = units.iter().any(|other| {
+            if other.state.entity == state.entity
+                || !other.state.stats.can_capture
+                || other.state.combat_ineffective
+                || reaches_open_front(other)
+            {
+                return false;
+            }
+            let other_capturing_here = board
+                .tactical
+                .action_targets
+                .action_targets_at(
+                    other.state.entity,
+                    &other.state.stats,
+                    other.state.position,
+                    false,
+                )
+                .can_capture;
+            !other_capturing_here
+                && distances
+                    .turns(&other.state.stats, other.state.position, pos, 0)
+                    .turns
+                    <= 1
+        });
+        if has_successor {
+            relays.insert(state.entity);
+        }
+    }
+    relays
 }
 
 /// 今ターン中に複数ユニットの合算火力で撃破できる敵集合を求める。
@@ -319,6 +401,7 @@ fn evaluate_unit(
     board: &SmallMapBoard,
     context: &KeyTerrainContext,
     focus_targets: &HashSet<Entity>,
+    relay_units: &HashSet<Entity>,
     unit: &SmallMapUnit,
     distances: &mut ApproachDistances,
 ) -> BestAction {
@@ -353,6 +436,9 @@ fn evaluate_unit(
         if actions.can_capture {
             let priority = if relieves_gridlock {
                 ActionPriority::ProductionSiteRelief
+            } else if is_stationary && relay_units.contains(&state.entity) {
+                // 後続が引き継げるため、前線へ押し出して1ターン短縮する。
+                ActionPriority::CaptureAdvance
             } else {
                 ActionPriority::CaptureExecution
             };
