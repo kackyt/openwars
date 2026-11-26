@@ -41,6 +41,11 @@ impl BestAction {
         self.0 = Some((rank, command));
     }
 
+    /// 最良候補の (優先度, score)。診断出力用。
+    pub(crate) fn rank(&self) -> Option<Rank> {
+        self.0.as_ref().map(|(rank, _)| *rank)
+    }
+
     pub(crate) fn command(&self) -> Option<&AiCommand> {
         self.0.as_ref().map(|(_, command)| command)
     }

@@ -193,6 +193,101 @@ pub(crate) fn assign(
     result
 }
 
+/// 前線都市守備の試験スイッチ（`OPENWARS_V4_FORCE_CITY_GUARD=1`）。強制保持が有効なときだけ使う。
+pub(crate) fn city_guard_enabled() -> bool {
+    std::env::var("OPENWARS_V4_FORCE_CITY_GUARD").as_deref() == Ok("1")
+}
+
+/// 奪われた前線都市の上の敵を優先攻撃する試験スイッチ（`OPENWARS_V4_FORCE_CITY_RECAPTURE=1`）。
+/// 強制保持が有効なときだけ使う。空いた都市の占領は既存の占領計画に任せる。
+pub(crate) fn city_recapture_enabled() -> bool {
+    std::env::var("OPENWARS_V4_FORCE_CITY_RECAPTURE").as_deref() == Ok("1")
+}
+
+/// 守備上重要な都市にいる兵を都市担当にする。
+///
+/// `garrisons` は自軍の非生産前線都市の上にいる保持候補の兵と、その都市。
+/// `threatened(兵, 都市)` は、その守備兵の占有だけを外したときに敵地上部隊が次の手番に入れるか。
+/// 森か都市かの二択にはせず、守れていて空けると危険な都市だけを担当として残す。
+pub(crate) fn city_guards(
+    garrisons: &[(Entity, GridPosition)],
+    mut threatened: impl FnMut(Entity, GridPosition) -> bool,
+) -> BTreeMap<Entity, GridPosition> {
+    garrisons
+        .iter()
+        .filter(|(unit, city)| threatened(*unit, *city))
+        .map(|(unit, city)| (*unit, *city))
+        .collect()
+}
+
+/// 奪還対象の前線都市: 敵が所有している都市と、自軍所有だが敵が上にいる都市。
+///
+/// `cities` は非生産前線都市の（位置, 所有者, 敵地上部隊が上にいるか）。中立都市は通常の
+/// 占領順に任せ、敵のいない自軍都市は守備（[`city_guards`]）の対象なので含めない。
+pub(crate) fn lost_cities(
+    cities: &[(GridPosition, Option<PlayerId>, bool)],
+    me: PlayerId,
+) -> HashSet<GridPosition> {
+    cities
+        .iter()
+        .filter(|(_, owner, enemy_on)| match owner {
+            Some(owner) if *owner == me => *enemy_on,
+            Some(_) => true,
+            None => false,
+        })
+        .map(|(position, ..)| *position)
+        .collect()
+}
+
+/// 都市担当と陣地線（森）担当を合わせた割当結果。
+pub(crate) struct HoldPlan {
+    /// 陣地線マスの担当。
+    pub(crate) line: BTreeMap<Entity, GridPosition>,
+    /// 都市担当（その場で射撃・待機する）。
+    pub(crate) guards: BTreeMap<Entity, GridPosition>,
+    /// 空いていて、届く兵もいない陣地線マス（診断用）。
+    pub(crate) unfilled: Vec<GridPosition>,
+}
+
+/// 都市担当を除いた兵で陣地線を割り当てる。
+/// 都市担当は前回の森の割当からも、新規候補からも外す。
+pub(crate) fn assign_with_city_guards(
+    previous: &BTreeMap<Entity, GridPosition>,
+    input: &AssignInput,
+    guards: BTreeMap<Entity, GridPosition>,
+    retained: impl Fn(Entity) -> bool,
+    cost: impl FnMut(Entity, GridPosition) -> Option<(u32, u32)>,
+) -> HoldPlan {
+    let pool = input
+        .pool
+        .iter()
+        .copied()
+        .filter(|unit| !guards.contains_key(unit))
+        .collect::<Vec<_>>();
+    let line = assign(
+        previous,
+        &AssignInput {
+            line: input.line,
+            unavailable: input.unavailable,
+            pool: &pool,
+        },
+        |unit| !guards.contains_key(&unit) && retained(unit),
+        cost,
+    );
+    let taken = line.values().copied().collect::<HashSet<_>>();
+    let unfilled = input
+        .line
+        .iter()
+        .copied()
+        .filter(|cell| !taken.contains(cell) && !input.unavailable.contains(cell))
+        .collect();
+    HoldPlan {
+        line,
+        guards,
+        unfilled,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +451,113 @@ mod tests {
         assert!(can_hold_line_in_forced_mode(false, true, false, true));
         // 占領任務のないフリー歩兵は対象になる
         assert!(can_hold_line_in_forced_mode(false, false, false, false));
+    }
+
+    #[test]
+    fn 危険な都市の守備兵は森へ転用しない() {
+        let units = entities(1);
+        let city = cell(8, 5);
+        let line = [cell(8, 6)];
+        let unavailable = HashSet::default();
+        let input = AssignInput {
+            line: &line,
+            unavailable: &unavailable,
+            pool: &units,
+        };
+        let guards = city_guards(&[(units[0], city)], |_, _| true);
+        // 前回は森へ割り当てていても、都市担当にしたら森の割当から外す。
+        let previous = BTreeMap::from([(units[0], cell(8, 6))]);
+        let plan =
+            assign_with_city_guards(&previous, &input, guards, |_| true, |_, _| Some((1, 0)));
+        assert_eq!(plan.guards[&units[0]], city);
+        assert!(plan.line.is_empty());
+        assert_eq!(plan.unfilled, vec![cell(8, 6)]);
+    }
+
+    #[test]
+    fn 安全な都市の兵は従来どおり森へ向ける() {
+        let units = entities(1);
+        let line = [cell(8, 6)];
+        let unavailable = HashSet::default();
+        let input = AssignInput {
+            line: &line,
+            unavailable: &unavailable,
+            pool: &units,
+        };
+        let guards = city_guards(&[(units[0], cell(8, 5))], |_, _| false);
+        assert!(guards.is_empty());
+        let plan = assign_with_city_guards(
+            &BTreeMap::new(),
+            &input,
+            guards,
+            |_| true,
+            |_, _| Some((1, 0)),
+        );
+        assert_eq!(plan.line[&units[0]], cell(8, 6));
+        assert!(plan.unfilled.is_empty());
+    }
+
+    #[test]
+    fn 都市を守ったまま届く別の兵で森を埋める() {
+        let units = entities(2);
+        let line = [cell(8, 6)];
+        let unavailable = HashSet::default();
+        let input = AssignInput {
+            line: &line,
+            unavailable: &unavailable,
+            pool: &units,
+        };
+        let guards = city_guards(&[(units[0], cell(8, 5))], |_, _| true);
+        // 守備兵の方が森に近くても、森は別の兵が埋める。
+        let plan = assign_with_city_guards(
+            &BTreeMap::new(),
+            &input,
+            guards,
+            |_| true,
+            |u, _| Some(if u == units[0] { (0, 1) } else { (1, 0) }),
+        );
+        assert_eq!(plan.guards.len(), 1);
+        assert_eq!(plan.line[&units[1]], cell(8, 6));
+        assert!(plan.unfilled.is_empty());
+    }
+
+    #[test]
+    fn 届く兵がいない森は空白のまま未充足として返す() {
+        let units = entities(2);
+        let line = [cell(8, 6), cell(9, 7)];
+        let unavailable = HashSet::default();
+        let input = AssignInput {
+            line: &line,
+            unavailable: &unavailable,
+            pool: &units,
+        };
+        let guards = city_guards(&[(units[0], cell(8, 5))], |_, _| true);
+        // 兵1は (8,6) にだけ届く。(9,7) には誰も届かない。
+        let plan = assign_with_city_guards(
+            &BTreeMap::new(),
+            &input,
+            guards,
+            |_| true,
+            |u, c| (u == units[1] && c == cell(8, 6)).then_some((1, 0)),
+        );
+        assert_eq!(plan.line[&units[1]], cell(8, 6));
+        assert_eq!(plan.unfilled, vec![cell(9, 7)]);
+    }
+
+    #[test]
+    fn 奪われた都市と敵が上にいる自軍都市だけを奪還対象にする() {
+        let me = PlayerId(2);
+        let enemy = PlayerId(1);
+        let lost = lost_cities(
+            &[
+                (cell(9, 5), Some(enemy), false),
+                (cell(8, 5), Some(me), true),
+                (cell(7, 5), Some(me), false),
+                (cell(6, 5), None, true),
+            ],
+            me,
+        );
+        // 中立都市は通常の占領順に任せ、敵のいない自軍都市は守備の対象（奪還ではない）。
+        assert_eq!(lost, HashSet::from_iter([cell(9, 5), cell(8, 5)]));
     }
 }
