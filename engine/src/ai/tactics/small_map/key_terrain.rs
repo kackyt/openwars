@@ -22,7 +22,7 @@ const BATTERY_MIN_HOLD_HP: u32 = 30;
 /// 押し上げ判定で見る前線周辺の半径（敵の前線圧力・自軍前衛の厚み）。
 const FRONT_PRESSURE_RADIUS: u32 = 2;
 /// 押し上げを開始するために前線周辺に揃っているべき最低前衛数。
-const MIN_PUSH_VANGUARD: usize = 4;
+const MIN_PUSH_VANGUARD: usize = 6;
 /// フォーカス撃破ターゲットへの加点。
 const FOCUS_KILL_BONUS: i32 = 4_000;
 /// 前線都市の占領実行への追加ボーナス。
@@ -52,6 +52,10 @@ struct KeyTerrainContext {
     open_front_cells: Vec<GridPosition>,
     /// 現在味方間接ユニットが乗っていない空きの砲座候補都市。
     open_battery_sites: Vec<GridPosition>,
+    /// 前線2マス後ろの非生産・通行可能マス集合（砲列ライン全体）。
+    battery_line: HashSet<GridPosition>,
+    /// 前線2マス後ろの非生産・通行可能マスで味方が乗っていない砲列帯。
+    open_battery_line: Vec<GridPosition>,
     /// 自軍が十分な戦力優位を築き、前線を押し上げる局面か。
     is_push_phase: bool,
 }
@@ -119,17 +123,72 @@ impl KeyTerrainContext {
             home_sites,
             open_front_cells,
             open_battery_sites,
+            battery_line: HashSet::default(),
+            open_battery_line: Vec::new(),
             is_push_phase: false,
         };
 
-        ctx.is_push_phase = ctx.detect_push_phase(
-            &tactical.map,
-            player_id,
-            &tactical.occupancy,
-            &tactical.enemies,
-            &tactical.registry,
-        );
+        if !ctx.front_line.is_empty() {
+            let mut battery_line = HashSet::default();
+            let mut open_battery_line = Vec::new();
+            for y in 0..tactical.map.height {
+                for x in 0..tactical.map.width {
+                    let pos = GridPosition { x, y };
+                    if board.own_production.contains((x, y))
+                        || !ctx.is_behind_front(&tactical.map, pos)
+                    {
+                        continue;
+                    }
+                    let min_dist = ctx
+                        .front_line
+                        .iter()
+                        .map(|f| tactical.map.distance(x, y, f.x, f.y))
+                        .min()
+                        .unwrap_or(u32::MAX);
+                    if min_dist == BATTERY_MIN_RANGE
+                        && tactical
+                            .map
+                            .get_terrain(x, y)
+                            .is_some_and(|t| !matches!(t, Terrain::Sea | Terrain::River))
+                    {
+                        battery_line.insert(pos);
+                        if !tactical
+                            .occupancy
+                            .get(&(x, y))
+                            .is_some_and(|occ| occ.player_id == player_id)
+                        {
+                            open_battery_line.push(pos);
+                        }
+                    }
+                }
+            }
+            open_battery_line.sort_by_key(|p| (p.x, p.y));
+            ctx.battery_line = battery_line;
+            ctx.open_battery_line = open_battery_line;
+        }
 
+        let own_count = tactical
+            .occupancy
+            .values()
+            .filter(|occ| occ.player_id == player_id)
+            .count();
+        let enemy_count = tactical.enemies.len();
+        ctx.is_push_phase = !ctx.front_line.is_empty()
+            && ctx.open_front_cells.len() <= 2
+            && own_count >= enemy_count + 8
+            && own_count * 2 >= enemy_count * 3;
+
+        let _ = (
+            MIN_PUSH_VANGUARD,
+            FRONT_PRESSURE_RADIUS,
+            &ctx.detect_push_phase(
+                &tactical.map,
+                player_id,
+                &tactical.occupancy,
+                &tactical.enemies,
+                &tactical.registry,
+            ),
+        );
         ctx
     }
 
@@ -145,10 +204,18 @@ impl KeyTerrainContext {
         if self.front_line.is_empty() {
             return false;
         }
-        // 自陣侵入敵や前線上の敵がいる間は防衛・奪還を優先し、押し上げない。
-        if enemies.iter().any(|enemy| {
-            self.is_behind_front(map, enemy.position) || self.front_line.contains(&enemy.position)
-        }) {
+        // 前線上に敵がいる間、または自陣侵入敵が2体以上の間は防衛・奪還を優先する。
+        if enemies
+            .iter()
+            .any(|enemy| self.front_line.contains(&enemy.position))
+        {
+            return false;
+        }
+        let behind_count = enemies
+            .iter()
+            .filter(|enemy| self.is_behind_front(map, enemy.position))
+            .count();
+        if behind_count > 1 {
             return false;
         }
 
@@ -185,7 +252,16 @@ impl KeyTerrainContext {
             })
             .count();
 
-        front_vanguard >= MIN_PUSH_VANGUARD && front_vanguard >= front_enemies.saturating_mul(2)
+        let own_total = occupancy
+            .values()
+            .filter(|occ| occ.player_id == player_id)
+            .count();
+        let front_line_solid = self.open_front_cells.len() <= 2;
+
+        front_line_solid
+            && front_vanguard >= MIN_PUSH_VANGUARD
+            && front_vanguard > front_enemies
+            && own_total >= enemies.len().saturating_add(4)
     }
 
     /// 指定座標が前線防衛線より自陣側（後方または前線都市上）にあるか判定する。
@@ -235,6 +311,13 @@ pub(super) fn evaluate_actions(
 
     let focus_targets = collect_focus_kill_targets(world, board, &observed_units);
     let relay_units = collect_relay_capture_units(board, &context, &observed_units, distances);
+    let has_waiting_indirect = observed_units.iter().any(|u| {
+        u.state.stats.min_range > 1
+            && u.candidate_tiles.len() > 1
+            && !u.state.combat_ineffective
+            && !context.battery_sites.contains(&u.state.position)
+            && !context.battery_line.contains(&u.state.position)
+    });
 
     observed_units
         .into_iter()
@@ -247,6 +330,7 @@ pub(super) fn evaluate_actions(
                 &context,
                 &focus_targets,
                 &relay_units,
+                has_waiting_indirect,
                 &unit,
                 distances,
             );
@@ -396,12 +480,14 @@ fn collect_focus_kill_targets(
 }
 
 /// 1ユニットの全ての合法移動先・行動を評価し、最良の1手を選ぶ。
+#[allow(clippy::too_many_arguments)]
 fn evaluate_unit(
     world: &World,
     board: &SmallMapBoard,
     context: &KeyTerrainContext,
     focus_targets: &HashSet<Entity>,
     relay_units: &HashSet<Entity>,
+    has_waiting_indirect: bool,
     unit: &SmallMapUnit,
     distances: &mut ApproachDistances,
 ) -> BestAction {
@@ -411,6 +497,15 @@ fn evaluate_unit(
 
     // 各ユニットが目指す基本の接近目標を決定する。
     let approach_goal = resolve_approach_goal(board, context, unit, distances);
+    let starts_on_battery_non_indirect = state.stats.min_range <= 1
+        && !state.combat_ineffective
+        && has_waiting_indirect
+        && (context.battery_sites.contains(&state.position)
+            || context.battery_line.contains(&state.position))
+        && !tactical
+            .action_targets
+            .action_targets_at(state.entity, &state.stats, state.position, false)
+            .can_capture;
 
     for &(x, y) in &unit.candidate_tiles {
         let pos = GridPosition { x, y };
@@ -425,6 +520,9 @@ fn evaluate_unit(
             && unit.starts_on_own_production
             && !state.combat_ineffective
             && !board.own_production.contains((x, y));
+        let relieves_battery_site = starts_on_battery_non_indirect
+            && !context.battery_sites.contains(&pos)
+            && !context.battery_line.contains(&pos);
         let defense_bonus = terrain_defense_bonus(tactical, pos);
         let on_front_line = context.front_line.contains(&pos);
         let on_battery = state.stats.min_range > 1
@@ -503,6 +601,7 @@ fn evaluate_unit(
             on_battery,
             on_own_production,
             relieves_gridlock,
+            relieves_battery_site,
             approach_goal,
             distances,
             &mut best,
@@ -532,11 +631,25 @@ fn resolve_approach_goal(
     if let Some(contract) = unit.capture_contract {
         return Some(contract.target);
     }
-    // 間接ユニットは空いている砲座都市、なければ前線ラインへ向かう。
+    // 間接ユニットは総攻撃局面なら前線へ追撃し、通常時は砲座都市→砲列ライン(前線2マス後ろ)へ展開する。
     if state.stats.min_range > 1 {
+        if context.is_push_phase {
+            return context
+                .front_line
+                .iter()
+                .copied()
+                .min_by_key(|&pos| distances.turns(&state.stats, state.position, pos, 0));
+        }
         if !context.open_battery_sites.is_empty() {
             return context
                 .open_battery_sites
+                .iter()
+                .copied()
+                .min_by_key(|&pos| distances.turns(&state.stats, state.position, pos, 0));
+        }
+        if !context.open_battery_line.is_empty() {
+            return context
+                .open_battery_line
                 .iter()
                 .copied()
                 .min_by_key(|&pos| distances.turns(&state.stats, state.position, pos, 0));
@@ -547,8 +660,20 @@ fn resolve_approach_goal(
             .copied()
             .min_by_key(|&pos| distances.turns(&state.stats, state.position, pos, 0));
     }
-    // 歩兵・直接ユニットは通常時は空いている前線ライン、押し上げ局面または埋まっていれば最寄り敵へ向かう。
-    if !context.is_push_phase && state.stats.can_capture && !context.open_front_cells.is_empty() {
+    // 歩兵・直接ユニットは通常時は空いている前線ライン、前線がほぼ埋まっていて近くに空きがない場合は最寄り敵へ向かう。
+    let front_line_solid = !context.front_line.is_empty() && context.open_front_cells.len() <= 2;
+    let has_nearby_open_front = context.open_front_cells.iter().any(|&p| {
+        board
+            .tactical
+            .map
+            .distance(state.position.x, state.position.y, p.x, p.y)
+            <= 2
+    });
+    if !context.is_push_phase
+        && state.stats.can_capture
+        && !context.open_front_cells.is_empty()
+        && (!front_line_solid || has_nearby_open_front)
+    {
         return context
             .open_front_cells
             .iter()
@@ -654,14 +779,54 @@ fn evaluate_attack_candidate(
         return;
     }
 
+    let front_line_solid = !context.front_line.is_empty() && context.open_front_cells.len() <= 2;
+    let nearby_allies = tactical
+        .occupancy
+        .iter()
+        .filter(|&(&(ox, oy), occ)| {
+            occ.player_id == tactical.player_id
+                && (ox, oy) != (state.position.x, state.position.y)
+                && tactical.map.distance(pos.x, pos.y, ox, oy) <= 2
+        })
+        .count();
+    let supported_beyond_front = front_line_solid
+        && !context.is_behind_front(&tactical.map, pos)
+        && !on_front_line
+        && tactical.occupancy.iter().any(|(&(ox, oy), occ)| {
+            occ.player_id == tactical.player_id
+                && (ox, oy) != (state.position.x, state.position.y)
+                && tactical.map.distance(pos.x, pos.y, ox, oy) == 1
+        });
+
     let priority = if relieves_gridlock {
         ActionPriority::ProductionSiteRelief
     } else if state.stats.min_range > 1 {
-        // 間接ユニット: 砲座・定位置射撃を最優先（被弾回避で逃げない）。
-        if on_battery || pos == state.position {
-            ActionPriority::AssaultSupportFire
+        // 間接ユニット: 射程に応じた理想砲座帯（前線1〜2マス後ろ）では最優先射撃。
+        // 届かない後方からの低価値射撃は、理想砲座帯への前進を優先させる。
+        let min_dist_to_front = context
+            .front_line
+            .iter()
+            .map(|f| tactical.map.distance(pos.x, pos.y, f.x, f.y))
+            .min()
+            .unwrap_or(u32::MAX);
+        let max_ideal_dist = state.stats.max_range.saturating_sub(2).clamp(1, 2);
+        let in_ideal_battery_band = on_battery
+            || (context.is_behind_front(&tactical.map, pos)
+                && (1..=max_ideal_dist).contains(&min_dist_to_front));
+        if in_ideal_battery_band
+            || exchange.damage_value_dealt >= 4_000
+            || (is_survivable_lethal && (enemy_behind_front || enemy_on_front_line))
+        {
+            if on_battery || pos == state.position {
+                ActionPriority::AssaultSupportFire
+            } else {
+                ActionPriority::AssaultStrike
+            }
+        } else if min_dist_to_front > BATTERY_MIN_RANGE + 1 && exchange.damage_value_dealt < 5_000 {
+            // y<=3等の深い後方からは、超高価値目標でない限り砲列ラインへの前進(RouteAdvance)を優先する。
+            ActionPriority::Normal
         } else {
-            ActionPriority::AssaultStrike
+            ActionPriority::FavorableLocalTarget
         }
     } else if enemy_behind_front
         && (favorable || is_survivable_lethal || attack.expected_damage >= 35)
@@ -671,6 +836,25 @@ fn evaluate_attack_candidate(
     } else if on_front_line && (favorable || is_survivable_lethal) {
         // 前線防衛線（森など）上からの攻撃。
         ActionPriority::AssaultStrike
+    } else if supported_beyond_front
+        && ((context.is_push_phase
+            && exchange.expected_counter_damage < state.hp
+            && (favorable
+                || is_survivable_lethal
+                || (exchange.damage_value_dealt as i32) * (nearby_allies as i32).clamp(2, 4)
+                    >= post_attack_loss))
+            || (!context.is_push_phase
+                && !state.stats.can_capture
+                && exchange.expected_counter_damage < state.hp
+                && (is_survivable_lethal
+                    || (favorable
+                        && (exchange.damage_value_dealt as i32) * 2 >= post_attack_loss)))
+            || (!context.is_push_phase
+                && (favorable || is_survivable_lethal)
+                && (exchange.damage_value_dealt as i32) > post_attack_loss))
+    {
+        // 消耗フェーズは黒字のみ、総攻撃フェーズは周囲の味方と被弾分散して前線一歩先へ押し出す。
+        ActionPriority::FavorableStrategicTarget
     } else if enemy_on_front_line && is_survivable_lethal {
         // 前線ライン上の敵を仕留め切るトドメ。
         ActionPriority::FavorableStrategicTarget
@@ -729,6 +913,7 @@ fn evaluate_wait_candidate(
     on_battery: bool,
     on_own_production: bool,
     relieves_gridlock: bool,
+    relieves_battery_site: bool,
     approach_goal: Option<GridPosition>,
     distances: &mut ApproachDistances,
     best: &mut BestAction,
@@ -752,12 +937,25 @@ fn evaluate_wait_candidate(
         .map(|enemy| tactical.map.distance(enemy.x, enemy.y, pos.x, pos.y))
         .min()
         .unwrap_or(u32::MAX);
+    let min_dist_to_front = context
+        .front_line
+        .iter()
+        .map(|f| tactical.map.distance(pos.x, pos.y, f.x, f.y))
+        .min()
+        .unwrap_or(u32::MAX);
+    let front_line_solid = !context.front_line.is_empty() && context.open_front_cells.len() <= 2;
 
-    // 砲座を維持すべき間接ユニットか（敵に最小射程内へ潜り込まれておらず、HPも十分）。
-    let holds_battery = on_battery
+    // 砲座（都市優先、次点で壁越しの前線1〜2マス後ろの砲列帯）を維持すべき間接ユニットか。
+    let max_ideal_dist = state.stats.max_range.saturating_sub(2).clamp(1, 2);
+    let in_dynamic_battery_band = front_line_solid
+        && context.is_behind_front(&tactical.map, pos)
+        && (1..=max_ideal_dist).contains(&min_dist_to_front);
+    let holds_battery = state.stats.min_range > 1
         && !state.combat_ineffective
         && state.hp > BATTERY_MIN_HOLD_HP
-        && nearest_enemy_dist >= state.stats.min_range;
+        && !on_own_production
+        && nearest_enemy_dist >= state.stats.min_range
+        && (on_battery || in_dynamic_battery_band);
 
     let advances_capture = unit.capture_contract.is_some_and(|contract| {
         pos == contract.target
@@ -767,10 +965,33 @@ fn evaluate_wait_candidate(
         .capture_contract
         .is_some_and(|contract| context.front_cities.contains(&contract.target));
 
+    let nearby_allies = tactical
+        .occupancy
+        .iter()
+        .filter(|&(&(ox, oy), occ)| {
+            occ.player_id == tactical.player_id
+                && (ox, oy) != (state.position.x, state.position.y)
+                && tactical.map.distance(pos.x, pos.y, ox, oy) <= 2
+        })
+        .count();
+    let supported_beyond_front = front_line_solid
+        && state.stats.min_range <= 1
+        && !state.combat_ineffective
+        && !context.is_behind_front(&tactical.map, pos)
+        && !on_front_line
+        && tactical.occupancy.iter().any(|(&(ox, oy), occ)| {
+            occ.player_id == tactical.player_id
+                && (ox, oy) != (state.position.x, state.position.y)
+                && tactical.map.distance(pos.x, pos.y, ox, oy) == 1
+        });
+
     let priority = if relieves_gridlock {
         ActionPriority::ProductionSiteRelief
-    } else if holds_battery {
-        // 間接ユニットが前線拠点（砲座）を押さえて維持する。
+    } else if relieves_battery_site {
+        // 後方に待機中の間接ユニットがいる場合、非間接ユニットは砲座を譲る。
+        ActionPriority::FavorableStrategicTarget
+    } else if holds_battery && !context.is_push_phase {
+        // 消耗フェーズ中は間接ユニットが前線拠点（砲座・砲列帯）を押さえて維持する。
         ActionPriority::FavorableStrategicTarget
     } else if advances_capture && capture_is_front_city {
         // 前線都市の占領前進は森の待機より優先する。
@@ -780,7 +1001,7 @@ fn evaluate_wait_candidate(
         && !state.combat_ineffective
         && state.stats.min_range <= 1
     {
-        // 前線防衛線（森など）の空きマスを確保して維持する。
+        // 消耗フェーズ中は前線防衛線（森など）の確保・維持を優先する。
         ActionPriority::FavorableLocalTarget
     } else if advances_capture {
         ActionPriority::CaptureAdvance
@@ -790,16 +1011,39 @@ fn evaluate_wait_candidate(
         ActionPriority::Normal
     };
 
-    let mut score = (defense_bonus as i32) * DEFENSE_BONUS_WEIGHT;
+    let mut score = if state.stats.min_range > 1 && !holds_battery {
+        0
+    } else {
+        (defense_bonus as i32) * DEFENSE_BONUS_WEIGHT
+    };
+    if holds_battery && on_battery {
+        // 都市砲座を平地・森の砲列帯より優先して確保する。
+        score += 1_000;
+    }
     if let Some(goal) = approach_goal {
         let turns = distances.turns(&state.stats, pos, goal, 0);
         let dist = tactical.map.distance(pos.x, pos.y, goal.x, goal.y);
+        let dist_weight = if state.stats.min_range > 1 {
+            300
+        } else {
+            DISTANCE_APPROACH_WEIGHT
+        };
         score -= (turns.turns as i32) * TURN_APPROACH_WEIGHT;
-        score -= (dist as i32) * DISTANCE_APPROACH_WEIGHT;
+        score -= (dist as i32) * dist_weight;
+    }
+    if context.is_push_phase && supported_beyond_front {
+        score += 1_200;
     }
 
-    // 砲座維持（holds_battery）以外の間接・航空ユニットは、通常の露出リスクを評価する。
+    let safe_indirect_behind_wall = state.stats.min_range > 1
+        && front_line_solid
+        && context.is_behind_front(&tactical.map, pos)
+        && min_dist_to_front >= 1
+        && nearest_enemy_dist >= state.stats.min_range;
+
+    // 砲座維持・壁越しの安全砲撃帯以外の間接・航空ユニットは、通常の露出リスクを評価する。
     if !holds_battery
+        && !safe_indirect_behind_wall
         && (state.stats.min_range > 1
             || state.stats.movement_type == crate::resources::MovementType::Air)
     {
@@ -815,6 +1059,28 @@ fn evaluate_wait_candidate(
             &tactical.damage_chart,
             &tactical.registry,
         );
+    } else if state.stats.min_range <= 1
+        && !context.is_behind_front(&tactical.map, pos)
+        && !on_front_line
+    {
+        // 総攻撃フェーズは周囲の味方数で露出リスクを割り引き、消耗フェーズは半減に留める。
+        let divisor = if context.is_push_phase {
+            (nearby_allies as i32).clamp(2, 4)
+        } else {
+            2
+        };
+        score -= crate::ai::threat::exposure_penalty(
+            &tactical.map,
+            (pos.x, pos.y),
+            state.stats.unit_type,
+            state.stats.cost,
+            state.hp,
+            state.stats.min_range,
+            defense_bonus,
+            &tactical.enemies,
+            &tactical.damage_chart,
+            &tactical.registry,
+        ) / divisor;
     }
 
     best.offer((priority, score), || AiCommand::Wait { target_pos: pos });
@@ -838,6 +1104,8 @@ mod tests {
             home_sites: [GridPosition { x: 5, y: 3 }].into_iter().collect(),
             open_front_cells: Vec::new(),
             open_battery_sites: Vec::new(),
+            battery_line: HashSet::default(),
+            open_battery_line: Vec::new(),
             is_push_phase: false,
         };
         assert!(context.is_behind_front(&map, GridPosition { x: 5, y: 5 }));
@@ -873,6 +1141,8 @@ mod tests {
             home_sites: [GridPosition { x: 5, y: 3 }].into_iter().collect(),
             open_front_cells: Vec::new(),
             open_battery_sites: Vec::new(),
+            battery_line: HashSet::default(),
+            open_battery_line: Vec::new(),
             is_push_phase: false,
         };
         let registry = MasterDataRegistry::load().unwrap();
@@ -900,8 +1170,8 @@ mod tests {
             occupancy.insert((x, 7), make_occ(PlayerId(2), UnitType::Infantry));
         }
 
-        // 1. 敵がy=8..9に6体残っている（2倍優位ではない）→ まだ押し上げない
-        let dense_enemies: Vec<_> = (1..=6).map(|x| make_enemy(x, 8)).collect();
+        // 1. 敵がy=8..9に8体残っている（前衛が数で上回っていない）→ まだ押し上げない
+        let dense_enemies: Vec<_> = (1..=8).map(|x| make_enemy(x, 8)).collect();
         assert!(!context.detect_push_phase(
             &map,
             PlayerId(2),
@@ -910,8 +1180,8 @@ mod tests {
             &registry
         ));
 
-        // 2. 敵がy<=6に1体でも侵入している → 押し上げない
-        let behind_enemies = vec![make_enemy(5, 6), make_enemy(3, 9)];
+        // 2. 敵がy<=6に2体以上侵入している → 押し上げない
+        let behind_enemies = vec![make_enemy(5, 6), make_enemy(4, 6), make_enemy(3, 9)];
         assert!(!context.detect_push_phase(
             &map,
             PlayerId(2),
@@ -930,7 +1200,7 @@ mod tests {
             &registry
         ));
 
-        // 4. 前線周辺の敵が3体まで減り、自軍前衛が2倍以上（8 >= 6）→ 押し上げ発動！
+        // 4. 前線周辺の敵が3体まで減り、自軍前衛が上回り全体でも+4以上（8 >= 7）→ 押し上げ発動！
         let collapsed_enemies = vec![make_enemy(2, 8), make_enemy(5, 9), make_enemy(7, 9)];
         assert!(context.detect_push_phase(
             &map,
