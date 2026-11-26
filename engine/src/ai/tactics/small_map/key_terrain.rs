@@ -19,6 +19,10 @@ const BATTERY_MIN_RANGE: u32 = 2;
 const BATTERY_MAX_RANGE: u32 = 4;
 /// 砲座を維持する最低HP閾値（これ以下は修理・合流を優先）。
 const BATTERY_MIN_HOLD_HP: u32 = 30;
+/// 押し上げ判定で見る前線周辺の半径（敵の前線圧力・自軍前衛の厚み）。
+const FRONT_PRESSURE_RADIUS: u32 = 2;
+/// 押し上げを開始するために前線周辺に揃っているべき最低前衛数。
+const MIN_PUSH_VANGUARD: usize = 4;
 /// フォーカス撃破ターゲットへの加点。
 const FOCUS_KILL_BONUS: i32 = 4_000;
 /// 前線都市の占領実行への追加ボーナス。
@@ -48,6 +52,8 @@ struct KeyTerrainContext {
     open_front_cells: Vec<GridPosition>,
     /// 現在味方間接ユニットが乗っていない空きの砲座候補都市。
     open_battery_sites: Vec<GridPosition>,
+    /// 自軍が十分な戦力優位を築き、前線を押し上げる局面か。
+    is_push_phase: bool,
 }
 
 impl KeyTerrainContext {
@@ -82,7 +88,7 @@ impl KeyTerrainContext {
             })
             .collect();
 
-        let open_front_cells: Vec<GridPosition> = front_line
+        let mut open_front_cells: Vec<GridPosition> = front_line
             .iter()
             .copied()
             .filter(|pos| {
@@ -92,8 +98,9 @@ impl KeyTerrainContext {
                     .is_some_and(|occ| occ.player_id == player_id)
             })
             .collect();
+        open_front_cells.sort_by_key(|p| (p.x, p.y));
 
-        let open_battery_sites: Vec<GridPosition> = battery_sites
+        let mut open_battery_sites: Vec<GridPosition> = battery_sites
             .iter()
             .copied()
             .filter(|pos| {
@@ -103,15 +110,82 @@ impl KeyTerrainContext {
                     .is_some_and(|occ| occ.player_id == player_id)
             })
             .collect();
+        open_battery_sites.sort_by_key(|p| (p.x, p.y));
 
-        Self {
+        let mut ctx = Self {
             front_line,
             front_cities,
             battery_sites,
             home_sites,
             open_front_cells,
             open_battery_sites,
+            is_push_phase: false,
+        };
+
+        ctx.is_push_phase = ctx.detect_push_phase(
+            &tactical.map,
+            player_id,
+            &tactical.occupancy,
+            &tactical.enemies,
+            &tactical.registry,
+        );
+
+        ctx
+    }
+
+    /// 前線周辺の敵の厚みと自軍前衛の厚みから、前線を押し上げる攻勢転移の局面か見極める。
+    fn detect_push_phase(
+        &self,
+        map: &crate::resources::Map,
+        player_id: PlayerId,
+        occupancy: &HashMap<(usize, usize), OccupantInfo>,
+        enemies: &[crate::ai::threat::EnemyThreatInfo],
+        registry: &crate::resources::master_data::MasterDataRegistry,
+    ) -> bool {
+        if self.front_line.is_empty() {
+            return false;
         }
+        // 自陣侵入敵や前線上の敵がいる間は防衛・奪還を優先し、押し上げない。
+        if enemies.iter().any(|enemy| {
+            self.is_behind_front(map, enemy.position) || self.front_line.contains(&enemy.position)
+        }) {
+            return false;
+        }
+
+        let front_enemies = enemies
+            .iter()
+            .filter(|enemy| {
+                self.front_line.iter().any(|front| {
+                    map.distance(enemy.position.x, enemy.position.y, front.x, front.y)
+                        <= FRONT_PRESSURE_RADIUS
+                })
+            })
+            .count();
+
+        let front_vanguard = occupancy
+            .iter()
+            .filter(|&(&(x, y), occ)| {
+                occ.player_id == player_id
+                    && !occ.is_transport
+                    && registry.ai_category_for(occ.unit_type).is_some_and(|cat| {
+                        use crate::resources::master_data::AiUnitCategory;
+                        matches!(
+                            cat,
+                            AiUnitCategory::Infantry
+                                | AiUnitCategory::Tank
+                                | AiUnitCategory::AntiAirTank
+                                | AiUnitCategory::Fighter
+                                | AiUnitCategory::AirForce
+                        )
+                    })
+                    && self
+                        .front_line
+                        .iter()
+                        .any(|front| map.distance(x, y, front.x, front.y) <= FRONT_PRESSURE_RADIUS)
+            })
+            .count();
+
+        front_vanguard >= MIN_PUSH_VANGUARD && front_vanguard >= front_enemies.saturating_mul(2)
     }
 
     /// 指定座標が前線防衛線より自陣側（後方または前線都市上）にあるか判定する。
@@ -387,8 +461,8 @@ fn resolve_approach_goal(
             .copied()
             .min_by_key(|&pos| distances.turns(&state.stats, state.position, pos, 0));
     }
-    // 歩兵・直接ユニットは空いている前線ライン、埋まっていれば最寄り敵へ向かう。
-    if state.stats.can_capture && !context.open_front_cells.is_empty() {
+    // 歩兵・直接ユニットは通常時は空いている前線ライン、押し上げ局面または埋まっていれば最寄り敵へ向かう。
+    if !context.is_push_phase && state.stats.can_capture && !context.open_front_cells.is_empty() {
         return context
             .open_front_cells
             .iter()
@@ -615,7 +689,11 @@ fn evaluate_wait_candidate(
     } else if advances_capture && capture_is_front_city {
         // 前線都市の占領前進は森の待機より優先する。
         ActionPriority::FavorableStrategicTarget
-    } else if on_front_line && !state.combat_ineffective && state.stats.min_range <= 1 {
+    } else if !context.is_push_phase
+        && on_front_line
+        && !state.combat_ineffective
+        && state.stats.min_range <= 1
+    {
         // 前線防衛線（森など）の空きマスを確保して維持する。
         ActionPriority::FavorableLocalTarget
     } else if advances_capture {
@@ -674,6 +752,7 @@ mod tests {
             home_sites: [GridPosition { x: 5, y: 3 }].into_iter().collect(),
             open_front_cells: Vec::new(),
             open_battery_sites: Vec::new(),
+            is_push_phase: false,
         };
         assert!(context.is_behind_front(&map, GridPosition { x: 5, y: 5 }));
         assert!(context.is_behind_front(&map, GridPosition { x: 5, y: 6 }));
@@ -689,5 +768,90 @@ mod tests {
         assert!(ActionPriority::FavorableStrategicTarget > ActionPriority::FavorableLocalTarget);
         assert!(ActionPriority::FavorableLocalTarget > ActionPriority::StrategicTargetFallback);
         assert!(ActionPriority::StrategicTargetFallback > ActionPriority::RouteAdvance);
+    }
+
+    #[test]
+    fn detect_push_phase_matches_human_board_intuition() {
+        use crate::ai::threat::EnemyThreatInfo;
+        use crate::resources::UnitType;
+        use crate::resources::master_data::MasterDataRegistry;
+
+        let mut map = Map::new(11, 15, Terrain::Plains, GridTopology::Hex);
+        for x in 1..=9 {
+            map.set_terrain(x, 7, Terrain::Forest).unwrap();
+        }
+        let context = KeyTerrainContext {
+            front_line: (1..=9).map(|x| GridPosition { x, y: 7 }).collect(),
+            front_cities: [GridPosition { x: 5, y: 5 }].into_iter().collect(),
+            battery_sites: HashSet::default(),
+            home_sites: [GridPosition { x: 5, y: 3 }].into_iter().collect(),
+            open_front_cells: Vec::new(),
+            open_battery_sites: Vec::new(),
+            is_push_phase: false,
+        };
+        let registry = MasterDataRegistry::load().unwrap();
+        let make_occ = |player_id: PlayerId, unit_type: UnitType| OccupantInfo {
+            player_id,
+            is_transport: false,
+            unit_type,
+            loadable_types: Vec::new(),
+            free_slots: 0,
+        };
+        let make_enemy = |x: usize, y: usize| EnemyThreatInfo {
+            position: GridPosition { x, y },
+            unit_type: UnitType::Infantry,
+            strategic_value: 1_000,
+            hp: 100,
+            min_range: 1,
+            max_range: 1,
+            max_movement: 3,
+            ammo: (10, 10),
+        };
+
+        // 味方前衛がy=7に8体揃っている盤面
+        let mut occupancy = HashMap::default();
+        for x in 1..=8 {
+            occupancy.insert((x, 7), make_occ(PlayerId(2), UnitType::Infantry));
+        }
+
+        // 1. 敵がy=8..9に6体残っている（2倍優位ではない）→ まだ押し上げない
+        let dense_enemies: Vec<_> = (1..=6).map(|x| make_enemy(x, 8)).collect();
+        assert!(!context.detect_push_phase(
+            &map,
+            PlayerId(2),
+            &occupancy,
+            &dense_enemies,
+            &registry
+        ));
+
+        // 2. 敵がy<=6に1体でも侵入している → 押し上げない
+        let behind_enemies = vec![make_enemy(5, 6), make_enemy(3, 9)];
+        assert!(!context.detect_push_phase(
+            &map,
+            PlayerId(2),
+            &occupancy,
+            &behind_enemies,
+            &registry
+        ));
+
+        // 3. 敵がy=7の森上に1体でも残っている → 押し上げない
+        let on_front_enemies = vec![make_enemy(9, 7), make_enemy(3, 9)];
+        assert!(!context.detect_push_phase(
+            &map,
+            PlayerId(2),
+            &occupancy,
+            &on_front_enemies,
+            &registry
+        ));
+
+        // 4. 前線周辺の敵が3体まで減り、自軍前衛が2倍以上（8 >= 6）→ 押し上げ発動！
+        let collapsed_enemies = vec![make_enemy(2, 8), make_enemy(5, 9), make_enemy(7, 9)];
+        assert!(context.detect_push_phase(
+            &map,
+            PlayerId(2),
+            &occupancy,
+            &collapsed_enemies,
+            &registry
+        ));
     }
 }
