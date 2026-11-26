@@ -186,11 +186,21 @@ fn evaluate_actions(
     let joint_hold =
         hold_mode == LineHoldMode::Forced && crate::ai::v4::hold_line::forced::with_batteries();
     let battery_sites = if joint_hold {
-        forced_forward_battery_sites(world, &board.tactical)
+        let mut sites = forced_forward_battery_sites(world, &board.tactical);
+        if crate::ai::v4::hold_line::forced::battery_non_prod_only_enabled() {
+            sites.retain(|pos| !board.own_production.contains((pos.x, pos.y)));
+        }
+        sites
     } else {
         Vec::new()
     };
     let (actions, forced) = with_turn_distances(world, &board.tactical, |world, distances| {
+        if board.is_v4 && key_terrain::enabled() {
+            return (
+                key_terrain::evaluate_actions(world, &board, movable_units, distances),
+                None,
+            );
+        }
         trace_capture_blocks(world, &board, &movable_units, distances);
         let hold = (hold_mode == LineHoldMode::Partial)
             .then(|| first_hold_decision(world, &board, &movable_units, distances))
@@ -205,7 +215,7 @@ fn evaluate_actions(
             &battery_sites,
             distances,
         );
-        let actions = movable_units
+        let observed_units: Vec<_> = movable_units
             .into_iter()
             .filter_map(|entity| {
                 let mut unit = SmallMapUnit::observe(world, &board, entity, distances)?;
@@ -218,6 +228,25 @@ fn evaluate_actions(
                 } else if let Some(target) = forced_target {
                     unit.march_to_hold(&board, target, distances);
                 }
+                Some((unit, holding, battery, forced_target))
+            })
+            .collect();
+        if board.is_v4 && crate::ai::v4::hold_line::forced::multi_kill_plan_enabled() {
+            let units_only: Vec<&SmallMapUnit> =
+                observed_units.iter().map(|(u, _, _, _)| u).collect();
+            *board.assigned_kill_targets.borrow_mut() =
+                build_multi_kill_plan(world, &board, &units_only);
+        } else if board.is_v4 && crate::ai::v4::hold_line::forced::focus_kill_plan_enabled() {
+            let units_only: Vec<&SmallMapUnit> =
+                observed_units.iter().map(|(u, _, _, _)| u).collect();
+            board
+                .focus_kill_target
+                .set(select_focus_kill_target(world, &board, &units_only));
+        }
+        let actions = observed_units
+            .into_iter()
+            .filter_map(|(unit, holding, battery, forced_target)| {
+                let entity = unit.state.entity;
                 let mut log = AttackLog {
                     enabled: small_map_trace_enabled(world, player_id),
                     lines: Vec::new(),
@@ -281,6 +310,243 @@ fn evaluate_actions(
         actions,
         board: board.tactical,
     }
+}
+
+/// 試験（`OPENWARS_V4_FOCUS_KILL_PLAN=1`）:
+/// 今手番に動ける味方の合計期待ダメージで撃破可能な敵のうち、最優先で仕留める1体を選ぶ。
+fn select_focus_kill_target(
+    world: &World,
+    board: &SmallMapBoard,
+    units: &[&SmallMapUnit],
+) -> Option<Entity> {
+    let mut totals: HashMap<Entity, (u32, usize)> = HashMap::default();
+    for &unit in units {
+        let mut per_unit: HashMap<Entity, u32> = HashMap::default();
+        for &(x, y) in &unit.candidate_tiles {
+            let pos = GridPosition { x, y };
+            let actions = board.tactical.action_targets.action_targets_at(
+                unit.state.entity,
+                &unit.state.stats,
+                pos,
+                pos != unit.state.position,
+            );
+            for target in actions.attackable_targets.iter().copied() {
+                if !attack_serves_campaign(
+                    world,
+                    unit.campaign.as_ref(),
+                    unit.deployment_target,
+                    target,
+                ) {
+                    continue;
+                }
+                let Some(exchange) = crate::ai::pruning::evaluate_attack_exchange(
+                    world,
+                    unit.state.entity,
+                    target,
+                    pos,
+                    &board.tactical.damage_chart,
+                ) else {
+                    continue;
+                };
+                if exchange.expected_damage > 0 {
+                    per_unit
+                        .entry(target)
+                        .and_modify(|d| *d = (*d).max(exchange.expected_damage))
+                        .or_insert(exchange.expected_damage);
+                }
+            }
+        }
+        for (target, dmg) in per_unit {
+            let entry = totals.entry(target).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(dmg);
+            entry.1 += 1;
+        }
+    }
+
+    totals
+        .into_iter()
+        .filter_map(|(target, (total_dmg, count))| {
+            let hp = world.get::<Health>(target)?;
+            if count < 2 || total_dmg < hp.current {
+                return None;
+            }
+            let stats = world.get::<crate::components::UnitStats>(target)?;
+            let is_damaged = hp.current < hp.max;
+            Some((
+                (
+                    !is_damaged,
+                    std::cmp::Reverse(stats.cost),
+                    count,
+                    target.to_bits(),
+                ),
+                target,
+            ))
+        })
+        .min_by_key(|(key, _)| *key)
+        .map(|(_, target)| target)
+}
+
+/// 試験（`OPENWARS_V4_MULTI_KILL_PLAN=1`）:
+/// 動ける全味方の期待ダメージと射撃位置の排他制約を考慮し、
+/// 有利交換または低反撃の手だけで今ターン中に撃破できる敵の組（味方Entity -> 標的Entity）を割り当てる。
+fn build_multi_kill_plan(
+    world: &World,
+    board: &SmallMapBoard,
+    units: &[&SmallMapUnit],
+) -> HashMap<Entity, Entity> {
+    struct ShotOption {
+        unit: Entity,
+        pos: GridPosition,
+        damage: u32,
+        counter: u32,
+        is_indirect: bool,
+    }
+
+    let mut options_by_enemy: HashMap<Entity, Vec<ShotOption>> = HashMap::default();
+    for &unit in units {
+        let is_indirect = unit.state.stats.min_range > 1;
+        let mut by_target: HashMap<Entity, Vec<ShotOption>> = HashMap::default();
+        for &(x, y) in &unit.candidate_tiles {
+            let pos = GridPosition { x, y };
+            let actions = board.tactical.action_targets.action_targets_at(
+                unit.state.entity,
+                &unit.state.stats,
+                pos,
+                pos != unit.state.position,
+            );
+            for target in actions.attackable_targets.iter().copied() {
+                if !attack_serves_campaign(
+                    world,
+                    unit.campaign.as_ref(),
+                    unit.deployment_target,
+                    target,
+                ) {
+                    continue;
+                }
+                let Some(exchange) = crate::ai::pruning::evaluate_attack_exchange(
+                    world,
+                    unit.state.entity,
+                    target,
+                    pos,
+                    &board.tactical.damage_chart,
+                ) else {
+                    continue;
+                };
+                if exchange.expected_damage == 0 {
+                    continue;
+                }
+                let target_hp = world.get::<Health>(target).map_or(100, |h| h.current);
+                let survivable_kill = exchange.expected_damage >= target_hp
+                    && exchange.expected_counter_damage < unit.state.hp;
+                // 直接部隊は有利交換・生存可能致死・または反撃が軽微（現在HPの半分未満）な手だけを採用する。
+                if !is_indirect
+                    && !exchange.is_favorable_matchup()
+                    && !survivable_kill
+                    && exchange.expected_counter_damage.saturating_mul(2) >= unit.state.hp
+                {
+                    continue;
+                }
+                if unit.state.stats.movement_type == crate::resources::MovementType::Air
+                    && exchange.expected_counter_damage >= unit.state.hp
+                {
+                    continue;
+                }
+                by_target.entry(target).or_default().push(ShotOption {
+                    unit: unit.state.entity,
+                    pos,
+                    damage: exchange.expected_damage,
+                    counter: exchange.expected_counter_damage,
+                    is_indirect,
+                });
+            }
+        }
+        for (target, mut opts) in by_target {
+            opts.sort_unstable_by_key(|o| {
+                (std::cmp::Reverse(o.damage), o.counter, o.pos.y, o.pos.x)
+            });
+            opts.truncate(2);
+            options_by_enemy.entry(target).or_default().extend(opts);
+        }
+    }
+
+    let home_set = world
+        .get_resource::<planner::InitialHoldSites>()
+        .and_then(|sites| sites.line(&board.tactical))
+        .map(|line| &line.home);
+
+    let mut enemy_order: Vec<(Entity, u32)> = options_by_enemy
+        .keys()
+        .filter_map(|&enemy| {
+            let hp = world.get::<Health>(enemy)?;
+            Some((enemy, hp.current))
+        })
+        .collect();
+    enemy_order.sort_unstable_by_key(|&(enemy, hp)| {
+        let max_hp = world.get::<Health>(enemy).map_or(100, |h| h.max);
+        let cost = world
+            .get::<crate::components::UnitStats>(enemy)
+            .map_or(0, |s| s.cost);
+        let in_home = world
+            .get::<GridPosition>(enemy)
+            .is_some_and(|p| home_set.is_some_and(|h| h.contains(p)));
+        let is_damaged = hp < max_hp;
+        (
+            !in_home,
+            !is_damaged,
+            std::cmp::Reverse(cost),
+            hp,
+            enemy.to_bits(),
+        )
+    });
+
+    let mut assigned: HashMap<Entity, Entity> = HashMap::default();
+    let mut used_positions: HashSet<GridPosition> = HashSet::default();
+    for (enemy, enemy_hp) in enemy_order {
+        let Some(opts) = options_by_enemy.get(&enemy) else {
+            continue;
+        };
+        let mut best_per_unit: HashMap<Entity, &ShotOption> = HashMap::default();
+        for opt in opts {
+            if assigned.contains_key(&opt.unit) || used_positions.contains(&opt.pos) {
+                continue;
+            }
+            best_per_unit.entry(opt.unit).or_insert(opt);
+        }
+        let mut candidates: Vec<&ShotOption> = best_per_unit.into_values().collect();
+        // すでに単独撃破できる敵は既存の +5000 に任せ、複数体割り当ての対象から外す。
+        if candidates.iter().any(|o| o.damage >= enemy_hp) {
+            continue;
+        }
+        candidates.sort_unstable_by_key(|o| {
+            (
+                !o.is_indirect,
+                std::cmp::Reverse(o.damage),
+                o.counter,
+                o.unit.to_bits(),
+            )
+        });
+        let mut chosen: Vec<&ShotOption> = Vec::new();
+        let mut chosen_pos: HashSet<GridPosition> = HashSet::default();
+        let mut sum_dmg: u32 = 0;
+        for opt in candidates {
+            if chosen_pos.contains(&opt.pos) {
+                continue;
+            }
+            chosen.push(opt);
+            chosen_pos.insert(opt.pos);
+            sum_dmg = sum_dmg.saturating_add(opt.damage);
+            if sum_dmg >= enemy_hp {
+                break;
+            }
+        }
+        if sum_dmg >= enemy_hp && chosen.len() >= 2 && chosen.len() <= 3 {
+            for opt in chosen {
+                assigned.insert(opt.unit, enemy);
+                used_positions.insert(opt.pos);
+            }
+        }
+    }
+    assigned
 }
 
 /// 【診断】占領任務の兵が目標へこの手番に届くか、敵に塞がれているかを記録する
@@ -541,6 +807,55 @@ fn trace_forced_hold(world: &World, player: PlayerId, message: impl FnOnce() -> 
     eprintln!("FORCED_HOLD turn={turn} player={} {}", player.0, message());
 }
 
+/// 強制保持で使う現在の防衛ラインを返す（`OPENWARS_V4_DYNAMIC_HOLD_LINE=1` 時は戦況に応じて前後させる）。
+fn resolve_hold_line(
+    world: &World,
+    tactical: &TacticalBoard,
+) -> Option<crate::ai::v4::hold_line::forced::DynamicHoldLine> {
+    use crate::ai::v4::hold_line::forced;
+    let initial = world
+        .get_resource::<planner::InitialHoldSites>()
+        .and_then(|sites| sites.line(tactical))?;
+    if !forced::dynamic_hold_line_enabled() {
+        return Some(forced::DynamicHoldLine {
+            cells: initial.cells.clone(),
+            is_retreated: false,
+        });
+    }
+    let enemies = enemy_ground_positions(world, tactical);
+    let allies: HashSet<GridPosition> = tactical
+        .action_targets
+        .units()
+        .iter()
+        .filter(|unit| unit.faction == tactical.player_id && !unit.is_transporting)
+        .map(|unit| unit.position)
+        .collect();
+    Some(forced::select_dynamic_line(
+        &initial.cells,
+        &initial.home,
+        &enemies,
+        &allies,
+        |pos| {
+            tactical.map.get_terrain(pos.x, pos.y).is_some_and(|t| {
+                crate::systems::movement::get_valid_movement_cost(
+                    &tactical.registry,
+                    crate::resources::MovementType::Infantry,
+                    t,
+                )
+                .is_some()
+            })
+        },
+        |cell| {
+            tactical
+                .map
+                .get_adjacent(cell.x, cell.y)
+                .into_iter()
+                .map(|(x, y)| GridPosition { x, y })
+                .collect()
+        },
+    ))
+}
+
 /// 強制保持の上限実験: 占領担当も含め、陣地線の空きマスに向かう兵の割当を更新する。
 /// 防衛・回復・輸送・出発待ちは従来どおり優先する。
 fn forced_line_targets(
@@ -551,13 +866,11 @@ fn forced_line_targets(
 ) -> std::collections::BTreeMap<Entity, GridPosition> {
     use crate::ai::v4::hold_line::forced;
     let tactical = &board.tactical;
-    let Some(line) = world
-        .get_resource::<planner::InitialHoldSites>()
-        .and_then(|sites| sites.line(tactical))
-    else {
+    let Some(dynamic_line) = resolve_hold_line(world, tactical) else {
         trace_forced_hold(world, tactical.player_id, || "no_line".into());
         return Default::default();
     };
+    let line_cells = &dynamic_line.cells;
     let previous = forced::previous(world, tactical.player_id);
     let units = movable
         .iter()
@@ -606,7 +919,7 @@ fn forced_line_targets(
         .iter()
         .filter(|unit| {
             !unit.is_transporting
-                && line.cells.contains(&unit.position)
+                && line_cells.contains(&unit.position)
                 && (unit.faction != tactical.player_id
                     || !(pool_set.contains(&unit.entity) || previous.contains_key(&unit.entity)))
         })
@@ -618,21 +931,25 @@ fn forced_line_targets(
             && (!movable_set.contains(&entity) || pool_set.contains(&entity))
     };
     let input = forced::AssignInput {
-        line: &line.cells,
+        line: line_cells,
         unavailable: &unavailable,
         pool: &pool,
     };
     // 敵地上部隊が入った・隣接したマスだけ、新たに出発させる。それまでは本来の仕事を続ける。
-    // ただし所有済みの前線都市上にいる歩兵（占領完了・前線生産）は線へ解放する。
+    // ただし後退ライン発動時はすでに敵が侵入しているため、ライン全体を埋めて壁を作る。
     let enemies = enemy_ground_positions(world, tactical);
-    let contested = forced::contested_cells(&line.cells, &enemies, |cell| {
-        tactical
-            .map
-            .get_adjacent(cell.x, cell.y)
-            .into_iter()
-            .map(|(x, y)| GridPosition { x, y })
-            .collect()
-    });
+    let contested: HashSet<GridPosition> = if dynamic_line.is_retreated {
+        line_cells.iter().copied().collect()
+    } else {
+        forced::contested_cells(line_cells, &enemies, |cell| {
+            tactical
+                .map
+                .get_adjacent(cell.x, cell.y)
+                .into_iter()
+                .map(|(x, y)| GridPosition { x, y })
+                .collect()
+        })
+    };
     // 試験: 守備兵を外すと敵が次の手番に入れる非生産前線都市では、その兵を都市担当として残す。
     let guards = if forced::city_guard_enabled() {
         let garrisons = pool_units
@@ -695,6 +1012,67 @@ fn forced_line_targets(
     });
     // 都市担当は保持先＝現在地として渡し、その場の射撃・待機だけを残す。
     assignments.extend(guards);
+    if forced::second_line_fill_enabled()
+        && !contested.is_empty()
+        && let Some(initial) = world
+            .get_resource::<planner::InitialHoldSites>()
+            .and_then(|sites| sites.line(tactical))
+    {
+        let second_line = forced::retreat1_cells(
+            &initial.cells,
+            &initial.home,
+            |pos| {
+                tactical.map.get_terrain(pos.x, pos.y).is_some_and(|t| {
+                    crate::systems::movement::get_valid_movement_cost(
+                        &tactical.registry,
+                        crate::resources::MovementType::Infantry,
+                        t,
+                    )
+                    .is_some()
+                })
+            },
+            |cell| {
+                tactical
+                    .map
+                    .get_adjacent(cell.x, cell.y)
+                    .into_iter()
+                    .map(|(x, y)| GridPosition { x, y })
+                    .collect()
+            },
+        );
+        let remaining_pool: Vec<Entity> = pool
+            .iter()
+            .copied()
+            .filter(|e| !assignments.contains_key(e))
+            .collect();
+        let remaining_set: HashSet<Entity> = remaining_pool.iter().copied().collect();
+        let second_unavail: HashSet<GridPosition> = tactical
+            .action_targets
+            .units()
+            .iter()
+            .filter(|u| {
+                !u.is_transporting
+                    && second_line.contains(&u.position)
+                    && (u.faction != tactical.player_id || !remaining_set.contains(&u.entity))
+            })
+            .map(|u| u.position)
+            .collect();
+        let second_assignments = forced::assign(
+            &Default::default(),
+            &forced::AssignInput {
+                line: &second_line,
+                unavailable: &second_unavail,
+                pool: &remaining_pool,
+            },
+            |_| true,
+            |entity, cell| {
+                let unit = pool_units.iter().find(|u| u.state.entity == entity)?;
+                let distance = distances.turns(&unit.state.stats, unit.state.position, cell, 0);
+                Some((distance.turns, distance.used_mp))
+            },
+        );
+        assignments.extend(second_assignments);
+    }
     assignments
 }
 
@@ -847,6 +1225,12 @@ struct SmallMapBoard {
     own_production: OwnProductionSites,
     /// 試験: 上の敵を優先攻撃する非生産前線都市（強制保持＋スイッチ時のみ非空）。
     recapture_cities: HashSet<GridPosition>,
+    /// 試験: 森の列の歩兵が隣接敵を任務標的とみなす陣地線マス（強制保持＋スイッチ時のみ非空）。
+    hold_line_cells: HashSet<GridPosition>,
+    /// 試験: 手番内の集中攻撃で優先して仕留める標的。
+    focus_kill_target: std::cell::Cell<Option<Entity>>,
+    /// 試験: ターン全体のマルチユニット火力割り当て（味方Entity -> 撃破標的Entity）。
+    assigned_kill_targets: std::cell::RefCell<HashMap<Entity, Entity>>,
     /// 敵生産口の占位。V4限定（V3は対戦評価の基準線として挙動を不変に保つ）。
     blockade: Option<EnemyProductionBlockade>,
     /// 修理滞在中（HP100未満）のunitの位置。回復拠点の空きを判定する。
@@ -854,6 +1238,16 @@ struct SmallMapBoard {
 }
 
 impl SmallMapBoard {
+    fn is_focus_kill_target(&self, unit: Entity, target: Entity) -> bool {
+        if self.focus_kill_target.get() == Some(target) {
+            return true;
+        }
+        self.assigned_kill_targets
+            .borrow()
+            .get(&unit)
+            .is_some_and(|&assigned| assigned == target)
+    }
+
     fn observe(world: &World, tactical: TacticalBoard) -> Self {
         let player_id = tactical.player_id;
         let ai_version = crate::ai::resolve_player_ai_version(world, player_id);
@@ -863,6 +1257,15 @@ impl SmallMapBoard {
             .map_or(0, |p| p.funds);
         let own_production = OwnProductionSites::observe(&tactical, funds);
         let recapture_cities = forced_recapture_cities(world, &tactical, &own_production);
+        let hold_line_cells = if crate::ai::v4::hold_line::forced::enabled()
+            && crate::ai::v4::hold_line::forced::line_adjacent_target_enabled()
+        {
+            resolve_hold_line(world, &tactical)
+                .map(|line| line.cells.into_iter().collect())
+                .unwrap_or_default()
+        } else {
+            HashSet::default()
+        };
         let blockade = ai_version
             .uses_enemy_production_blockade()
             .then(|| EnemyProductionBlockade::observe(&tactical));
@@ -886,6 +1289,9 @@ impl SmallMapBoard {
             tactical,
             own_production,
             recapture_cities,
+            hold_line_cells,
+            focus_kill_target: std::cell::Cell::new(None),
+            assigned_kill_targets: std::cell::RefCell::new(HashMap::default()),
             blockade,
             repairing_units,
         }
@@ -1774,7 +2180,20 @@ fn consider_attacks(
             .hp
             .saturating_sub(exchange.expected_counter_damage);
         let attack_def_bonus = terrain_defense_bonus(&board.tactical, tile.position);
-        let post_attack_loss_value = if board.is_v4 && unit.state.stats.min_range <= 1 {
+        let post_attack_loss_value = if board.is_v4
+            && unit.state.stats.movement_type == crate::resources::MovementType::Air
+            && crate::ai::v4::hold_line::forced::air_actual_reach_loss_enabled()
+        {
+            air_post_attack_expected_loss_value(
+                &board.tactical,
+                &unit.state,
+                tile.position,
+                post_counter_hp,
+                attack_def_bonus,
+                attack.target_position,
+                attack.expected_damage,
+            )
+        } else if board.is_v4 && unit.state.stats.min_range <= 1 {
             crate::ai::threat::post_attack_expected_loss_value(
                 &board.tactical.map,
                 (tile.position.x, tile.position.y),
@@ -1807,6 +2226,7 @@ fn consider_attacks(
         let Some(priority) = attack_priority(
             board,
             unit,
+            tile.position,
             target,
             attack.target_position,
             exchange.is_favorable_matchup(),
@@ -1831,9 +2251,38 @@ fn consider_attacks(
             priority
         };
         let mut attack_score = tile.base_score + attack.score - post_attack_loss_value;
+        if board.is_focus_kill_target(unit.state.entity, target) {
+            // 試験: 味方複数で今ターン中に仕留め切れる標的へ集中させる（単独撃破+5000未満）。
+            const FOCUS_KILL_BONUS: i32 = 4_000;
+            attack_score += FOCUS_KILL_BONUS;
+            if (crate::ai::v4::hold_line::forced::focus_kill_strategic_enabled()
+                || crate::ai::v4::hold_line::forced::multi_kill_plan_enabled())
+                && unit.state.combat_ineffective
+                && attack.expected_damage < attack.target_hp
+            {
+                attack_score += 3_000;
+            }
+        }
         let on_own_facility = board
             .own_production
             .contains((tile.position.x, tile.position.y));
+        if board.is_v4
+            && crate::ai::v4::hold_line::forced::vacate_production_indirect_enabled()
+            && on_own_facility
+            && unit.starts_on_own_production
+            && unit.state.stats.min_range > 1
+            && unit.has_non_production_wait_destination
+            && board.own_production.free_slots < board.own_production.demand_slots
+            && attack.expected_damage < attack.target_hp
+        {
+            log.push(|| {
+                format!(
+                    "{target:?}@{:?}:生産枠優先で間接退去",
+                    (tile.position.x, tile.position.y)
+                )
+            });
+            continue;
+        }
         if !board.production_block_trial
             && unit.starts_on_own_production
             && !unit.state.combat_ineffective
@@ -1894,6 +2343,111 @@ fn consider_attacks(
     }
 }
 
+/// 試験（`OPENWARS_V4_AIR_ACTUAL_REACH_LOSS=1`）:
+/// 航空機の攻撃後損失見込みを、実際に対空攻撃ができ、地形・占有・ZOCを踏まえてそのマスへ届く敵だけで見積もる。
+fn air_post_attack_expected_loss_value(
+    board: &TacticalBoard,
+    state: &UnitState,
+    tile: GridPosition,
+    post_counter_hp: u32,
+    tile_def_bonus: u32,
+    attacked_target_pos: GridPosition,
+    damage_dealt: u32,
+) -> i32 {
+    if post_counter_hp == 0 {
+        return 0;
+    }
+    let mut occupancy = board.occupancy.clone();
+    if state.position != tile
+        && let Some(my_occ) = occupancy.remove(&(state.position.x, state.position.y))
+    {
+        occupancy.insert((tile.x, tile.y), my_occ);
+    }
+    let mut total_damage = 0;
+    for enemy in &board.enemies {
+        let mut adjusted = *enemy;
+        if adjusted.position == attacked_target_pos {
+            adjusted.hp = adjusted.hp.saturating_sub(damage_dealt);
+        }
+        if adjusted.hp == 0 {
+            continue;
+        }
+        let distance = board
+            .map
+            .distance(adjusted.position.x, adjusted.position.y, tile.x, tile.y);
+        if adjusted.min_range > 1 {
+            if distance >= adjusted.min_range && distance <= adjusted.max_range {
+                total_damage += crate::ai::threat::shot_damage(
+                    &adjusted,
+                    state.stats.unit_type,
+                    distance,
+                    tile_def_bonus,
+                    &board.damage_chart,
+                    &board.registry,
+                );
+            }
+            continue;
+        }
+        if distance > adjusted.max_movement + adjusted.max_range {
+            continue;
+        }
+        let firing_distance = distance.saturating_sub(adjusted.max_movement).max(1);
+        let dmg = crate::ai::threat::shot_damage(
+            &adjusted,
+            state.stats.unit_type,
+            firing_distance,
+            tile_def_bonus,
+            &board.damage_chart,
+            &board.registry,
+        );
+        if dmg == 0 {
+            continue;
+        }
+        if enemy_can_reach_air_attack_tile(board, &occupancy, &adjusted, tile) {
+            total_damage += dmg;
+        }
+    }
+    crate::ai::threat::expected_loss_value(total_damage, state.stats.cost, post_counter_hp)
+}
+
+/// 直接対空ユニットが地形・占有・ZOCを考慮して攻撃対象マスへ射撃できるか。
+fn enemy_can_reach_air_attack_tile(
+    board: &TacticalBoard,
+    occupancy: &HashMap<(usize, usize), crate::systems::movement::OccupantInfo>,
+    enemy: &crate::ai::threat::EnemyThreatInfo,
+    tile: GridPosition,
+) -> bool {
+    let origin = (enemy.position.x, enemy.position.y);
+    let Some(enemy_occ) = occupancy.get(&origin) else {
+        return false;
+    };
+    let Some(enemy_stats) = board
+        .registry
+        .get_unit(&crate::resources::master_data::UnitName(
+            enemy.unit_type.as_str().to_owned(),
+        ))
+    else {
+        return false;
+    };
+    let reachable = calculate_reachable_tiles(
+        &board.map,
+        occupancy,
+        origin,
+        enemy_stats.movement_type,
+        enemy.max_movement,
+        u32::MAX,
+        enemy_occ.player_id,
+        enemy.unit_type,
+        &board.registry,
+    );
+    reachable.into_iter().any(|pos| {
+        (pos == origin || !occupancy.contains_key(&pos)) && {
+            let d = board.map.distance(pos.0, pos.1, tile.x, tile.y);
+            d >= enemy.min_range && d <= enemy.max_range
+        }
+    })
+}
+
 /// 生産枠に見合わない射撃は、攻撃の固定加点・優先度ではなく、
 /// その位置の価値と実際の交換利益で退去候補と比較する。
 fn rank_shot_with_production_cost(rank: Rank, combat_gain: i32, slot_cost: i32, base: i32) -> Rank {
@@ -1914,6 +2468,7 @@ fn rank_shot_with_production_cost(rank: Rank, combat_gain: i32, slot_cost: i32, 
 fn attack_priority(
     board: &SmallMapBoard,
     unit: &SmallMapUnit,
+    attack_position: GridPosition,
     target: Entity,
     target_position: GridPosition,
     favorable_matchup: bool,
@@ -1925,7 +2480,22 @@ fn attack_priority(
             .is_some_and(|contract| contract.target == target_position);
     // 試験: 奪われた・敵が乗った前線都市の上の敵は、任務によらず作戦上の標的とする。
     let occupies_lost_city = board.recapture_cities.contains(&target_position);
+    // 試験: 森の列の歩兵には、隣接する敵を任務上の標的とする。
+    let is_line_adjacent_target = !board.hold_line_cells.is_empty()
+        && unit.state.stats.can_capture
+        && (unit.is_forced_hold || board.hold_line_cells.contains(&attack_position))
+        && board.tactical.map.distance(
+            attack_position.x,
+            attack_position.y,
+            target_position.x,
+            target_position.y,
+        ) == 1;
+    let is_focus_kill = board.is_v4
+        && crate::ai::v4::hold_line::forced::focus_kill_strategic_enabled()
+        && board.is_focus_kill_target(unit.state.entity, target);
     let is_strategic_target = occupies_lost_city
+        || is_line_adjacent_target
+        || is_focus_kill
         || if unit.is_capture_mission {
             blocks_capture_target
         } else {
@@ -1935,12 +2505,23 @@ fn attack_priority(
                 })
         };
     let has_strategic_mission = occupies_lost_city
+        || is_line_adjacent_target
+        || is_focus_kill
         || unit.deployment_target.is_some()
         || unit.has_offensive_mission
         || blocks_capture_target;
+    let must_press_target = occupies_lost_city || is_line_adjacent_target || blocks_capture_target;
+    let suppress_infantry_fallback = board.is_v4
+        && crate::ai::v4::hold_line::forced::infantry_no_unfavorable_fallback_enabled()
+        && unit.state.stats.can_capture
+        && !must_press_target;
     match (is_strategic_target, favorable_matchup) {
         (true, true) => Some(ActionPriority::FavorableStrategicTarget),
         (false, true) if has_strategic_mission => Some(ActionPriority::FavorableLocalTarget),
+        // 試験: 歩兵の汎用Attack任務では不利交換を抑止し、生存可能な致死攻撃（とどめ）だけを残す。
+        (true, false) if suppress_infantry_fallback => {
+            is_survivable_lethal_strike.then_some(ActionPriority::Normal)
+        }
         // 実行段階の作戦Entityは、他に有利な敵がいない場合だけ不利交換も受容する。
         (true, false) => Some(ActionPriority::StrategicTargetFallback),
         // 攻勢任務・作戦を抱えるEntityは、生存可能な致死攻撃までは消さない
@@ -2153,6 +2734,7 @@ fn prefer_fire_in_place(
 }
 
 mod execution_order;
+pub(super) mod key_terrain;
 pub(crate) mod squad_executor;
 
 #[cfg(test)]

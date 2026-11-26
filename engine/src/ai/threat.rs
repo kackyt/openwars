@@ -43,7 +43,7 @@ const EXPOSURE_RISK_NUM: i32 = 1;
 const EXPOSURE_RISK_DEN: i32 = 1;
 
 /// 本番と同じ武器選択・HP・地形防御式で、敵一体の射撃を評価する。
-fn shot_damage(
+pub(crate) fn shot_damage(
     enemy: &EnemyThreatInfo,
     target: UnitType,
     distance: u32,
@@ -73,7 +73,7 @@ fn shot_damage(
     crate::systems::combat::calculate_damage_formula(base, enemy.hp, defense, false)
 }
 
-fn expected_loss_value(total_damage: u32, my_cost: u32, my_hp: u32) -> i32 {
+pub(crate) fn expected_loss_value(total_damage: u32, my_cost: u32, my_hp: u32) -> i32 {
     let effective_damage = total_damage.min(my_hp);
     (effective_damage * my_cost / 100) as i32
 }

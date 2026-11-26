@@ -11279,7 +11279,7 @@ mod combat_responsibilities;
 mod local_assignment;
 // 標準V4の施設を目的とする戦闘割当。
 mod objective_allocation;
-mod planning_policy;
+pub(crate) mod planning_policy;
 mod route_operations;
 
 // 再編本体と通常／拡張hookの差分契約。

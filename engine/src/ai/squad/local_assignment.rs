@@ -147,10 +147,16 @@ fn assign_secure(
         responsibilities,
         &[MissionType::Capture],
     );
+    let no_surplus_attack = hold_no_surplus_attack(world, player_id);
     let combat = assignment
         .combat_entities
         .iter()
-        .chain(assignment.capture_entities.iter())
+        .chain(
+            assignment
+                .capture_entities
+                .iter()
+                .take(if no_surplus_attack { 0 } else { usize::MAX }),
+        )
         .copied()
         .filter(|entity| !assigned_capture.contains(entity))
         .filter(|entity| cargo_is_landed_on_assignment_island(world, assignment, *entity))
@@ -165,6 +171,13 @@ fn assign_secure(
         combat_responsibilities,
         &[MissionType::Attack, MissionType::Defense],
     );
+}
+
+fn hold_no_surplus_attack(world: &World, player_id: PlayerId) -> bool {
+    crate::ai::v4::hold_line::forced::enabled()
+        && crate::ai::v4::hold_line::forced::no_surplus_attack_enabled()
+        && crate::ai::strategy_profile::current_profile(world, player_id)
+            == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
 }
 
 /// 占領責務を先に確定し、島外から自力展開できる戦闘役も攻勢へ配属する。
@@ -199,10 +212,16 @@ fn assign_offense(
     );
     // 航空戦力など作戦島へ自力展開できる戦力は、島外にいても輸送cargoへ
     // 入れず、直接Attack/Defense責務を与える。
+    let no_surplus_attack = hold_no_surplus_attack(world, player_id);
     let combat = assignment
         .combat_entities
         .iter()
-        .chain(assignment.capture_entities.iter())
+        .chain(
+            assignment
+                .capture_entities
+                .iter()
+                .take(if no_surplus_attack { 0 } else { usize::MAX }),
+        )
         .copied()
         .filter(|entity| !assigned_capture.contains(entity))
         .filter(|entity| {

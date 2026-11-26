@@ -204,6 +204,182 @@ pub(crate) fn city_recapture_enabled() -> bool {
     std::env::var("OPENWARS_V4_FORCE_CITY_RECAPTURE").as_deref() == Ok("1")
 }
 
+/// 陣地線より敵陣側の物件を占領候補から外す試験スイッチ（`OPENWARS_V4_HOLD_HOME_CAPTURES_ONLY=1`）。
+/// 強制保持が有効なときだけ使う。
+pub(crate) fn home_captures_only_enabled() -> bool {
+    std::env::var("OPENWARS_V4_HOLD_HOME_CAPTURES_ONLY").as_deref() == Ok("1")
+}
+
+/// 森の列の歩兵に隣接する敵を任務上の標的とする試験スイッチ（`OPENWARS_V4_HOLD_LINE_ADJACENT_TARGET=1`）。
+/// 強制保持が有効なときだけ使う。
+pub(crate) fn line_adjacent_target_enabled() -> bool {
+    std::env::var("OPENWARS_V4_HOLD_LINE_ADJACENT_TARGET").as_deref() == Ok("1")
+}
+
+/// 森の守備の歩兵と間接部隊が同じ敵を撃つとき、間接射撃を先にする試験スイッチ（`OPENWARS_V4_HOLD_INDIRECT_FIRST=1`）。
+/// 強制保持が有効なときだけ使う。
+pub(crate) fn indirect_first_enabled() -> bool {
+    std::env::var("OPENWARS_V4_HOLD_INDIRECT_FIRST").as_deref() == Ok("1")
+}
+
+/// 航空機の攻撃後損失見込みを、実際に対空攻撃できて到達可能な敵だけで計算する試験スイッチ（`OPENWARS_V4_AIR_ACTUAL_REACH_LOSS=1`）。
+pub(crate) fn air_actual_reach_loss_enabled() -> bool {
+    std::env::var("OPENWARS_V4_AIR_ACTUAL_REACH_LOSS").as_deref() == Ok("1")
+}
+
+/// 余剰の占領要員（歩兵）を攻撃任務へ流さず、陣地線保持（Reserve）へ残す試験スイッチ（`OPENWARS_V4_HOLD_NO_SURPLUS_ATTACK=1`）。
+pub(crate) fn no_surplus_attack_enabled() -> bool {
+    std::env::var("OPENWARS_V4_HOLD_NO_SURPLUS_ATTACK").as_deref() == Ok("1")
+}
+
+/// 歩兵の汎用Attack任務で不利交換（StrategicTargetFallback）を抑止し、有利交換と致死攻撃だけを許可する試験スイッチ（`OPENWARS_V4_INFANTRY_NO_UNFAVORABLE_FALLBACK=1`）。
+pub(crate) fn infantry_no_unfavorable_fallback_enabled() -> bool {
+    std::env::var("OPENWARS_V4_INFANTRY_NO_UNFAVORABLE_FALLBACK").as_deref() == Ok("1")
+}
+
+/// 戦況に応じて防衛ラインを前後させる試験スイッチ（`OPENWARS_V4_DYNAMIC_HOLD_LINE=1`）。
+pub(crate) fn dynamic_hold_line_enabled() -> bool {
+    std::env::var("OPENWARS_V4_DYNAMIC_HOLD_LINE").as_deref() == Ok("1")
+}
+
+/// 手番内の集中攻撃（キルプラン）を有効にする試験スイッチ（`OPENWARS_V4_FOCUS_KILL_PLAN=1`）。
+pub(crate) fn focus_kill_plan_enabled() -> bool {
+    std::env::var("OPENWARS_V4_FOCUS_KILL_PLAN").as_deref() == Ok("1")
+}
+
+/// 近い前線都市から先に占領目標へ割り当てる試験スイッチ（`OPENWARS_V4_CAPTURE_NEAREST_FRONT_FIRST=1`）。
+pub(crate) fn capture_nearest_front_first_enabled() -> bool {
+    std::env::var("OPENWARS_V4_CAPTURE_NEAREST_FRONT_FIRST").as_deref() == Ok("1")
+}
+
+/// 強制砲座を非生産の前線都市だけに限定する試験スイッチ（`OPENWARS_V4_BATTERY_NON_PROD_ONLY=1`）。
+pub(crate) fn battery_non_prod_only_enabled() -> bool {
+    std::env::var("OPENWARS_V4_BATTERY_NON_PROD_ONLY").as_deref() == Ok("1")
+}
+
+/// 集中攻撃標的（focus_kill_target）に対しては不利交換制限と負傷ペナルティを外して総攻撃する試験スイッチ（`OPENWARS_V4_FOCUS_KILL_STRATEGIC=1`）。
+pub(crate) fn focus_kill_strategic_enabled() -> bool {
+    std::env::var("OPENWARS_V4_FOCUS_KILL_STRATEGIC").as_deref() == Ok("1")
+}
+
+/// 生産枠不足時に工場上の間接部隊を退去・前進させる試験スイッチ（`OPENWARS_V4_VACATE_PRODUCTION_INDIRECT=1`）。
+pub(crate) fn vacate_production_indirect_enabled() -> bool {
+    std::env::var("OPENWARS_V4_VACATE_PRODUCTION_INDIRECT").as_deref() == Ok("1")
+}
+
+/// 第1防衛線に割り当てられない余剰歩兵を第2防衛線（1マス自陣側）へ押し出す試験スイッチ（`OPENWARS_V4_SECOND_LINE_FILL=1`）。
+pub(crate) fn second_line_fill_enabled() -> bool {
+    std::env::var("OPENWARS_V4_SECOND_LINE_FILL").as_deref() == Ok("1")
+}
+
+/// ターン全体のマルチユニット火力割り当て（複数撃破キルプラン）を有効にする試験スイッチ（`OPENWARS_V4_MULTI_KILL_PLAN=1`）。
+pub(crate) fn multi_kill_plan_enabled() -> bool {
+    std::env::var("OPENWARS_V4_MULTI_KILL_PLAN").as_deref() == Ok("1")
+}
+
+/// 初期ラインの1マス自陣側にある地上マス列（第2防衛線）を返す。
+pub(crate) fn retreat1_cells(
+    initial_cells: &[GridPosition],
+    initial_home: &HashSet<GridPosition>,
+    is_ground: impl Fn(GridPosition) -> bool,
+    adjacent: impl Fn(GridPosition) -> Vec<GridPosition>,
+) -> Vec<GridPosition> {
+    let mut set = HashSet::default();
+    for &pos in initial_cells {
+        for next in adjacent(pos) {
+            if is_ground(next) && initial_home.contains(&next) {
+                set.insert(next);
+            }
+        }
+    }
+    let mut vec: Vec<GridPosition> = set.into_iter().collect();
+    vec.sort_unstable_by_key(|p| (p.y, p.x));
+    vec
+}
+
+/// 戦況に応じて選んだ防衛ライン。
+pub(crate) struct DynamicHoldLine {
+    pub(crate) cells: Vec<GridPosition>,
+    /// 後退ラインを選んでいるか（後退時は全マスを埋めて壁を作る）。
+    pub(crate) is_retreated: bool,
+}
+
+/// 初期の地形カット（`initial_cells`, `initial_home`）と現在の敵・味方位置から防衛ラインを決める。
+///
+/// - 敵が `retreat1` より内側（`inner_home`）へ2体以上侵入 → `retreat2`（都市ライン）へ後退
+/// - 敵が `initial_home` へ1体以上侵入 → `retreat1`（初期ラインの1マス自陣側）へ後退
+/// - `initial_home` と初期ライン周辺に敵がおらず、初期ラインの過半数を味方が保持 → `advance1`（1マス敵陣側）へ前進
+/// - それ以外 → `initial_cells`
+pub(crate) fn select_dynamic_line(
+    initial_cells: &[GridPosition],
+    initial_home: &HashSet<GridPosition>,
+    enemies: &HashSet<GridPosition>,
+    allies: &HashSet<GridPosition>,
+    is_ground: impl Fn(GridPosition) -> bool,
+    adjacent: impl Fn(GridPosition) -> Vec<GridPosition>,
+) -> DynamicHoldLine {
+    let initial_set: HashSet<GridPosition> = initial_cells.iter().copied().collect();
+    let collect_adjacent = |frontier: &[GridPosition], filter: &dyn Fn(GridPosition) -> bool| {
+        let mut set = HashSet::default();
+        for &pos in frontier {
+            for next in adjacent(pos) {
+                if is_ground(next) && filter(next) {
+                    set.insert(next);
+                }
+            }
+        }
+        let mut vec: Vec<GridPosition> = set.into_iter().collect();
+        vec.sort_unstable_by_key(|p| (p.y, p.x));
+        vec
+    };
+
+    let retreat1 = collect_adjacent(initial_cells, &|p| initial_home.contains(&p));
+    let retreat1_set: HashSet<GridPosition> = retreat1.iter().copied().collect();
+    let inner_home: HashSet<GridPosition> = initial_home
+        .iter()
+        .copied()
+        .filter(|p| !retreat1_set.contains(p))
+        .collect();
+    let retreat2 = collect_adjacent(&retreat1, &|p| inner_home.contains(&p));
+    let advance1 = collect_adjacent(initial_cells, &|p| {
+        !initial_home.contains(&p) && !initial_set.contains(&p)
+    });
+
+    let enemies_in_inner = enemies.iter().filter(|p| inner_home.contains(p)).count();
+    if enemies_in_inner >= 2 && !retreat2.is_empty() {
+        return DynamicHoldLine {
+            cells: retreat2,
+            is_retreated: true,
+        };
+    }
+    let enemies_in_home = enemies.iter().filter(|p| initial_home.contains(p)).count();
+    if enemies_in_home >= 1 && !retreat1.is_empty() {
+        return DynamicHoldLine {
+            cells: retreat1,
+            is_retreated: true,
+        };
+    }
+    let line_contested = initial_cells
+        .iter()
+        .any(|c| enemies.contains(c) || adjacent(*c).iter().any(|n| enemies.contains(n)));
+    let allies_on_line = initial_cells.iter().filter(|c| allies.contains(c)).count();
+    if enemies_in_home == 0
+        && !line_contested
+        && !initial_cells.is_empty()
+        && allies_on_line * 2 >= initial_cells.len()
+        && !advance1.is_empty()
+    {
+        return DynamicHoldLine {
+            cells: advance1,
+            is_retreated: false,
+        };
+    }
+    DynamicHoldLine {
+        cells: initial_cells.to_vec(),
+        is_retreated: false,
+    }
+}
+
 /// 守備上重要な都市にいる兵を都市担当にする。
 ///
 /// `garrisons` は自軍の非生産前線都市の上にいる保持候補の兵と、その都市。

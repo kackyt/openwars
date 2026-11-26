@@ -5,6 +5,30 @@ use super::{
     PlayerId, Property, SquadManager, Terrain, TerrainConnectivity, UnitStats, World,
     campaign_member_distance_to_position,
 };
+/// 試験（`OPENWARS_V4_HOLD_HOME_CAPTURES_ONLY=1`）: 強制保持が有効な小規模マップでは
+/// 陣地線の自陣側（`line.home`）のみを占領対象として許可する。
+fn allowed_capture_home(
+    world: &World,
+    player_id: PlayerId,
+) -> Option<&crate::collections::HashSet<GridPosition>> {
+    if crate::ai::strategy_profile::current_profile(world, player_id)
+        != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+    {
+        return None;
+    }
+    if !crate::ai::v4::hold_line::forced::enabled()
+        || !crate::ai::v4::hold_line::forced::home_captures_only_enabled()
+    {
+        return None;
+    }
+    let map = world.get_resource::<Map>()?;
+    let registry = world.get_resource::<MasterDataRegistry>()?;
+    let line = world
+        .get_resource::<crate::ai::v4::hold_line::planner::InitialHoldSites>()?
+        .line_for(player_id, map, registry)?;
+    Some(&line.home)
+}
+
 pub(super) fn nearest_campaign_property_target_with_connectivity(
     world: &World,
     player_id: PlayerId,
@@ -16,6 +40,7 @@ pub(super) fn nearest_campaign_property_target_with_connectivity(
     let island_map = world.get_resource::<crate::ai::islands::IslandMap>()?;
     let map = world.get_resource::<Map>()?;
     let registry = world.get_resource::<MasterDataRegistry>()?;
+    let allowed_home = allowed_capture_home(world, player_id);
     world
         .iter_entities()
         .filter_map(|entity| {
@@ -23,6 +48,7 @@ pub(super) fn nearest_campaign_property_target_with_connectivity(
             let property = entity.get::<Property>()?;
             if property.owner_id == Some(player_id)
                 || excluded_targets.contains(&target)
+                || allowed_home.is_some_and(|home| !home.contains(&target))
                 || island_map
                     .get_island_at(&target)
                     .is_none_or(|island| island.id != island_id)
@@ -59,23 +85,35 @@ pub(super) fn campaign_assignment_capture_responsibilities(
     members: &[Entity],
     connectivity: &mut TerrainConnectivity,
 ) -> Vec<CampaignResponsibility> {
+    let allowed_home = allowed_capture_home(world, player_id);
     let mut targets: Vec<_> = assignment
         .capture_target_positions
         .iter()
         .copied()
         .filter(|target| {
-            world.iter_entities().any(|entity| {
-                entity.get::<GridPosition>() == Some(target)
-                    && entity
-                        .get::<Property>()
-                        .is_some_and(|property| property.owner_id != Some(player_id))
-            })
+            allowed_home.is_none_or(|home| home.contains(target))
+                && world.iter_entities().any(|entity| {
+                    entity.get::<GridPosition>() == Some(target)
+                        && entity
+                            .get::<Property>()
+                            .is_some_and(|property| property.owner_id != Some(player_id))
+                })
         })
         .collect();
     if crate::ai::strategy_profile::current_profile(world, player_id)
         == crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
     {
-        if let Some(map) = world.get_resource::<Map>() {
+        if let (Some(map), Some(registry)) = (
+            world.get_resource::<Map>(),
+            world.get_resource::<MasterDataRegistry>(),
+        ) {
+            let nearest_front_first = crate::ai::v4::hold_line::forced::enabled()
+                && crate::ai::v4::hold_line::forced::capture_nearest_front_first_enabled();
+            let front_cities = if nearest_front_first {
+                super::planning_policy::home_front_cities(world, player_id, map, registry)
+            } else {
+                HashSet::default()
+            };
             let properties = world
                 .iter_entities()
                 .filter_map(|p| {
@@ -95,11 +133,17 @@ pub(super) fn campaign_assignment_capture_responsibilities(
             });
             if let Some(my_cap) = my_capital {
                 targets.sort_unstable_by_key(|t| {
+                    let is_front = front_cities.contains(t);
                     let d_my = map.distance(my_cap.x, my_cap.y, t.x, t.y);
                     let d_enemy = enemy_capital
                         .map(|ec| map.distance(ec.x, ec.y, t.x, t.y))
                         .unwrap_or(0);
-                    (std::cmp::Reverse(d_my), d_enemy, t.y, t.x)
+                    let my_key = if is_front && nearest_front_first {
+                        d_my
+                    } else {
+                        u32::MAX - d_my
+                    };
+                    (!is_front, my_key, d_enemy, t.y, t.x)
                 });
             }
         }

@@ -26,6 +26,71 @@ pub(super) fn adopt_portfolio(
     )
 }
 
+/// 試験（`OPENWARS_V4_HOLD_HOME_CAPTURES_ONLY=1`）: 強制保持が有効な間は、
+/// 陣地線の敵陣側（`line.home` に含まれない側）の物件を占領候補から外す。
+pub(super) fn filter_small_map_capture_targets(
+    world: &World,
+    player: PlayerId,
+    targets: &mut Vec<GridPosition>,
+    context: &CapturePlanningContext<'_>,
+) {
+    if crate::ai::strategy_profile::current_profile(world, player)
+        != crate::ai::strategy_profile::V4StrategyProfile::SmallMapExpansion
+    {
+        return;
+    }
+    if !crate::ai::v4::hold_line::forced::enabled()
+        || !crate::ai::v4::hold_line::forced::home_captures_only_enabled()
+    {
+        return;
+    }
+    if let Some(line) = world
+        .get_resource::<crate::ai::v4::hold_line::planner::InitialHoldSites>()
+        .and_then(|sites| sites.line_for(player, context.map, context.registry))
+    {
+        targets.retain(|pos| line.home.contains(pos));
+    }
+}
+
+/// 強制保持が有効なとき、陣地線の自陣側にある前線都市集合を返す。
+pub(crate) fn home_front_cities(
+    world: &World,
+    player: PlayerId,
+    map: &crate::resources::Map,
+    registry: &crate::resources::master_data::MasterDataRegistry,
+) -> crate::collections::HashSet<GridPosition> {
+    let mut city_positions = Vec::new();
+    for entity in world.iter_entities() {
+        if let (Some(pos), Some(property)) =
+            (entity.get::<GridPosition>(), entity.get::<Property>())
+            && property.terrain == Terrain::City
+        {
+            city_positions.push(*pos);
+        }
+    }
+    let Some(line) = world
+        .get_resource::<crate::ai::v4::hold_line::planner::InitialHoldSites>()
+        .and_then(|sites| sites.line_for(player, map, registry))
+    else {
+        return Default::default();
+    };
+    let cities = city_positions
+        .into_iter()
+        .filter_map(|pos| {
+            if !line.home.contains(&pos) {
+                return None;
+            }
+            let distance = line
+                .cells
+                .iter()
+                .map(|cell| map.distance(pos.x, pos.y, cell.x, cell.y))
+                .min()?;
+            Some((pos, distance))
+        })
+        .collect::<Vec<_>>();
+    crate::ai::v4::hold_line::forced::front_cities(&cities)
+}
+
 /// 小規模マップの占領目標順: 自首都から遠い順（同点は敵首都に近い順）。
 /// 小規模プロファイルでない場合は通常の順序を使う。
 pub(super) fn sort_small_map_capture_targets(
@@ -41,50 +106,23 @@ pub(super) fn sort_small_map_capture_targets(
         return;
     }
     if crate::ai::v4::hold_line::forced::enabled() {
-        let city_positions: Vec<GridPosition> = {
-            let mut properties = world.query::<(&GridPosition, &Property)>();
-            properties
-                .iter(world)
-                .filter(|(_, property)| property.terrain == Terrain::City)
-                .map(|(position, _)| *position)
-                .collect()
-        };
-        if let Some(line) = world
-            .get_resource::<crate::ai::v4::hold_line::planner::InitialHoldSites>()
-            .and_then(|sites| sites.line_for(player, context.map, context.registry))
-        {
-            let cities = city_positions
-                .into_iter()
-                .filter_map(|pos| {
-                    if !line.home.contains(&pos) {
-                        return None;
-                    }
-                    let distance = line
-                        .cells
+        let front_cities = home_front_cities(world, player, context.map, context.registry);
+        if !front_cities.is_empty() {
+            crate::ai::v4::hold_line::forced::sort_capture_targets_front_first(
+                targets,
+                &front_cities,
+                |target| {
+                    context
+                        .infantry
                         .iter()
-                        .map(|cell| context.map.distance(pos.x, pos.y, cell.x, cell.y))
-                        .min()?;
-                    Some((pos, distance))
-                })
-                .collect::<Vec<_>>();
-            let front_cities = crate::ai::v4::hold_line::forced::front_cities(&cities);
-            if !front_cities.is_empty() {
-                crate::ai::v4::hold_line::forced::sort_capture_targets_front_first(
-                    targets,
-                    &front_cities,
-                    |target| {
-                        context
-                            .infantry
-                            .iter()
-                            .map(|(_, pos, _)| {
-                                context.map.distance(pos.x, pos.y, target.x, target.y) as usize
-                            })
-                            .min()
-                            .unwrap_or(usize::MAX)
-                    },
-                );
-                return;
-            }
+                        .map(|(_, pos, _)| {
+                            context.map.distance(pos.x, pos.y, target.x, target.y) as usize
+                        })
+                        .min()
+                        .unwrap_or(usize::MAX)
+                },
+            );
+            return;
         }
     }
     let enemy_capital = {

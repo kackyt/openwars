@@ -280,6 +280,9 @@ pub(crate) fn decide_squad_action_v4(
             order.push(index);
         }
     }
+    if super::key_terrain::enabled() {
+        order.sort_by_key(|index| std::cmp::Reverse(batch.actions[*index].rank));
+    }
     let support = stationary_support_dependencies(world, &batch, &order);
     let (root, selected) = super::execution_order::select(world, &batch, &order, &support)?;
     // 先行条件の解消で別部隊を動かした場合は、元の部隊へ戻って再評価する。
@@ -340,20 +343,32 @@ fn stationary_support_dependencies(
     batch: &super::EvaluatedActions,
     order: &[usize],
 ) -> Vec<(usize, usize)> {
+    let indirect_first_hold = crate::ai::v4::hold_line::forced::enabled()
+        && crate::ai::v4::hold_line::forced::indirect_first_enabled();
+    let indirect_first_all = crate::ai::v4::hold_line::forced::multi_kill_plan_enabled();
     let mut dependencies = Vec::new();
     for &front_index in order {
         let front = &batch.actions[front_index];
-        if batch.board.squads.mission(front.entity) != Some(&crate::ai::squad::MissionType::Attack)
-            || !world
+        let is_direct = world
+            .get::<UnitStats>(front.entity)
+            .is_some_and(|stats| stats.min_range <= 1);
+        let is_forced_hold_infantry = indirect_first_hold
+            && front.forced_target.is_some()
+            && world
                 .get::<UnitStats>(front.entity)
-                .is_some_and(|stats| stats.min_range <= 1)
-        {
+                .is_some_and(|stats| stats.can_capture);
+        let is_multi_kill_direct = indirect_first_all && is_direct;
+        let is_attack_front = batch.board.squads.mission(front.entity)
+            == Some(&crate::ai::squad::MissionType::Attack)
+            && is_direct;
+        if !is_forced_hold_infantry && !is_multi_kill_direct && !is_attack_front {
             continue;
         }
+        let relaxed_coop = is_forced_hold_infantry || is_multi_kill_direct;
         let objective = batch.board.squads.target(front.entity);
         let target = match front.command {
             AiCommand::Attack { target_entity, .. } => Some(target_entity),
-            AiCommand::Wait { .. } => objective.and_then(|position| {
+            AiCommand::Wait { .. } if is_attack_front => objective.and_then(|position| {
                 batch
                     .board
                     .action_targets
@@ -373,11 +388,15 @@ fn stationary_support_dependencies(
         };
         for &gun_index in order {
             let gun = &batch.actions[gun_index];
-            if batch.board.squads.mission(gun.entity)
-                != Some(&crate::ai::squad::MissionType::Attack)
-                || !world
-                    .get::<UnitStats>(gun.entity)
-                    .is_some_and(|stats| stats.min_range > 1)
+            let is_indirect_gun = world
+                .get::<UnitStats>(gun.entity)
+                .is_some_and(|stats| stats.min_range > 1);
+            if !is_indirect_gun {
+                continue;
+            }
+            if !relaxed_coop
+                && batch.board.squads.mission(gun.entity)
+                    != Some(&crate::ai::squad::MissionType::Attack)
             {
                 continue;
             }
@@ -388,12 +407,13 @@ fn stationary_support_dependencies(
             } = gun.command
                 && target_entity == target
                 && world.get::<GridPosition>(gun.entity) == Some(&target_pos)
-                && shares_attack_operation(
-                    world,
-                    front.entity,
-                    gun.entity,
-                    objective.is_some() && batch.board.squads.target(gun.entity) == objective,
-                )
+                && (relaxed_coop
+                    || shares_attack_operation(
+                        world,
+                        front.entity,
+                        gun.entity,
+                        objective.is_some() && batch.board.squads.target(gun.entity) == objective,
+                    ))
             {
                 dependencies.push((front_index, gun_index));
             }

@@ -112,6 +112,22 @@ impl PlanningPolicy {
         }
     }
 
+    /// 汎用占領の候補を方策に応じて絞り込む。
+    pub(super) fn filter_capture_targets(
+        self,
+        world: &World,
+        player: PlayerId,
+        targets: &mut Vec<GridPosition>,
+        context: &CapturePlanningContext<'_>,
+    ) {
+        match self {
+            Self::Standard => {}
+            Self::SmallMap => {
+                planning_policy::filter_small_map_capture_targets(world, player, targets, context)
+            }
+        }
+    }
+
     /// 汎用占領の目標順を決める。
     pub(super) fn sort_capture_targets(
         self,
@@ -1279,12 +1295,9 @@ fn form_capture_squads(
     // 限られた歩兵を近い目標へ優先的に振り分ける)。
     // #53 (V3): 工場・首都などの生産施設は敵の増援源であり、奪取すれば
     // 前線の消耗戦を根本から崩せるため、多少遠くても優先する
-    policy.sort_capture_targets(
-        world,
-        player,
-        &mut capture_targets,
-        &board.capture_context(&free.infantry),
-    );
+    let capture_context = board.capture_context(&free.infantry);
+    policy.filter_capture_targets(world, player, &mut capture_targets, &capture_context);
+    policy.sort_capture_targets(world, player, &mut capture_targets, &capture_context);
 
     // #53 (V3): 敵生産施設への突入 (スピアヘッド) は戦力優勢 (Assault フェーズ)
     // のときのみ許可する。拮抗・劣勢時に前線から兵力を抜くと防衛線が崩壊する
