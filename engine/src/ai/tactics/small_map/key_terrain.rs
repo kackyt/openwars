@@ -129,12 +129,15 @@ impl KeyTerrainContext {
         };
 
         if !ctx.front_line.is_empty() {
+            let allow_surplus_factory_battery = !board.own_production.gridlocked
+                && board.own_production.free_slots > board.own_production.demand_slots;
             let mut battery_line = HashSet::default();
             let mut open_battery_line = Vec::new();
             for y in 0..tactical.map.height {
                 for x in 0..tactical.map.width {
                     let pos = GridPosition { x, y };
-                    if board.own_production.contains((x, y))
+                    let is_prod = board.own_production.contains((x, y));
+                    if (is_prod && !allow_surplus_factory_battery)
                         || !ctx.is_behind_front(&tactical.map, pos)
                     {
                         continue;
@@ -822,8 +825,8 @@ fn evaluate_attack_candidate(
             } else {
                 ActionPriority::AssaultStrike
             }
-        } else if min_dist_to_front > BATTERY_MIN_RANGE + 1 && exchange.damage_value_dealt < 5_000 {
-            // y<=3等の深い後方からは、超高価値目標でない限り砲列ラインへの前進(RouteAdvance)を優先する。
+        } else if min_dist_to_front > BATTERY_MIN_RANGE {
+            // y=3,4等の砲列帯より後方からは、高価値目標・前線緊急排除でない限り砲列ラインへの前進(RouteAdvance)を優先する。
             ActionPriority::Normal
         } else {
             ActionPriority::FavorableLocalTarget
@@ -924,9 +927,32 @@ fn evaluate_wait_candidate(
     let tactical = &board.tactical;
     let state = &unit.state;
 
-    // 健全なユニットは生産口を塞がない。
+    let needs_production_slot = board.own_production.gridlocked
+        || board
+            .own_production
+            .free_slots
+            .saturating_sub(usize::from(!unit.starts_on_own_production))
+            < board.own_production.demand_slots;
+    let min_dist_to_front = context
+        .front_line
+        .iter()
+        .map(|f| tactical.map.distance(pos.x, pos.y, f.x, f.y))
+        .min()
+        .unwrap_or(u32::MAX);
+    let front_line_solid = !context.front_line.is_empty() && context.open_front_cells.len() <= 2;
+
+    // 砲座（都市優先、次点で前線2マス後ろの砲列帯、壁完成時は1マス後ろも含む）を維持すべき間接ユニットか。
+    let max_ideal_dist = state.stats.max_range.saturating_sub(2).clamp(1, 2);
+    let in_dynamic_battery_band = context.is_behind_front(&tactical.map, pos)
+        && (1..=max_ideal_dist).contains(&min_dist_to_front)
+        && (min_dist_to_front >= BATTERY_MIN_RANGE || front_line_solid);
+    let indirect_uses_surplus_factory_battery =
+        state.stats.min_range > 1 && in_dynamic_battery_band && !needs_production_slot;
+
+    // 健全なユニットは生産口を塞がない（ただし生産枠に余裕がある砲列帯の間接ユニットは除く）。
     let healthy_blocks_production = !state.combat_ineffective
         && on_own_production
+        && !indirect_uses_surplus_factory_battery
         && (unit.has_non_production_wait_destination || !unit.starts_on_own_production);
     if healthy_blocks_production {
         return;
@@ -937,23 +963,11 @@ fn evaluate_wait_candidate(
         .map(|enemy| tactical.map.distance(enemy.x, enemy.y, pos.x, pos.y))
         .min()
         .unwrap_or(u32::MAX);
-    let min_dist_to_front = context
-        .front_line
-        .iter()
-        .map(|f| tactical.map.distance(pos.x, pos.y, f.x, f.y))
-        .min()
-        .unwrap_or(u32::MAX);
-    let front_line_solid = !context.front_line.is_empty() && context.open_front_cells.len() <= 2;
 
-    // 砲座（都市優先、次点で壁越しの前線1〜2マス後ろの砲列帯）を維持すべき間接ユニットか。
-    let max_ideal_dist = state.stats.max_range.saturating_sub(2).clamp(1, 2);
-    let in_dynamic_battery_band = front_line_solid
-        && context.is_behind_front(&tactical.map, pos)
-        && (1..=max_ideal_dist).contains(&min_dist_to_front);
     let holds_battery = state.stats.min_range > 1
         && !state.combat_ineffective
         && state.hp > BATTERY_MIN_HOLD_HP
-        && !on_own_production
+        && (!on_own_production || indirect_uses_surplus_factory_battery)
         && nearest_enemy_dist >= state.stats.min_range
         && (on_battery || in_dynamic_battery_band);
 
