@@ -83,7 +83,15 @@ impl KeyTerrainContext {
             .iter()
             .copied()
             .filter(|pos| {
-                !board.own_production.contains((pos.x, pos.y))
+                let is_dedicated_production =
+                    tactical.map.get_terrain(pos.x, pos.y).is_some_and(|t| {
+                        matches!(t, Terrain::Factory | Terrain::Airport | Terrain::Port)
+                    });
+                let is_usable_city = !is_dedicated_production
+                    && (!board.own_production.contains((pos.x, pos.y))
+                        || (!board.own_production.gridlocked
+                            && board.own_production.free_slots >= 2));
+                is_usable_city
                     && (front_line.is_empty()
                         || front_line.iter().any(|front| {
                             let dist = tactical.map.distance(pos.x, pos.y, front.x, front.y);
@@ -946,8 +954,12 @@ fn evaluate_wait_candidate(
     let in_dynamic_battery_band = context.is_behind_front(&tactical.map, pos)
         && (1..=max_ideal_dist).contains(&min_dist_to_front)
         && (min_dist_to_front >= BATTERY_MIN_RANGE || front_line_solid);
-    let indirect_uses_surplus_factory_battery =
-        state.stats.min_range > 1 && in_dynamic_battery_band && !needs_production_slot;
+    let indirect_uses_surplus_factory_battery = state.stats.min_range > 1
+        && (on_battery || in_dynamic_battery_band)
+        && (!needs_production_slot
+            || (on_battery
+                && !board.own_production.gridlocked
+                && board.own_production.free_slots >= 2));
 
     // 健全なユニットは生産口を塞がない（ただし生産枠に余裕がある砲列帯の間接ユニットは除く）。
     let healthy_blocks_production = !state.combat_ineffective
