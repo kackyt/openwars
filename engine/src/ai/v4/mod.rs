@@ -104,6 +104,7 @@ use slot_demand::*;
 mod tests;
 
 mod assignment;
+pub(crate) mod capture_completion;
 pub(crate) mod home_defense;
 pub mod plan_contract;
 pub mod property_control;

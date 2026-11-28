@@ -355,6 +355,13 @@ fn decide_normal_action(
             decide_ai_action_v2(world, step.player_id, skip)
         }
         TurnTactics::SmallMapSquads => {
+            // 試験: この手番に完了できる占領を、ほかの行動より先に仕上げる
+            if crate::ai::v4::capture_completion::enabled()
+                && let Some(action) =
+                    crate::ai::v4::capture_completion::decide_action(world, step.player_id, skip)
+            {
+                return Some(action);
+            }
             let defense = crate::ai::v4::home_defense::decide_action(world, step.player_id, skip);
             let source = if defense.is_some() {
                 "home_defense"

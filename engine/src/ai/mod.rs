@@ -3,6 +3,7 @@ pub mod ai_version;
 pub mod assault_decision;
 /// 通常AIへ接続しない、局地攻略の実エンジン分岐比較。
 pub mod assault_probe;
+pub(crate) mod assignment_solver;
 /// main互換実装と拡張実装の経路選択
 pub mod code_path;
 pub mod demand;
