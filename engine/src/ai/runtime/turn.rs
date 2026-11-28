@@ -355,10 +355,45 @@ fn decide_normal_action(
             decide_ai_action_v2(world, step.player_id, skip)
         }
         TurnTactics::SmallMapSquads => {
-            crate::ai::v4::home_defense::decide_action(world, step.player_id, skip)
-                .or_else(|| decide_squad_action_v4(world, step.player_id, skip))
+            let defense = crate::ai::v4::home_defense::decide_action(world, step.player_id, skip);
+            let source = if defense.is_some() {
+                "home_defense"
+            } else {
+                "squad_v4"
+            };
+            let action = defense.or_else(|| decide_squad_action_v4(world, step.player_id, skip));
+            trace_indirect_source(world, action.as_ref(), source);
+            action
         }
     }
+}
+
+/// 診断: `OPENWARS_TRACE_INDIRECT=1` のとき、間接部隊の手をどの層が決めたかを stderr に出す（既定オフ）。
+fn trace_indirect_source(world: &World, action: Option<&(Entity, AiCommand)>, source: &str) {
+    let Some((entity, command)) = action else {
+        return;
+    };
+    if !std::env::var("OPENWARS_TRACE_INDIRECT").is_ok_and(|v| v == "1") {
+        return;
+    }
+    let Some(stats) = world.get::<crate::components::UnitStats>(*entity) else {
+        return;
+    };
+    if stats.min_range <= 1 {
+        return;
+    }
+    let pos = world.get::<GridPosition>(*entity).copied();
+    eprintln!(
+        "TRACE_INDIRECT_SOURCE {}",
+        serde_json::json!({
+            "turn": world.get_resource::<crate::resources::MatchState>().map(|m| m.current_turn_number.0),
+            "unit": entity.to_bits(),
+            "unit_type": stats.unit_type.as_str(),
+            "pos": pos.map(|p| [p.x, p.y]),
+            "source": source,
+            "command": format!("{command:?}"),
+        })
+    );
 }
 
 /// 橋頭堡DAGの島に居る戦闘役だけを、DAGを読むSquad executorで動かす。

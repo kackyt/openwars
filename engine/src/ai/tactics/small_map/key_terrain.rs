@@ -518,6 +518,11 @@ fn evaluate_unit(
             .action_targets_at(state.entity, &state.stats, state.position, false)
             .can_capture;
 
+    // 診断: `OPENWARS_TRACE_INDIRECT=1` のとき、間接部隊の「その場射撃の最良」と「選んだ手」を stderr に出す
+    let trace_indirect = state.stats.min_range > 1
+        && std::env::var("OPENWARS_TRACE_INDIRECT").is_ok_and(|v| v == "1");
+    let mut stationary_fire = BestAction::default();
+
     for &(x, y) in &unit.candidate_tiles {
         let pos = GridPosition { x, y };
         let is_stationary = pos == state.position;
@@ -578,6 +583,24 @@ fn evaluate_unit(
                 relieves_gridlock,
                 &mut best,
             );
+            // 診断: 間接部隊がその場から撃てる最良の射撃を別に記録する（既定オフ）
+            if trace_indirect && is_stationary {
+                evaluate_attack_candidate(
+                    world,
+                    board,
+                    context,
+                    focus_targets,
+                    unit,
+                    pos,
+                    target,
+                    defense_bonus,
+                    on_front_line,
+                    on_battery,
+                    on_own_production,
+                    relieves_gridlock,
+                    &mut stationary_fire,
+                );
+            }
         }
 
         // 3. 合流評価（前線上での合流は前線保持と同格に扱う）
@@ -616,6 +639,24 @@ fn evaluate_unit(
             approach_goal,
             distances,
             &mut best,
+        );
+    }
+
+    if trace_indirect {
+        eprintln!(
+            "TRACE_INDIRECT {}",
+            serde_json::json!({
+                "turn": world.get_resource::<crate::resources::MatchState>().map(|m| m.current_turn_number.0),
+                "unit": state.entity.to_bits(),
+                "unit_type": state.stats.unit_type.as_str(),
+                "pos": [state.position.x, state.position.y],
+                "hp": state.hp,
+                "chosen_rank": best.rank().map(|r| format!("{r:?}")),
+                "chosen": best.command().map(|c| format!("{c:?}")),
+                "stationary_fire_rank": stationary_fire.rank().map(|r| format!("{r:?}")),
+                "stationary_fire": stationary_fire.command().map(|c| format!("{c:?}")),
+                "push_phase": context.is_push_phase,
+            })
         );
     }
 
